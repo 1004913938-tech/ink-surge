@@ -69,6 +69,8 @@ src/
 harness/      Playwright retina screenshot harness
 ```
 
+See `KNOWN_GAPS.md` for an honest, measured account of what is not yet at target.
+
 Two rules matter more than the rest:
 
 1. **One wave field.** `src/water/gerstner.ts` is the single source of truth.
