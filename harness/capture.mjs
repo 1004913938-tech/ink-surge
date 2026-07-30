@@ -48,6 +48,13 @@ const TIMEOUT = Number(args.timeout ?? 90000);
  * Shot list.
  *
  * `t`      seconds of simulation to advance before capturing
+ * `until`  JS expression over stats() — advance until true instead of a fixed t.
+ *          Use this for transient states (airborne, landing). A fixed timestamp
+ *          silently stops proving anything the moment physics is retuned, which
+ *          already happened once to the `air` shot in this project.
+ * `maxT`   safety bound for `until`
+ * `settle` frames to render before capture (default 8). Transient states need
+ *          1-2, or the moment is over before the shutter opens.
  * `cam`    camera preset understood by the in-game harness API
  * `drive`  scripted controls applied during the run: {steer, throttle, drift}
  * `phase`  force a race phase, e.g. 'racing' to skip the countdown
@@ -55,43 +62,50 @@ const TIMEOUT = Number(args.timeout ?? 90000);
  */
 const SHOTS = {
   hero: {
-    t: 26, cam: 'chase', phase: 'racing', drive: { throttle: 1, steer: 0.15 },
+    t: 26, cam: 'chase', phase: 'racing', drive: { autopilot: true, throttle: 1 },
     note: 'The money shot. Player boat at speed, wake, water, sky, HUD all together.',
   },
   ocean_wide: {
-    t: 14, cam: 'far', phase: 'racing', drive: { throttle: 1 },
+    t: 14, cam: 'far', phase: 'racing', drive: { autopilot: true, throttle: 1 },
     note: 'Open water to the horizon: checks for tiling repetition, LOD popping, horizon seam.',
   },
   ocean_low: {
-    t: 18, cam: 'bow', phase: 'racing', drive: { throttle: 1 },
+    t: 18, cam: 'bow', phase: 'racing', drive: { autopilot: true, throttle: 1 },
     note: 'Camera near the waterline. Checks wave silhouette, crest sharpening, foam threshold.',
   },
   foam_wake: {
-    t: 22, cam: 'wake', phase: 'racing', drive: { throttle: 1, steer: 0.7, drift: true },
+    until: 's.drifting && s.driftTier >= 1', maxT: 90, settle: 2,
+    cam: 'wake', phase: 'racing', drive: { autopilot: true, throttle: 1, drift: true },
     note: 'Hard drift. Wake ribbon spread/dissipation, foam ring around hull, spray particles.',
   },
   air: {
-    t: 33.4, cam: 'chase', phase: 'racing', drive: { throttle: 1 },
-    note: 'Boat airborne off a crest. Checks rider crouch, hull pitch, spray on launch.',
+    until: 's.airborne && s.airTime > 0.28', maxT: 90, settle: 1,
+    cam: 'chase', phase: 'racing', drive: { autopilot: true, throttle: 1 },
+    note: 'Boat genuinely airborne off a crest. Checks rider tuck, hull pitch, spray on launch.',
+  },
+  land: {
+    until: 's.landingImpact > 1.2', maxT: 90, settle: 2,
+    cam: 'chase', phase: 'racing', drive: { autopilot: true, throttle: 1 },
+    note: 'Water re-entry. Checks landing crouch, impact spray burst, camera shake.',
   },
   rider_closeup: {
-    t: 20, cam: 'rider', phase: 'racing', drive: { throttle: 1, steer: 0.8 },
+    until: 'Math.abs(s.speed) > 18', maxT: 60, cam: 'rider', phase: 'racing', drive: { autopilot: true, throttle: 1 },
     note: 'Rider leaning into a turn. Checks pose, outline on limbs, cel banding on cloth/skin.',
   },
   outline_check: {
-    t: 12, cam: 'orbit_near', phase: 'racing', drive: { throttle: 0.4 },
+    t: 12, cam: 'orbit_near', phase: 'racing', drive: { autopilot: true, throttle: 0.4 },
     note: 'Slow orbit close to the hull. Checks outline width consistency and silhouette breaks.',
   },
   outline_far: {
-    t: 12, cam: 'far_boat', phase: 'racing', drive: { throttle: 1 },
+    t: 12, cam: 'far_boat', phase: 'racing', drive: { autopilot: true, throttle: 1 },
     note: 'Same boat at distance. Outline must be the same screen width as outline_check.',
   },
   pack: {
-    t: 8, cam: 'broadcast', phase: 'racing', drive: { throttle: 1 },
+    t: 8, cam: 'broadcast', phase: 'racing', drive: { autopilot: true, throttle: 1 },
     note: 'All four racers in frame. Checks per-racer colour separation and AI spacing.',
   },
   course: {
-    t: 5, cam: 'aerial', phase: 'racing', drive: { throttle: 1 },
+    t: 5, cam: 'aerial', phase: 'racing', drive: { autopilot: true, throttle: 1 },
     note: 'High aerial. Checks racing line ribbon riding the swell, gate placement, circuit shape.',
   },
   countdown: {
@@ -103,11 +117,12 @@ const SHOTS = {
     note: 'Results screen: placements, times, celebration animation, orbit camera.',
   },
   hud: {
-    t: 24, cam: 'chase', phase: 'racing', drive: { throttle: 1, steer: -0.4, drift: true },
+    until: 's.drifting && s.boostMeter > 0.35', maxT: 90, settle: 2,
+    cam: 'chase', phase: 'racing', drive: { autopilot: true, throttle: 1, drift: true },
     note: 'HUD under load: boost meter charging, speed high, minimap, position, splits.',
   },
   sky: {
-    t: 10, cam: 'sky', phase: 'racing', drive: { throttle: 1 },
+    t: 10, cam: 'sky', phase: 'racing', drive: { autopilot: true, throttle: 1 },
     note: 'Camera tilted up. Checks sky gradient banding, cel clouds, sun flare treatment.',
   },
 };
@@ -235,13 +250,21 @@ async function main() {
         H.reset();
         if (shotDef.phase) H.setPhase(shotDef.phase);
         H.setControls(shotDef.drive ?? {});
+
         // Fixed-step simulation: identical every run, independent of how fast
         // the headless machine happens to be.
-        await H.simulate(shotDef.t, 1 / 60);
+        let hunted = null;
+        if (shotDef.until) {
+          hunted = await H.simulateUntil(shotDef.until, shotDef.maxT ?? 90, 1 / 60);
+        } else {
+          await H.simulate(shotDef.t, 1 / 60);
+        }
+
         H.setCameraPreset(shotDef.cam);
-        // A few settle frames so spring cameras and particle systems land.
-        await H.settle(8);
-        return H.stats();
+        // Settle frames so spring cameras and particle systems land. Transient
+        // states want very few, or the moment passes before capture.
+        await H.settle(shotDef.settle ?? 8);
+        return { ...H.stats(), hunted };
       },
       [name, shot],
     );
@@ -249,7 +272,15 @@ async function main() {
     const file = path.join(OUT, `${name}.png`);
     await page.screenshot({ path: file, animations: 'disabled' });
     manifest.push({ name, file: path.relative(process.cwd(), file), note: shot.note, stats: result });
-    console.log(`${Date.now() - t0}ms  (fps ${result.fps?.toFixed?.(0) ?? '?'}, tris ${result.triangles ?? '?'}, draws ${result.drawCalls ?? '?'})`);
+    let extra = '';
+    if (shot.until) {
+      extra = result.hunted?.found
+        ? `  hunted@t=${result.hunted.t.toFixed(2)}`
+        : `  ⚠ STATE NEVER REACHED (${shot.until}) — this shot proves nothing`;
+    }
+    console.log(
+      `${Date.now() - t0}ms  (tris ${result.triangles ?? '?'}, draws ${result.drawCalls ?? '?'})${extra}`,
+    );
   }
 
   await writeFile(

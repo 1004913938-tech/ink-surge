@@ -15,6 +15,7 @@ import {
   Color,
   DataTexture,
   LinearFilter,
+  LinearMipmapLinearFilter,
   LinearSRGBColorSpace,
   NearestFilter,
   RepeatWrapping,
@@ -40,9 +41,22 @@ function memo<T extends Texture>(key: string, make: () => T): T {
  * begins, so the terminator can be pushed toward the lit side — which is what
  * anime key art actually does. Evenly spaced bands read as a technical demo;
  * a wide lit band with a narrow, late shadow band reads as illustration.
+ *
+ * RGB is a **multiplier** applied to the surface colour. The optional
+ * `ambient` array carries a per-band *ambient bounce weight* in the alpha
+ * channel. A purely multiplicative ladder can only ever make a shadow a darker
+ * version of the same hue — the exact failure the first captures showed, where
+ * a vermilion hull went to (58,2,2), a black-red with no green or blue in it at
+ * all. The alpha channel is what lets `celMaterial` *add* a cool bounce in the
+ * shadow bands so the terminator shifts hue as well as value.
  */
-export function makeRampTexture(colors: Color[], stops: number[], size = 64): DataTexture {
-  const key = `ramp:${colors.map((c) => c.getHexString()).join(',')}:${stops.join(',')}:${size}`;
+export function makeRampTexture(
+  colors: Color[],
+  stops: number[],
+  size = 64,
+  ambient?: number[],
+): DataTexture {
+  const key = `ramp:${colors.map((c) => c.getHexString()).join(',')}:${stops.join(',')}:${size}:${(ambient ?? []).join(',')}`;
   return memo(key, () => {
     const data = new Uint8Array(size * 4);
     for (let i = 0; i < size; i++) {
@@ -51,10 +65,11 @@ export function makeRampTexture(colors: Color[], stops: number[], size = 64): Da
       let band = 0;
       for (let s = 0; s < stops.length; s++) if (t >= stops[s]) band = s;
       const c = colors[Math.min(band, colors.length - 1)];
-      data[i * 4 + 0] = Math.round(c.r * 255);
-      data[i * 4 + 1] = Math.round(c.g * 255);
-      data[i * 4 + 2] = Math.round(c.b * 255);
-      data[i * 4 + 3] = 255;
+      data[i * 4 + 0] = Math.round(Math.min(1, c.r) * 255);
+      data[i * 4 + 1] = Math.round(Math.min(1, c.g) * 255);
+      data[i * 4 + 2] = Math.round(Math.min(1, c.b) * 255);
+      const a = ambient ? (ambient[Math.min(band, ambient.length - 1)] ?? 0) : 0;
+      data[i * 4 + 3] = Math.round(Math.max(0, Math.min(1, a)) * 255);
     }
     const tex = new DataTexture(data, size, 1, RGBAFormat, UnsignedByteType);
     tex.magFilter = NearestFilter;
@@ -212,9 +227,92 @@ export function makeNoiseTexture(size = 256, lattice = 16, octaves = 4): CanvasT
     const tex = new CanvasTexture(cv);
     tex.wrapS = tex.wrapT = RepeatWrapping;
     tex.colorSpace = LinearSRGBColorSpace;
-    tex.minFilter = LinearFilter;
+    // Mip-filtered by default. The mip chain was already being *built* and never
+    // sampled, which is what dithered the ocean's band edges in shots/water_r0:
+    // any surface sampling this map at a grazing angle aliases without it.
+    tex.minFilter = LinearMipmapLinearFilter;
     tex.magFilter = LinearFilter;
     tex.generateMipmaps = true;
+    return tex;
+  }) as CanvasTexture;
+}
+
+/**
+ * The default "graphic gloss" matcap: a drawn stand-in for an environment
+ * probe, used by every cel material at low strength.
+ *
+ * It is built as three *hard* zones with no gradient between them — a sky wash
+ * across the top, a sea wash across the bottom, a crisp horizon cut between
+ * them, one hard key blob and a thin rim sliver. That shape language is the
+ * whole point: a real cubemap (or any smoothly varying probe) makes a surface
+ * read as physically based within one frame, whereas a two-tone disc with a
+ * straight horizon line reads as *drawn reflection*, the way anime paints gloss
+ * on a helmet or a lacquered hull.
+ */
+export function makeGlossMatcap(
+  sky: Color,
+  sea: Color,
+  hot: Color,
+  horizon = 0.06,
+  size = 256,
+): CanvasTexture {
+  const key = `gloss:${sky.getHexString()}:${sea.getHexString()}:${hot.getHexString()}:${horizon}`;
+  return memo(key, () => {
+    const cv = document.createElement('canvas');
+    cv.width = cv.height = size;
+    const g = cv.getContext('2d')!;
+    const R = size / 2;
+    const hex = (c: Color) => '#' + c.clone().convertLinearToSRGB().getHexString();
+
+    // Black background matters: this disc is *added* to the shaded surface, so
+    // every pixel that is not a deliberate mark must contribute nothing. The
+    // first version filled the whole disc with a sky wash and every lit plane on
+    // the boat picked up a broad pale sheen — a wet blowout, the exact PBR read
+    // we are trying to avoid (shots/cel_r1/outline_check.png).
+    g.fillStyle = '#000000';
+    g.fillRect(0, 0, size, size);
+    g.save();
+    g.beginPath();
+    g.arc(R, R, R, 0, Math.PI * 2);
+    g.clip();
+
+    const hy = R - horizon * size;
+
+    // Sky band: a narrow *strip* along the very top of the disc. It has to be
+    // narrow and dim, because a flat up-facing plane (a deck) samples one point
+    // of the disc and so takes the tone as a flat fill — a wide bright strip
+    // paints the whole deck pale blue instead of reading as gloss.
+    g.fillStyle = hex(sky.clone().multiplyScalar(0.5));
+    g.fillRect(0, 0, size, hy * 0.20);
+
+    // Sea bounce: a matching strip along the bottom, dimmer and cooler.
+    g.fillStyle = hex(sea.clone().multiplyScalar(0.6));
+    g.fillRect(0, size - hy * 0.16, size, size);
+
+    // One hard key blob, up-left, matching SUN_DIR's screen-space lean, and a
+    // detached spark: two marks read as intent, one reads as an accident.
+    g.fillStyle = hex(hot);
+    g.beginPath();
+    g.ellipse(R * 0.66, R * 0.50, R * 0.20, R * 0.115, -0.55, 0, Math.PI * 2);
+    g.fill();
+    g.beginPath();
+    g.ellipse(R * 1.30, R * 0.80, R * 0.075, R * 0.040, 0.35, 0, Math.PI * 2);
+    g.fill();
+
+    // Rim sliver along the lower-right: the "turn" of a glossy form.
+    g.strokeStyle = hex(hot.clone().multiplyScalar(0.55));
+    g.lineWidth = size * 0.022;
+    g.beginPath();
+    g.arc(R, R, R * 0.968, Math.PI * -0.28, Math.PI * 0.40);
+    g.stroke();
+    g.restore();
+
+    const tex = new CanvasTexture(cv);
+    tex.colorSpace = LinearSRGBColorSpace;
+    tex.minFilter = LinearFilter;
+    tex.magFilter = LinearFilter;
+    tex.generateMipmaps = false;
+    tex.wrapS = tex.wrapT = ClampToEdgeWrapping;
     return tex;
   }) as CanvasTexture;
 }

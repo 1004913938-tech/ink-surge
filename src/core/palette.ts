@@ -27,6 +27,13 @@ export const HEX = {
 
   // Water bands, deep → crest. Hard steps between these, never a gradient.
   waterDeep: 0x0b2f6e,
+  /**
+   * Shadow-side water body. Committed after a capture proved that using raw
+   * waterDeep for the whole shadow side reads as a *hole punched in the image*
+   * once the composite vignette lands on it — the "oil slick" failure. The
+   * shadow side needs its own lifted tone, not a darker copy of the mid tone.
+   */
+  waterShadow: 0x11487f,
   waterMid: 0x1667c8,
   waterShallow: 0x35a8e8,
   waterCrest: 0x7fe0f5,
@@ -69,6 +76,17 @@ export const HEX = {
   suit1: 0x3a2b5f,
   suit2: 0x1f3f5c,
   suit3: 0x243d3a,
+  /**
+   * Mid-value race-suit fabric, ~40% relative luminance, hue-matched to the
+   * suit tones above. Committed after a raw (post-free) capture proved a rider
+   * dressed in suit0..3 alone is a black silhouette with no internal cel
+   * drawing — the bands had nowhere to land. The dark suit tones are now the
+   * *shadow* band and these are the lit band.
+   */
+  suitMid0: 0x5f7bc4,
+  suitMid1: 0x7a5eb0,
+  suitMid2: 0x4a86b8,
+  suitMid3: 0x4f8f7e,
   skin: 0xffcfa8,
   skinShade: 0xe0a074,
 

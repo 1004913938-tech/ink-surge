@@ -46,8 +46,12 @@ class Game {
   private running = false;
 
   /** Harness overrides. */
-  private forcedControls: Partial<{ steer: number; throttle: number; brake: number; drift: boolean }> | null = null;
+  private forcedControls:
+    | Partial<{ steer: number; throttle: number; brake: number; drift: boolean; autopilot: boolean }>
+    | null = null;
   private fixedDt: number | null = null;
+  /** True while a harness script owns the clock; suppresses the rAF step. */
+  private scripted = false;
 
   constructor(
     private glCanvas: HTMLCanvasElement,
@@ -125,6 +129,26 @@ class Game {
     window.addEventListener('keydown', unlock);
   }
 
+  /**
+   * Minimal lookahead steering for the harness-driven player.
+   *
+   * Deliberately lives here rather than in the AI subsystem: the harness must
+   * keep working regardless of how the AI is rewritten, and a captured frame is
+   * only comparable across rounds if the player's line is reproducible.
+   */
+  private autopilotSteer(racer: Racer): number {
+    const proj = this.track.project(racer.root.position);
+    const speed = racer.state.velocity.length();
+    const lookahead = 15 + speed * 1.0;
+    const target = this.track.sampleDistance(proj.u * this.track.length + lookahead);
+    const dx = target.position.x - racer.root.position.x;
+    const dz = target.position.z - racer.root.position.z;
+    let err = Math.atan2(dx, dz) - racer.state.heading;
+    while (err > Math.PI) err -= Math.PI * 2;
+    while (err < -Math.PI) err += Math.PI * 2;
+    return clamp(-err * 2.0, -1, 1);
+  }
+
   private resetRacers() {
     for (const r of this.racers) {
       const grid = this.track.startGrid(r.id);
@@ -175,7 +199,13 @@ class Game {
     this.lastTime = performance.now();
     const loop = (now: number) => {
       if (!this.running) return;
-      this.frame(now);
+      // While a scripted harness run is in flight, the rAF loop must not step
+      // the simulation. `simulate()` awaits between batches, and those awaits
+      // used to let real-dt frames slip in — so the same (phase, controls, t)
+      // triple produced different boat state on every run and the harness was
+      // not actually deterministic. Keep the loop alive, but let the script own
+      // the clock.
+      if (!this.scripted) this.frame(now);
       requestAnimationFrame(loop);
     };
     requestAnimationFrame(loop);
@@ -199,10 +229,16 @@ class Game {
     this.input.update(ctx.dt);
     const pc = this.racers[0].controls;
     if (this.forcedControls) {
-      pc.steer = this.forcedControls.steer ?? 0;
       pc.throttle = this.forcedControls.throttle ?? 0;
       pc.brake = this.forcedControls.brake ?? 0;
       pc.drift = this.forcedControls.drift ?? false;
+      // A scripted `steer: 0` drives the player dead straight off the circuit —
+      // 1.2 km off-line after a minute, which put the WRONG WAY banner in almost
+      // every captured frame and pushed the AI pack out of shot. Autopilot steers
+      // the player along the spline so shots frame a real racing situation.
+      pc.steer = this.forcedControls.autopilot
+        ? this.autopilotSteer(this.racers[0])
+        : this.forcedControls.steer ?? 0;
     } else {
       const s = this.input.state;
       pc.steer = s.steer;
@@ -290,6 +326,7 @@ class Game {
 
       /** Fixed-step advance — identical output on every machine. */
       async simulate(seconds: number, dt = 1 / 60) {
+        self.scripted = true;
         const steps = Math.max(1, Math.round(seconds / dt));
         for (let i = 0; i < steps; i++) {
           self.frame(performance.now(), dt);
@@ -299,12 +336,82 @@ class Game {
         }
       },
 
-      /** Render N real frames so springs and particles settle. */
+      /**
+       * Advance until a predicate over stats() holds, or `maxSeconds` elapses.
+       *
+       * Fixed-t shots are brittle for transient states: the boat physics was
+       * retuned and the old `air` timestamp stopped landing on an airborne
+       * frame, so a shot that existed to prove the landing crouch was silently
+       * proving nothing. Hunting for the state instead survives retuning.
+       */
+      async simulateUntil(
+        predicateSource: string,
+        maxSeconds = 90,
+        dt = 1 / 60,
+      ): Promise<{ found: boolean; t: number }> {
+        self.scripted = true;
+        // eslint-disable-next-line no-new-func
+        const pred = new Function('s', `return (${predicateSource});`) as (s: any) => boolean;
+        const steps = Math.round(maxSeconds / dt);
+        for (let i = 0; i < steps; i++) {
+          self.frame(performance.now(), dt);
+          if (i % 30 === 29) await new Promise((r) => setTimeout(r, 0));
+          try {
+            if (pred(this.stats())) return { found: true, t: self.ctx.time };
+          } catch {
+            /* a malformed predicate should not wedge the run */
+          }
+        }
+        return { found: false, t: self.ctx.time };
+      },
+
+      /** Render N frames so springs and particles settle. Still script-owned. */
       async settle(frames = 6) {
+        self.scripted = true;
         for (let i = 0; i < frames; i++) {
           self.frame(performance.now(), 1 / 60);
           await new Promise((r) => requestAnimationFrame(() => r(null)));
         }
+      },
+
+      /** Hand the clock back to real time. */
+      release() {
+        self.scripted = false;
+        self.lastTime = performance.now();
+      },
+
+      /**
+       * Per-racer diagnostic dump. Exists because "the boats are driving the
+       * wrong way" is a claim that needs numbers, not a screenshot.
+       */
+      probe() {
+        return self.racers.map((r) => {
+          const proj = self.track.project(r.root.position);
+          const tp = self.track.sample(proj.u);
+          const speed = r.state.velocity.length();
+          const fwd = { x: Math.sin(r.state.heading), z: Math.cos(r.state.heading) };
+          return {
+            id: r.id,
+            name: r.name,
+            heading: r.state.heading,
+            headingFwd: fwd,
+            trackTangent: { x: tp.tangent.x, z: tp.tangent.z },
+            // >0 means the hull points along the track; <0 means backwards.
+            headingDotTangent: fwd.x * tp.tangent.x + fwd.z * tp.tangent.z,
+            velDotTangent: speed > 0.01 ? r.state.velocity.dot(tp.tangent) / speed : 0,
+            speed,
+            u: proj.u,
+            lateral: proj.lateral,
+            distToLine: proj.distance,
+            lap: r.lap,
+            nextCheckpoint: r.nextCheckpoint,
+            progress: r.progress,
+            place: r.place,
+            wrongWay: r.wrongWay,
+            finished: r.finished,
+            pos: r.root.position.toArray().map((v) => +v.toFixed(2)),
+          };
+        });
       },
 
       setCameraPreset(name: CameraPreset) {
@@ -327,8 +434,13 @@ class Game {
           phase: self.race.phase,
           speed: p.forwardSpeed,
           airborne: p.airborne,
+          airTime: p.airTime,
+          landingImpact: p.landingImpact,
           drifting: p.drifting,
+          driftTier: p.driftTier,
+          boostMeter: p.boostMeter,
           boostTime: p.boostTime,
+          wrongWay: self.ctx.player.wrongWay,
           position: p.position.toArray(),
           lap: self.ctx.player.lap,
           place: self.ctx.player.place,

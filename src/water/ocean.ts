@@ -20,45 +20,68 @@
  * The disc is re-centred every frame and snapped to a fixed grid. Snapping
  * matters: without it, vertices creep continuously relative to the wave field
  * and high-frequency crests visibly shimmer as the sampling points slide.
+ *
+ * ── Two fixes the first captures forced ─────────────────────────────────────
+ * 1. **Rings are rotated by a hashed offset.** With every ring's vertices at
+ *    the same angles, the grid's spokes line up into faint radial rays that
+ *    the eye picks up as rotational structure centred on the player. A
+ *    per-ring angular offset destroys that alignment; the quads skew by at
+ *    most half a cell, which is invisible.
+ * 2. **The grid publishes its own spacing to the shader.** The ocean material
+ *    band-limits the wave field to the local vertex spacing, so it needs to
+ *    know `spacing(r) ≈ 2πr / angularSteps` — measured here rather than
+ *    hard-coded there, so retuning the mesh cannot silently desync the filter.
  */
 
-import { BufferAttribute, BufferGeometry, type Camera, Mesh, Texture, Vector3 } from 'three';
+import { BufferAttribute, BufferGeometry, Mesh, Texture } from 'three';
 import { CONFIG } from '../core/config';
 import { createOceanMaterial } from './oceanMaterial';
+import { WaterFX } from './foam';
 import { maxWaveHeight, sampleHeight, sampleOcean } from './gerstner';
 import type { OceanSample } from './gerstner';
 import type { GameContext, OceanSampler, Subsystem } from '../core/types';
+
+/** Deterministic per-ring hash, so the mesh is identical on every run. */
+function ringHash(i: number): number {
+  let x = Math.imul(i ^ 0x9e3779b9, 0x85ebca6b) >>> 0;
+  x ^= x >>> 13;
+  x = Math.imul(x, 0xc2b2ae35) >>> 0;
+  return ((x ^ (x >>> 16)) >>> 0) / 4294967296;
+}
 
 /**
  * Build the radial lattice.
  *
  * Radius distribution is exponential: r(i) = R·(e^(k·i/N) − 1)/(e^k − 1).
- * That puts roughly half the rings inside the first 8% of the radius, which is
- * where the camera actually is, while still reaching 2.6 km for the horizon.
+ * k trades near-field density against mid-field density. k = 5.6 (the first
+ * attempt) put half the rings inside 150 m, which starved the 50–400 m band
+ * where the aliasing stripes were worst; k = 5.0 pushes that out to ~240 m and
+ * the mid-field reads much better with the same vertex count.
  *
  * The centre is a fan of triangles to a single origin vertex, avoiding the
  * pinched degenerate quads a naive polar grid produces at r → 0.
  */
-function buildRadialGrid(radialSteps: number, angularSteps: number, radius: number): BufferGeometry {
+function buildRadialGrid(radialSteps: number, angularSteps: number, radius: number, k: number) {
   const vertCount = 1 + radialSteps * angularSteps;
   const positions = new Float32Array(vertCount * 3);
   const uvs = new Float32Array(vertCount * 2);
 
-  // Origin vertex.
   positions[0] = 0;
   positions[1] = 0;
   positions[2] = 0;
 
-  const k = 5.6; // exponential tightness
   const denom = Math.exp(k) - 1;
+  const angStep = (Math.PI * 2) / angularSteps;
 
   let p = 3;
   let t = 2;
   for (let i = 0; i < radialSteps; i++) {
     const fi = (i + 1) / radialSteps;
-    const r = radius * (Math.exp(k * fi) - 1) / denom;
+    const r = (radius * (Math.exp(k * fi) - 1)) / denom;
+    // Break the spoke alignment that otherwise reads as radial rays.
+    const off = (ringHash(i) - 0.5) * angStep;
     for (let a = 0; a < angularSteps; a++) {
-      const theta = (a / angularSteps) * Math.PI * 2;
+      const theta = a * angStep + off;
       positions[p++] = Math.cos(theta) * r;
       positions[p++] = 0;
       positions[p++] = Math.sin(theta) * r;
@@ -67,7 +90,6 @@ function buildRadialGrid(radialSteps: number, angularSteps: number, radius: numb
     }
   }
 
-  // Indices: a central fan plus quad rings.
   const triCount = angularSteps + (radialSteps - 1) * angularSteps * 2;
   const indices = new Uint32Array(triCount * 3);
   let n = 0;
@@ -109,8 +131,19 @@ export class Ocean implements Subsystem, OceanSampler {
   readonly mesh: Mesh;
   private handles = createOceanMaterial();
 
-  constructor(radialSteps = 190, angularSteps = 256, radius = CONFIG.ocean.extent) {
-    const geo = buildRadialGrid(radialSteps, angularSteps, radius);
+  /**
+   * Wake ribbons + spray. Parented to the ocean mesh so that adding the ocean
+   * to the scene brings the water FX with it — the FX have no meaningful
+   * existence without the surface they live on, and this keeps the whole water
+   * subsystem to a single `scene.add()` and a single `update()`.
+   *
+   * The mesh is re-centred on the camera every frame, so the FX group carries
+   * the inverse offset to put its children back in absolute world space.
+   */
+  readonly fx = new WaterFX();
+
+  constructor(radialSteps = 224, angularSteps = 224, radius = CONFIG.ocean.extent, k = 5.0) {
+    const geo = buildRadialGrid(radialSteps, angularSteps, radius, k);
     this.mesh = new Mesh(geo, this.handles.material);
     this.mesh.name = 'ocean';
     this.mesh.frustumCulled = false;
@@ -120,6 +153,16 @@ export class Ocean implements Subsystem, OceanSampler {
     // water *reads* the G-buffer to build its foam ring, so it must not be in
     // it. See oceanMaterial.ts.
     this.mesh.userData.skipPrepass = true;
+
+    // Publish the mesh's own spacing law to the shader's band-limiting filter.
+    //   angular spacing = 2πr / angularSteps
+    //   radial  spacing = R·k/(N·(e^k−1)) · e^(k·fi)  — the same order, and at
+    //   the innermost ring it is the larger of the two, so it sets the floor.
+    const u = this.handles.material.uniforms;
+    u.uFilterSlope.value = (Math.PI * 2) / angularSteps;
+    u.uFilterBase.value = (radius * k) / (radialSteps * (Math.exp(k) - 1));
+
+    this.mesh.add(this.fx.group);
   }
 
   /** Called by the renderer once the G-buffer for this frame exists. */
@@ -131,6 +174,11 @@ export class Ocean implements Subsystem, OceanSampler {
     return this.handles.material;
   }
 
+  /** Exposed so the harness/critic loop can twiddle a threshold without a rebuild. */
+  get tunables() {
+    return this.handles.uniforms;
+  }
+
   update(ctx: GameContext) {
     // Re-centre on the camera, snapped so vertices do not creep against the
     // wave field. The snap interval must be larger than the finest wave
@@ -139,6 +187,15 @@ export class Ocean implements Subsystem, OceanSampler {
     const cx = Math.round(ctx.camera.position.x / snap) * snap;
     const cz = Math.round(ctx.camera.position.z / snap) * snap;
     this.mesh.position.set(cx, 0, cz);
+    // Undo the parent's offset so wake ribbons and spray stay in absolute world
+    // space; both of them address the wave field by world XZ.
+    this.fx.group.position.set(-cx, 0, -cz);
+
+    // FX run after the boats have moved. Ocean is order 20 and boat physics is
+    // order 30, so what we read here is last frame's hull position — one frame
+    // of latency on a trail that is metres long and seconds old is not
+    // observable, and it keeps the whole water subsystem on one registration.
+    this.fx.update(ctx);
   }
 
   // ── OceanSampler ──────────────────────────────────────────────────────────

@@ -44,6 +44,7 @@ import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
 import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
 import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
 import { PAL } from '../core/palette';
+import { paletteTone } from './celMaterial';
 
 const FULLSCREEN_VERT = /* glsl */ `
   varying vec2 vUv;
@@ -75,14 +76,21 @@ const EdgeShader = {
     tDepthId: { value: null as any },
     tFlare: { value: null as any },
     uResolution: { value: new Vector2() },
-    uInkColor: { value: PAL.ink.clone() },
+    uInkColor: { value: paletteTone(PAL.ink) },
     /** Line thickness in pixels. */
-    uThickness: { value: 1.35 },
-    uDepthThreshold: { value: 0.0055 },
-    uNormalThreshold: { value: 0.42 },
+    uThickness: { value: 1.15 },
+    uDepthThreshold: { value: 0.0060 },
+    /**
+     * 1 − dot(n, n'), so a 30° crease is 0.134 and a 45° crease is 0.29. The
+     * original 0.42 needed a *55° break* before it would ink anything, which is
+     * why the hull's chine — an authored, per-face-normal crease — never drew a
+     * line in any capture. 0.13 catches the creases that are actually modelled.
+     */
+    uNormalThreshold: { value: 0.13 },
     uEdgeStrength: { value: 0.95 },
-    uFlareStrength: { value: 0.85 },
-    uVignette: { value: 0.28 },
+    uFlareStrength: { value: 0.30 },
+    uVignette: { value: 0.26 },
+    uDither: { value: 1.0 },
   },
   vertexShader: FULLSCREEN_VERT,
   fragmentShader: /* glsl */ `
@@ -100,8 +108,22 @@ const EdgeShader = {
     uniform float uEdgeStrength;
     uniform float uFlareStrength;
     uniform float uVignette;
+    uniform float uDither;
 
     varying vec2 vUv;
+
+    float ditherNoise(vec2 c) {
+      vec2 p = floor(mod(c, 8.0));
+      return fract(52.9829189 * fract(dot(p, vec2(0.06711056, 0.00583715))));
+    }
+
+    /** Applied last, in the composite, so nothing downstream re-quantises. */
+    vec3 finish(vec3 col, vec2 uv) {
+      float v = 1.0 - uVignette * pow(length(uv - 0.5) * 1.42, 2.4);
+      col *= v;
+      float lsb = 0.0034 * pow(max(max(col.r, col.g), col.b), 0.55) * uDither;
+      return col + (ditherNoise(gl_FragCoord.xy) - 0.5) * lsb;
+    }
 
     void main() {
       vec2 texel = uThickness / uResolution;
@@ -116,8 +138,7 @@ const EdgeShader = {
       // Sky / anything that never wrote the G-buffer: leave it untouched.
       if (dc.a < 0.5 || edgeBias <= 0.001) {
         vec3 outc = scene + texture2D(tFlare, vUv).rgb * uFlareStrength;
-        float v = 1.0 - uVignette * pow(length(vUv - 0.5) * 1.42, 2.4);
-        gl_FragColor = vec4(outc * v, 1.0);
+        gl_FragColor = vec4(finish(outc, vUv), 1.0);
         return;
       }
 
@@ -152,36 +173,65 @@ const EdgeShader = {
       float depthEdge = smoothstep(uDepthThreshold, uDepthThreshold * 3.4, depthGrad);
       float normalEdge = smoothstep(uNormalThreshold, uNormalThreshold * 1.75, normalDiff);
 
-      // A very large depth gradient *is* a silhouette, and the inverted hull
-      // already inked it. Rolling the screen-space contribution off there is
-      // what stops the two systems doubling up into a fat, dirty edge.
-      float silhouette = smoothstep(uDepthThreshold * 6.0, uDepthThreshold * 16.0, depthGrad);
-      depthEdge *= (1.0 - silhouette * 0.88);
+      // Grazing surfaces are the one place a normal-difference Sobel lies. A
+      // panel seen almost edge-on packs many facets into a few pixels, so the
+      // G-buffer normal is undersampled and every tessellation seam reads as a
+      // crease — dense diagonal hatch across the boat's foredeck in
+      // shots/cel_r2/outline_check.png. Fade the normal signal as the surface
+      // turns away from the eye and only genuine, resolvable creases survive.
+      float facing = abs(centreNormal.z);
+      normalEdge *= smoothstep(0.14, 0.42, facing);
 
-      float edge = clamp(max(max(depthEdge, normalEdge), idDiff * 0.85), 0.0, 1.0);
+      // A very large depth gradient *is* a silhouette, and the inverted hull
+      // already inked it. Rolling *both* screen-space signals off there is what
+      // stops the two systems doubling up into a fat, dirty edge — the normal
+      // signal has to be rolled off too, because at a silhouette the neighbour
+      // sample lands on unrelated geometry and reads as a 90° crease.
+      float silhouette = smoothstep(uDepthThreshold * 5.0, uDepthThreshold * 14.0, depthGrad);
+      depthEdge *= (1.0 - silhouette * 0.92);
+      normalEdge *= (1.0 - silhouette * 0.80);
+
+      // Interior lines are the whole reason this pass exists, so the normal
+      // signal leads and the depth signal only fills in where two parallel
+      // surfaces overlap (a wing over a cowl).
+      float edge = clamp(max(max(depthEdge * 0.85, normalEdge), idDiff * (1.0 - silhouette * 0.9) * 0.8), 0.0, 1.0);
       edge *= edgeBias * uEdgeStrength;
 
       // Ink is multiplied in rather than mixed to white-point, so lines sit
       // *in* the artwork instead of on top of it.
-      vec3 col = mix(scene, uInkColor * (0.35 + 0.65 * scene), edge);
+      vec3 col = mix(scene, uInkColor + scene * 0.20, edge);
       col += texture2D(tFlare, vUv).rgb * uFlareStrength;
 
-      float v = 1.0 - uVignette * pow(length(vUv - 0.5) * 1.42, 2.4);
-      gl_FragColor = vec4(col * v, 1.0);
+      gl_FragColor = vec4(finish(col, vUv), 1.0);
     }
   `,
 };
 
-/** Hard threshold. No soft knee — a soft knee is what makes bloom photographic. */
+/**
+ * Hard threshold, plus a G-buffer opt-out.
+ *
+ * `uThreshold` is high on purpose. At 0.82 the palette's foam (0xf2fbff) sits
+ * just over the line, so every whitecap and every spray droplet bloomed and the
+ * water's hard ink edges turned to airbrush — the water subsystem was forced to
+ * keep its foam *below* white to work around it. At 0.94 only the sun, the sun's
+ * own drawn flare and a genuine specular glint qualify, which is the correct set.
+ *
+ * Materials can also opt out entirely via `flareMask: 0` on `createCelMaterial`,
+ * which lands in the G-buffer's blue channel. Geometry that never writes the
+ * G-buffer (particles, the sky) keeps the luminance test only, so the sun still
+ * flares while foam does not.
+ */
 const ThresholdShader = {
   uniforms: {
     tDiffuse: { value: null as any },
-    uThreshold: { value: 0.82 },
+    tDepthId: { value: null as any },
+    uThreshold: { value: 0.985 },
     uIntensity: { value: 1.0 },
   },
   vertexShader: FULLSCREEN_VERT,
   fragmentShader: /* glsl */ `
     uniform sampler2D tDiffuse;
+    uniform sampler2D tDepthId;
     uniform float uThreshold;
     uniform float uIntensity;
     varying vec2 vUv;
@@ -190,34 +240,80 @@ const ThresholdShader = {
       float lum = dot(c, vec3(0.2126, 0.7152, 0.0722));
       // step(), not smoothstep(): the flare should have a defined shape.
       float m = step(uThreshold, lum);
-      gl_FragColor = vec4(c * m * uIntensity, 1.0);
+      vec4 g = texture2D(tDepthId, vUv);
+      // g.a < 0.5 → nothing wrote the G-buffer here; allow.
+      float allow = g.a < 0.5 ? 1.0 : step(0.5, g.b);
+      gl_FragColor = vec4(c * m * allow * uIntensity, 1.0);
     }
   `,
 };
 
-const BlurShader = {
+/**
+ * The flare kernel — a **cross star**, not a bloom.
+ *
+ * An isotropic gaussian is what makes a highlight look photographic: it is a
+ * lens model, and the frame it produced (shots/cel_r0/sky.png) was a soft orange
+ * radial haze with blurred spokes, exactly what the brief rules out. Anime flares
+ * are anisotropic — long straight streaks along a few fixed axes with a small
+ * hard core — so this samples along four axes only, with taps spaced
+ * geometrically so the streaks reach far without needing many fetches.
+ *
+ * Running four directions in one pass rather than as a separable pair is what
+ * keeps them *straight*: two separable passes would smear the star into a square
+ * blob.
+ */
+const StreakShader = {
   uniforms: {
     tDiffuse: { value: null as any },
-    uDirection: { value: new Vector2(1, 0) },
     uResolution: { value: new Vector2() },
     uRadius: { value: 1.0 },
+    uCore: { value: 0.18 },
+    uStreak: { value: 0.42 },
   },
   vertexShader: FULLSCREEN_VERT,
   fragmentShader: /* glsl */ `
     uniform sampler2D tDiffuse;
-    uniform vec2 uDirection;
     uniform vec2 uResolution;
     uniform float uRadius;
+    uniform float uCore;
+    uniform float uStreak;
     varying vec2 vUv;
+
     void main() {
-      // 9-tap gaussian, linear-sampled to 5 fetches.
-      vec2 t = (uDirection / uResolution) * uRadius;
-      vec3 sum = texture2D(tDiffuse, vUv).rgb * 0.227027;
-      sum += texture2D(tDiffuse, vUv + t * 1.3846).rgb * 0.316216;
-      sum += texture2D(tDiffuse, vUv - t * 1.3846).rgb * 0.316216;
-      sum += texture2D(tDiffuse, vUv + t * 3.2308).rgb * 0.070270;
-      sum += texture2D(tDiffuse, vUv - t * 3.2308).rgb * 0.070270;
-      gl_FragColor = vec4(sum, 1.0);
+      vec2 px = uRadius / uResolution;
+      vec3 centre = texture2D(tDiffuse, vUv).rgb;
+
+      // Four axes: horizontal, vertical and both diagonals.
+      const int AXES = 4;
+      vec2 dirs[4];
+      dirs[0] = vec2(1.0, 0.0);
+      dirs[1] = vec2(0.0, 1.0);
+      dirs[2] = vec2(0.7071, 0.7071);
+      dirs[3] = vec2(0.7071, -0.7071);
+
+      vec3 streak = vec3(0.0);
+      float wsum = 0.0;
+      for (int a = 0; a < AXES; a++) {
+        // Geometric tap spacing: 1,2,4,8,16,28 px — a long reach for 12 fetches.
+        float d = 1.0;
+        for (int i = 0; i < 6; i++) {
+          float w = 1.0 / (1.0 + d * 0.85);
+          vec2 o = dirs[a] * px * d;
+          streak += (texture2D(tDiffuse, vUv + o).rgb + texture2D(tDiffuse, vUv - o).rgb) * w;
+          wsum += 2.0 * w;
+          d *= 1.85;
+        }
+      }
+      streak /= max(wsum, 1e-4);
+
+      // Small isotropic core so the very centre of a glint is solid, and the
+      // long streaks on top of it. The core is deliberately tiny: it is a
+      // *highlight*, and anything wider starts reading as a lens.
+      // The per-axis average is divided by the total weight of *all* axes, so
+      // multiplying back by the axis count restores one axis' worth of energy.
+      // Leaving the ×4 in (as the first pass did) made every near-white pixel a
+      // blown streak across the hull — shots/cel_r1/outline_check.png.
+      gl_FragColor = vec4(centre * uCore + streak * uStreak * float(AXES), 1.0);
     }
   `,
 };
@@ -228,7 +324,7 @@ export class InkComposer {
   private flareA: WebGLRenderTarget;
   private flareB: WebGLRenderTarget;
   private thresholdMat: ShaderMaterial;
-  private blurMat: ShaderMaterial;
+  private streakMat: ShaderMaterial;
   private edgePass: ShaderPass;
   private renderPass: RenderPass;
   private fsScene = new Scene();
@@ -275,7 +371,7 @@ export class InkComposer {
     // Standalone full-screen quad used for the flare chain, which runs outside
     // the composer so it can work at quarter resolution.
     this.thresholdMat = new ShaderMaterial({ ...ThresholdShader, blending: NoBlending });
-    this.blurMat = new ShaderMaterial({ ...BlurShader, blending: NoBlending });
+    this.streakMat = new ShaderMaterial({ ...StreakShader, blending: NoBlending });
     this.fsQuad = new Mesh(new PlaneGeometry(2, 2), this.thresholdMat);
     this.fsQuad.frustumCulled = false;
     this.fsScene.add(this.fsQuad);
@@ -292,7 +388,10 @@ export class InkComposer {
 
     const u = this.edgePass.uniforms;
     u.uResolution.value.set(this.width, this.height);
-    this.blurMat.uniforms.uResolution.value.set(this.width >> 2, this.height >> 2);
+    this.streakMat.uniforms.uResolution.value.set(
+      Math.max(1, this.width >> 2),
+      Math.max(1, this.height >> 2),
+    );
   }
 
   /**
@@ -336,29 +435,23 @@ export class InkComposer {
     }
   }
 
-  /** Threshold + separable blur at ¼ res → the stylised sun/spec flare. */
+  /** Threshold + one cross-star streak pass at ¼ res → the graphic flare. */
   private renderFlare(sourceTexture: any) {
     const prevTarget = this.renderer.getRenderTarget();
 
     this.fsQuad.material = this.thresholdMat;
     this.thresholdMat.uniforms.tDiffuse.value = sourceTexture;
-    this.renderer.setRenderTarget(this.flareA);
+    this.thresholdMat.uniforms.tDepthId.value = this.gbuffer.textures[1];
+    this.renderer.setRenderTarget(this.flareB);
     this.renderer.clear(true, false, false);
     this.renderer.render(this.fsScene, this.fsCamera);
 
-    this.fsQuad.material = this.blurMat;
-    for (let i = 0; i < 2; i++) {
-      this.blurMat.uniforms.tDiffuse.value = this.flareA.texture;
-      this.blurMat.uniforms.uDirection.value.set(1, 0);
-      this.blurMat.uniforms.uRadius.value = 1 + i * 2;
-      this.renderer.setRenderTarget(this.flareB);
-      this.renderer.render(this.fsScene, this.fsCamera);
-
-      this.blurMat.uniforms.tDiffuse.value = this.flareB.texture;
-      this.blurMat.uniforms.uDirection.value.set(0, 1);
-      this.renderer.setRenderTarget(this.flareA);
-      this.renderer.render(this.fsScene, this.fsCamera);
-    }
+    // Single pass, four axes. Re-blurring a streak just rounds it off.
+    this.fsQuad.material = this.streakMat;
+    this.streakMat.uniforms.tDiffuse.value = this.flareB.texture;
+    this.renderer.setRenderTarget(this.flareA);
+    this.renderer.clear(true, false, false);
+    this.renderer.render(this.fsScene, this.fsCamera);
 
     this.renderer.setRenderTarget(prevTarget);
   }
@@ -401,6 +494,10 @@ export class InkComposer {
   }
   get flareUniforms() {
     return this.thresholdMat.uniforms;
+  }
+  /** Streak kernel controls — radius, core weight, streak weight. */
+  get streakUniforms() {
+    return this.streakMat.uniforms;
   }
 
   dispose() {

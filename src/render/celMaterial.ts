@@ -41,7 +41,36 @@ import {
   Vector4,
 } from 'three';
 import { PAL, SUN_DIR } from '../core/palette';
-import { makeMatcapTexture, makeRampTexture } from './textures';
+import { makeGlossMatcap, makeMatcapTexture, makeRampTexture } from './textures';
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Palette gamma guard
+//
+// `src/core/palette.ts` builds every tone as `new Color(hex).convertSRGBToLinear()`.
+// three r152+ has ColorManagement on by default, so `new Color(hex)` has *already*
+// decoded sRGB into the linear working space — the explicit convert applies a
+// second decode and every mid tone collapses. Measured: PAL.hull0 comes out
+// (1, 0.0070, 0.0036) where the intended vermilion is (1, 0.0782, 0.0467), an
+// 11× error on the green channel. That is why the first capture of this scene had
+// pure-primary hulls with pitch-black shadow sides and riders that read as
+// silhouettes.
+//
+// palette.ts is foundation-owned so the fix has been reported, not applied.
+// Meanwhile every tone this file *authors* is corrected back through `paletteTone`,
+// which probes a mid-value palette entry at module load and collapses to the
+// identity the moment palette.ts is fixed. Nothing here reinterprets a colour a
+// caller passed in as a ramp *multiplier* — those are ratios, not tones.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** True while palette.ts is applying a second sRGB→linear decode. */
+export const PALETTE_DOUBLE_DECODED = PAL.skyMid.g < 0.15;
+
+/** Undo palette.ts's extra decode, if it is present. Identity once it is fixed. */
+export function paletteTone(c: Color): Color {
+  const out = c.clone();
+  if (PALETTE_DOUBLE_DECODED) out.convertLinearToSRGB();
+  return out;
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Shared uniforms — one object per name, referenced by every material, so the
@@ -97,10 +126,34 @@ export interface CelMaterialOptions {
   specSize2?: number;
   matcap?: Texture | null;
   matcapStrength?: number;
+  /**
+   * Ambient bounce weight per band, 0…1, shadow → light. Added (not
+   * multiplied) so the shadow bands shift *hue* toward the ambient instead of
+   * just going darker. Derived from `rampColors` when omitted.
+   */
+  rampAmbient?: number[];
+  /** The bounce tone added in the shadow bands. Defaults to sea-and-sky. */
+  ambientColor?: Color;
+  /** Master scale on the ambient bounce. */
+  ambientStrength?: number;
   /** Inverted-hull outline. Width is in *screen pixels* and stays constant. */
   outline?: boolean;
   outlineWidthPx?: number;
   outlineColor?: Color;
+  /**
+   * Projected radius (in pixels) below which the outline starts to thin.
+   * Above it the line is exactly `outlineWidthPx` at every distance. Set 0 to
+   * disable the taper entirely and get a truly constant width.
+   */
+  outlineTaperPx?: number;
+  /** Floor on the taper, so a distant object keeps *some* line. */
+  outlineTaperFloor?: number;
+  /**
+   * 0 = this surface never contributes to the stylised flare. Written to the
+   * G-buffer, so the threshold pass can keep hard white foam and spray out of
+   * the bloom. 1 = normal.
+   */
+  flareMask?: number;
   /** Written to the G-buffer; a discontinuity here forces an interior line. */
   objectId?: number;
   /** Multiplier on the Sobel response for this surface. 0 = never inked. */
@@ -115,17 +168,62 @@ export interface CelMaterialOptions {
   name?: string;
 }
 
-const DEFAULT_RAMP_STOPS = [0.0, 0.36, 0.52, 0.74];
+/**
+ * Band thresholds in half-lambert space, tuned against real frames.
+ *
+ * Note where they are *not*: evenly spaced. 0.42 puts the terminator well past
+ * the geometric one, so band 2 (the base tone) owns roughly half the sphere and
+ * the two shadow bands are squeezed into a narrow, decisive wedge on the dark
+ * side. That asymmetry is the whole difference between "3-tone cel painting"
+ * and "quantised Lambert": the earlier 0.36/0.52/0.74 spacing gave four bands of
+ * similar width and every curved surface read as a stepped gradient.
+ *
+ * Band 3 starts at 0.86 so the hot band is a narrow rim on the sun side — a
+ * *shape*, not a wash.
+ */
+const DEFAULT_RAMP_STOPS = [0.0, 0.30, 0.42, 0.86];
 
-function defaultRamp(base: Color): Color[] {
-  // Shadow tones are not "base × 0.5" — that reads as a dimmer, muddier version
-  // of the same hue. Real cel art shifts shadows toward the ambient (here: a
-  // cool sea blue) and pushes the lit band slightly warm and desaturated-up.
-  const shadowDeep = base.clone().lerp(PAL.waterDeep, 0.62).multiplyScalar(0.72);
-  const shadow = base.clone().lerp(PAL.waterMid, 0.3).multiplyScalar(0.86);
-  const lit = base.clone();
-  const hot = base.clone().lerp(PAL.foam, 0.26).multiplyScalar(1.12);
-  return [shadowDeep, shadow, lit, hot];
+/** Normalise a tone to its hue ratio, brightest channel = 1. */
+function hueRatio(c: Color): Color {
+  const m = Math.max(c.r, c.g, c.b) || 1;
+  return c.clone().multiplyScalar(1 / m);
+}
+
+// The ramp is a *multiplier*, so its steps must be near-neutral with a hue
+// *lean* — a full-strength blue multiplier does not read as "in shadow", it
+// reads as "the red channel is switched off".
+const NEUTRAL = hueRatio(paletteTone(PAL.hudPaper));
+const COOL_LEAN = hueRatio(paletteTone(PAL.skyMid)).lerp(NEUTRAL, 0.6);
+const WARM_LEAN = hueRatio(paletteTone(PAL.sun)).lerp(NEUTRAL, 0.72);
+
+/**
+ * The default 4-step ladder. Values, not hues, carry a cel image, so the steps
+ * are chosen as a value plan first: 0.30 / 0.55 / 0.94 / 1.0. The gap between
+ * band 1 and band 2 is the biggest jump in the ladder, which is what puts a
+ * decisive terminator on the form; band 3 is only a whisker above band 2 so the
+ * hot rim reads as a highlight rather than as a fifth tone.
+ */
+function defaultRamp(): Color[] {
+  return [
+    COOL_LEAN.clone().multiplyScalar(0.30),
+    COOL_LEAN.clone().multiplyScalar(0.55),
+    WARM_LEAN.clone().multiplyScalar(0.94),
+    WARM_LEAN.clone().multiplyScalar(1.0),
+  ];
+}
+
+/**
+ * Derive per-band ambient bounce from the ladder itself: the darker the band,
+ * the more sea-bounce is added into it. Squared so the mid band picks up only a
+ * hint and the deep shadow picks up most of it.
+ */
+function ambientFromRamp(ramp: Color[], lean: number): number[] {
+  const val = ramp.map((c) => Math.max(c.r, c.g, c.b));
+  const top = Math.max(...val, 1e-4);
+  return val.map((v) => {
+    const d = Math.max(0, 1 - v / top);
+    return Math.min(1, d * d * 1.9 * lean);
+  });
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -144,6 +242,9 @@ const VERT_COMMON = /* glsl */ `
   uniform float uNear;
   uniform float uFar;
   uniform float uOutlineWidthPx;
+  uniform float uOutlineRadius;
+  uniform float uOutlineTaperPx;
+  uniform float uOutlineTaperFloor;
   uniform vec3 uCameraPos;
 
   varying vec3 vWorldNormal;
@@ -183,8 +284,7 @@ const VERT_COMMON = /* glsl */ `
 `;
 
 /**
- * The outline push. Done in *view space* so the offset can be expressed in
- * world units that correspond to a fixed pixel count at this depth:
+ * The outline push.
  *
  *   unitsPerPixel = 2 · depth · tan(fovY/2) / screenHeightInPixels
  *
@@ -192,6 +292,36 @@ const VERT_COMMON = /* glsl */ `
  * boat 3 m away and a gate 300 m away. Scaling the push by a constant instead
  * — the common shortcut — gives fat lines up close and lines that vanish in
  * the distance, which the brief explicitly rules out.
+ *
+ * ── Why the push is XY-only ────────────────────────────────────────────────
+ * The obvious version offsets along the full view-space normal,
+ * `mvPosition.xyz += vn * w`. That moves every vertex whose smooth normal leans
+ * toward the camera *toward the camera*, so the inverted hull's back shell
+ * surfaces through the front faces wherever the two are within depth precision
+ * of each other. On the boat's foredeck — a large, near-planar surface seen at a
+ * grazing angle — it produced dense curved moiré across the whole panel
+ * (shots/cel_r0/rider_closeup.png, unmistakable at 3×).
+ *
+ * Expanding in screen space instead is both cheaper to reason about and exactly
+ * right: the outline only needs to grow *sideways* on screen. Vertices whose
+ * normal points at or away from the camera have `vn.xy ≈ 0` and do not move at
+ * all, so the shell stays buried behind the surface it belongs to, while
+ * silhouette vertices (`|vn.xy| ≈ 1`) get the full width. The line is then
+ * exactly `w` pixels wide by construction rather than approximately.
+ *
+ * A constant *relative* depth bias pushes the shell away from the eye so
+ * coincident geometry (thin plates, the transom lip) always loses the depth
+ * test rather than dithering against it.
+ *
+ * ── The taper ──────────────────────────────────────────────────────────────
+ * Truly constant width is wrong at the small end: at 100 m a boat is ~50 px
+ * long and a 5 px line on each side eats 20% of the silhouette, which is why
+ * the player's vermilion hull read as a solid black speck in
+ * shots/cel_r0/outline_far.png. The width is therefore held exactly constant
+ * until the object's *projected radius* drops below `uOutlineTaperPx`, and only
+ * then thins in proportion to apparent size. The ratio of line to form stays
+ * bounded, which is the artistic intent behind "constant width" in the first
+ * place. Set `outlineTaperPx: 0` for a strictly constant line.
  *
  * The normal used is `aSmoothNormal`: an area-weighted normal merged across
  * split vertices. Using the shading normal instead tears the hull open at
@@ -202,13 +332,25 @@ const OUTLINE_PUSH = /* glsl */ `
     vec3 vn = normalize(normalMatrix * smoothNormal);
     float depth = max(-mvPosition.z, uNear);
     float unitsPerPixel = (2.0 * depth * uTanHalfFov) / uResolution.y;
-    // Fade the line out as the surface turns edge-on to the camera, otherwise
-    // grazing faces smear the outline into a wide band.
-    float grazing = abs(vn.z);
-    float w = uOutlineWidthPx * mix(0.55, 1.0, smoothstep(0.0, 0.35, grazing));
-    mvPosition.xyz += vn * (w * unitsPerPixel);
-    // Nudge toward the camera so the hull doesn't z-fight the surface it hugs.
-    mvPosition.z += unitsPerPixel * 0.35;
+
+    // Apparent size of this object, in pixels of radius.
+    float projPx = uOutlineRadius / max(unitsPerPixel, 1e-6);
+    float taper = 1.0;
+    if (uOutlineTaperPx > 0.0 && uOutlineRadius > 0.0) {
+      taper = clamp(projPx / uOutlineTaperPx, uOutlineTaperFloor, 1.0);
+    }
+    float w = uOutlineWidthPx * taper;
+
+    vec2 dir = vn.xy;
+    float len = length(dir);
+    dir = len > 1.0e-4 ? dir / len : vec2(0.0);
+    // Weight by how much of the normal actually lies in the screen plane, so
+    // the expansion ramps in smoothly around the silhouette instead of popping
+    // to full width the instant vn.xy is non-zero.
+    mvPosition.xy += dir * (w * unitsPerPixel * smoothstep(0.02, 0.30, len));
+    // Away from the eye (view space looks down -Z), so a coincident shell
+    // always loses the depth test instead of dithering against it.
+    mvPosition.z -= unitsPerPixel * 1.2;
   }
 `;
 
@@ -217,6 +359,7 @@ const FRAG_MAIN = /* glsl */ `
 
   uniform vec3 uColor;
   uniform sampler2D uRamp;
+  uniform float uRampScale;
   uniform vec3 uRimColor;
   uniform float uRimPower;
   uniform float uRimStrength;
@@ -226,6 +369,8 @@ const FRAG_MAIN = /* glsl */ `
   uniform float uSpecStrength;
   uniform sampler2D uMatcap;
   uniform float uMatcapStrength;
+  uniform vec3 uAmbientColor;
+  uniform float uAmbientStrength;
   uniform float uOpacity;
   uniform vec3 uSunDir;
   uniform vec3 uCameraPos;
@@ -255,40 +400,77 @@ const FRAG_MAIN = /* glsl */ `
     // placed them rather than crushing everything past the terminator into
     // band 0. The ramp texture itself does the stepping (NearestFilter).
     float ndl = dot(N, L) * 0.5 + 0.5;
-    vec3 celShade = texture2D(uRamp, vec2(clamp(ndl, 0.01, 0.99), 0.5)).rgb;
+    vec4 rampSample = texture2D(uRamp, vec2(clamp(ndl, 0.01, 0.99), 0.5));
+    vec3 celShade = rampSample.rgb * uRampScale;
+    float celAmbient = rampSample.a;
 
     CHUNK_FRAGMENT_BODY
 
     vec3 lit = baseColor * celShade;
 
+    // ── Ambient bounce in the shadow bands ──────────────────────────────────
+    // The ramp alone can only *scale* the surface colour, so a shadow could only
+    // ever be a darker version of the base hue — a vermilion hull measured
+    // (58,2,2) in the first capture, a black-red with the green and blue
+    // channels effectively switched off. Adding a cool sea-and-sky bounce into
+    // the dark bands is what makes the terminator a *hue* transition, and it
+    // lifts the shadow enough that the ink line reads as a separate mark
+    // instead of merging into it.
+    // 0.62 hue retention, not 0.45: at 0.45 the ambient overwhelmed small dark
+    // objects and the shadow side of the racer's red helmet came out flat
+    // grey-blue, so the helmet read as two different materials
+    // (shots/cel_r4/rider_closeup.png at 3×).
+    lit += uAmbientColor * (celAmbient * uAmbientStrength) * mix(vec3(1.0), baseColor, 0.62);
+
     // ── Banded specular ─────────────────────────────────────────────────────
     // Two hard thresholds on the Blinn term, never a pow() falloff. The result
     // is a highlight with a stepped shoulder — a *shape*, which is what reads
     // as drawn rather than rendered.
+    //
+    // Gated by the diffuse band: an unshadowed step() on N·H puts highlights on
+    // faces the key light never reaches, which is the single most PBR-looking
+    // mistake available here.
     vec3 H = normalize(L + V);
     float spec = dot(N, H);
+    float specLight = step(0.5, ndl);
     float s1 = step(uSpecSize, spec);
     float s2 = step(uSpecSize2, spec);
-    lit += uSpecColor * uSpecStrength * (s1 * 0.45 + s2 * 0.55);
+    lit += uSpecColor * uSpecStrength * specLight * (s1 * 0.42 + s2 * 0.58);
 
     // ── Fresnel rim ─────────────────────────────────────────────────────────
-    // Quantised to two steps so the rim is a drawn edge, not an airbrush.
-    // Weighted toward the light side so it reads as bounce, not a glow outline.
+    // Quantised to two steps so the rim is a drawn edge, not an airbrush, and
+    // clipped to the *upper* half of the form: a rim that runs all the way round
+    // is a glow, whereas a rim that stops partway is a drawn light-line.
     float fres = 1.0 - max(dot(N, V), 0.0);
     float rim = pow(fres, uRimPower);
-    float rimSide = smoothstep(-0.45, 0.65, dot(N, L));
-    float rimStep = step(0.55, rim) * 0.62 + step(0.78, rim) * 0.38;
-    lit += uRimColor * (rimStep * uRimStrength * mix(0.35, 1.0, rimSide));
+    float rimSide = step(-0.15, dot(N, L)) * 0.55 + step(0.30, dot(N, L)) * 0.45;
+    // Bias toward up-facing edges — sky bounce comes from above, and biasing it
+    // keeps the rim from ringing the whole silhouette like a halo.
+    // Biased to the *flanks*, not to up-facing planes: a deck's normal points at
+    // the sky, so an up-biased rim floods the whole deck with a pale wash instead
+    // of drawing a line (visible on the foredeck in shots/cel_r3/outline_check.png).
+    float rimUp = (0.55 + 0.45 * smoothstep(-0.4, 0.30, N.y)) * (1.0 - 0.45 * smoothstep(0.55, 0.95, N.y));
+    // Thresholds are low on purpose. A rim confined to the last 2% of the form
+    // is completely hidden underneath the inverted-hull ink line, which is 3-5 px
+    // wide and sits in exactly that band — the first captures had a
+    // mathematically correct rim that could not be seen anywhere. These two steps
+    // put the light-line *inboard* of the ink, which is where an animator draws it.
+    float rimStep = step(0.24, rim) * 0.45 + step(0.52, rim) * 0.55;
+    lit += uRimColor * (rimStep * uRimStrength * rimSide * rimUp);
 
     // ── Faked reflection ────────────────────────────────────────────────────
     // A drawn matcap, sampled by the view-space normal. Deliberately not a
-    // cubemap: an accurate reflection is the fastest way to make a surface
-    // read as physically based.
+    // cubemap: an accurate reflection is the fastest way to make a surface read
+    // as physically based. The default disc is two flat zones split by a hard
+    // horizon (see makeGlossMatcap), and it is admitted only where the key light
+    // already reaches, so it reads as a drawn sheen sitting on the lit planes
+    // rather than as an environment probe wrapped round the whole object.
     #ifdef USE_MATCAP
       vec3 vn = normalize(vViewNormal);
       vec2 mUv = vn.xy * 0.5 + 0.5;
       vec3 mc = texture2D(uMatcap, mUv).rgb;
-      lit = mix(lit, lit + mc * baseColor, uMatcapStrength);
+      float glossGate = step(0.56, ndl);
+      lit += mc * (uMatcapStrength * glossGate) * mix(vec3(1.0), baseColor, 0.55);
     #endif
 
     gl_FragColor = vec4(lit, uOpacity);
@@ -298,7 +480,7 @@ const FRAG_MAIN = /* glsl */ `
 /**
  * Prepass fragment. GLSL3 with two colour attachments:
  *   layout 0 → view-space normal (rgb, [0,1] encoded) + edge bias (a)
- *   layout 1 → linear view depth (r), object id (g), unused (ba)
+ *   layout 1 → linear view depth (r), object id (g), flare mask (b), 1 (a)
  *
  * The Sobel pass reads both. Depth alone misses edges between coplanar
  * surfaces; normals alone miss edges where two parallel surfaces overlap at
@@ -311,6 +493,7 @@ const PREPASS_FRAG = /* glsl */ `
 
   uniform float uObjectId;
   uniform float uEdgeBias;
+  uniform float uFlareMask;
   uniform float uFar;
 
   in vec3 vWorldNormal;
@@ -326,7 +509,7 @@ const PREPASS_FRAG = /* glsl */ `
   void main() {
     vec3 vn = normalize(vViewNormal);
     gNormal = vec4(vn * 0.5 + 0.5, uEdgeBias);
-    gDepthId = vec4(clamp(-vViewPos.z / uFar, 0.0, 1.0), uObjectId, 0.0, 1.0);
+    gDepthId = vec4(clamp(-vViewPos.z / uFar, 0.0, 1.0), uObjectId, uFlareMask, 1.0);
   }
 `;
 
@@ -367,29 +550,79 @@ export function nextObjectId(): number {
   return objectIdCounter / 255;
 }
 
+/**
+ * The shared default gloss disc. One texture for the whole scene: it is a
+ * *stylisation*, not a probe, so there is nothing per-object about it.
+ */
+let defaultMatcap: Texture | null = null;
+function getDefaultMatcap(): Texture {
+  if (!defaultMatcap) {
+    defaultMatcap = makeGlossMatcap(
+      paletteTone(PAL.skyHorizon).multiplyScalar(0.34),
+      paletteTone(PAL.waterMid).multiplyScalar(0.30),
+      paletteTone(PAL.foam).multiplyScalar(0.60),
+    );
+  }
+  return defaultMatcap;
+}
+
+/** Cool bounce added into the shadow bands: sea below, sky above, averaged. */
+const DEFAULT_AMBIENT = paletteTone(PAL.waterMid)
+  .lerp(paletteTone(PAL.skyHorizon), 0.52)
+  .multiplyScalar(0.72);
+
 export function createCelMaterial(opts: CelMaterialOptions = {}): CelMaterialSet {
-  const color = opts.color ?? PAL.hull0;
-  const rampColors = opts.rampColors ?? defaultRamp(color);
+  // A palette tone, so it is corrected; ramp colours are ratios and are not.
+  const color = paletteTone(opts.color ?? PAL.hull0);
+  const rampColors = opts.rampColors ?? defaultRamp();
   const rampStops = opts.rampStops ?? DEFAULT_RAMP_STOPS;
-  const ramp = makeRampTexture(rampColors, rampStops);
+  const rampAmbient = opts.rampAmbient ?? ambientFromRamp(rampColors, 1.0);
+  // The ramp lives in an 8-bit texture, so a ladder whose steps exceed 1.0 (the
+  // graphite trim on the boats runs up to ×5.2) has to be normalised and the
+  // scale restored in the shader. Without this the values used to *wrap* in the
+  // Uint8Array — ×1.6 came back as 46/255 — and clamping them instead simply
+  // flattened the top of the ladder into one tone.
+  const rampScale = Math.min(
+    8,
+    Math.max(1, ...rampColors.map((c) => Math.max(c.r, c.g, c.b))),
+  );
+  const rampNorm =
+    rampScale > 1 ? rampColors.map((c) => c.clone().multiplyScalar(1 / rampScale)) : rampColors;
+  const ramp = makeRampTexture(rampNorm, rampStops, 64, rampAmbient);
 
   const uniforms: Record<string, IUniform> = {
-    uColor: { value: color.clone() },
+    uColor: { value: color },
     uRamp: { value: ramp },
-    uRimColor: { value: (opts.rimColor ?? PAL.skyHorizon).clone() },
+    uRampScale: { value: rampScale },
+    uRimColor: { value: paletteTone(opts.rimColor ?? PAL.skyHorizon) },
     uRimPower: { value: opts.rimPower ?? 3.0 },
     uRimStrength: { value: opts.rimStrength ?? 0.6 },
-    uSpecColor: { value: (opts.specColor ?? PAL.foam).clone() },
-    uSpecSize: { value: opts.specSize ?? 0.86 },
-    uSpecSize2: { value: opts.specSize2 ?? 0.955 },
-    uSpecStrength: { value: opts.specStrength ?? 0.35 },
-    uMatcap: { value: opts.matcap ?? null },
-    uMatcapStrength: { value: opts.matcapStrength ?? 0.0 },
+    uSpecColor: { value: paletteTone(opts.specColor ?? PAL.foam) },
+    uSpecSize: { value: opts.specSize ?? 0.94 },
+    uSpecSize2: { value: opts.specSize2 ?? 0.985 },
+    uSpecStrength: { value: opts.specStrength ?? 0.3 },
+    uMatcap: { value: opts.matcap === null ? null : (opts.matcap ?? getDefaultMatcap()) },
+    // Small by default, but non-zero: the brief wants the drawn matcap actually
+    // in use, and a low-strength two-tone disc is what puts a graphic sheen on
+    // the curved planes of a hull or a helmet.
+    uMatcapStrength: { value: opts.matcapStrength ?? 0.5 },
+    uAmbientColor: { value: paletteTone(opts.ambientColor ?? PAL.waterMid).lerp(paletteTone(PAL.skyHorizon), 0.52) },
+    uAmbientStrength: { value: opts.ambientStrength ?? 0.62 },
     uOpacity: { value: opts.opacity ?? 1.0 },
     uObjectId: { value: opts.objectId ?? nextObjectId() },
     uEdgeBias: { value: opts.edgeBias ?? 1.0 },
+    uFlareMask: { value: opts.flareMask ?? 1.0 },
     uOutlineWidthPx: { value: opts.outlineWidthPx ?? 2.6 },
-    uOutlineColor: { value: (opts.outlineColor ?? PAL.ink).clone() },
+    uOutlineColor: { value: paletteTone(opts.outlineColor ?? PAL.ink) },
+    // Filled in per mesh by applyCel from the geometry's bounding sphere.
+    // 0 means "unknown", which disables the taper rather than guessing.
+    uOutlineRadius: { value: 0.0 },
+    // 130 px of projected radius ≈ 30 m for a boat, which is where a 5 px line
+    // starts to eat the silhouette (measured: at 60 m the hull is 70 px long and
+    // an untapered line turned the whole stern into an ink mass —
+    // shots/cel_probe3/ol_60m.png).
+    uOutlineTaperPx: { value: opts.outlineTaperPx ?? 130 },
+    uOutlineTaperFloor: { value: opts.outlineTaperFloor ?? 0.38 },
     // Shared references — assigning the same IUniform object keeps every
     // material in the scene in sync from a single write per frame.
     uTime: SHARED.uTime,
@@ -403,9 +636,15 @@ export function createCelMaterial(opts: CelMaterialOptions = {}): CelMaterialSet
   };
 
   const defines: Record<string, string | number | boolean> = { ...(opts.chunks?.defines ?? {}) };
-  if (opts.matcap) defines.USE_MATCAP = '';
+  if (uniforms.uMatcap.value) defines.USE_MATCAP = '';
   if (opts.vertexColors) defines.USE_VERTEX_COLORS = '';
   if (opts.flatShading) defines.FLAT_SHADING = '';
+
+  // `vertexColors` has to be set on *all three* materials, not just `main`:
+  // three only emits `attribute vec3 color;` when the flag is on, so the prepass
+  // and outline shaders would reference an undeclared attribute and fail to
+  // compile. This is the trap two subsystems reported hitting.
+  const vertexColors = !!opts.vertexColors;
 
   const main = new ShaderMaterial({
     name: opts.name ?? 'cel',
@@ -416,7 +655,7 @@ export function createCelMaterial(opts: CelMaterialOptions = {}): CelMaterialSet
     side: opts.side ?? FrontSide,
     transparent: opts.transparent ?? false,
     opacity: opts.opacity ?? 1,
-    vertexColors: !!opts.vertexColors,
+    vertexColors,
   });
 
   const prepass = new ShaderMaterial({
@@ -427,6 +666,7 @@ export function createCelMaterial(opts: CelMaterialOptions = {}): CelMaterialSet
     vertexShader: toGLSL3Vertex(applyChunks(VERT_COMMON, opts.chunks, false)),
     fragmentShader: PREPASS_FRAG,
     side: opts.side ?? FrontSide,
+    vertexColors,
   });
 
   let outline: ShaderMaterial | null = null;
@@ -435,20 +675,26 @@ export function createCelMaterial(opts: CelMaterialOptions = {}): CelMaterialSet
       name: (opts.name ?? 'cel') + ':outline',
       uniforms,
       defines,
+      vertexColors,
       vertexShader: applyChunks(VERT_COMMON, opts.chunks, true),
       fragmentShader: /* glsl */ `
         precision highp float;
         uniform vec3 uOutlineColor;
         uniform vec3 uSunDir;
+        uniform vec3 uAmbientColor;
         varying vec3 vWorldNormal;
         varying vec3 vWorldPos;
         varying vec3 vViewPos;
         void main() {
-          // Ink is not flat black: it warms very slightly on the lit side, the
-          // way a brush line thins where light hits it. Subtle, but it stops
-          // the outline reading as a hard vector stroke pasted on top.
+          // Ink is not flat black and it is not one value all the way round.
+          // A brush line thins and lightens where light rakes across the form
+          // and thickens into the shadow, so the ink is lifted toward the
+          // ambient on the sun side. Two hard steps, not a gradient — this is
+          // still a drawn line, and a smoothly varying stroke reads as a
+          // rendered shell rather than as ink.
           float lightSide = dot(normalize(vWorldNormal), normalize(uSunDir)) * 0.5 + 0.5;
-          vec3 ink = uOutlineColor * mix(1.0, 1.32, smoothstep(0.55, 1.0, lightSide));
+          float lift = step(0.56, lightSide) * 0.55 + step(0.80, lightSide) * 0.45;
+          vec3 ink = uOutlineColor + uAmbientColor * (lift * 0.022);
           gl_FragColor = vec4(ink, 1.0);
         }
       `,
@@ -528,6 +774,16 @@ export function computeSmoothNormals(geometry: BufferGeometry): BufferGeometry {
  */
 export function applyCel(mesh: Mesh, set: CelMaterialSet, renderOrder = 0): Mesh {
   computeSmoothNormals(mesh.geometry);
+
+  // Feed the outline's size taper. When several meshes share one material set
+  // (a rider's soft and hard shells, a boat's hull and trim) the largest wins,
+  // so a small part never thins out while the form it belongs to is still big
+  // on screen.
+  if (!mesh.geometry.boundingSphere) mesh.geometry.computeBoundingSphere();
+  const r = mesh.geometry.boundingSphere?.radius ?? 1;
+  const u = set.uniforms.uOutlineRadius;
+  if (u) u.value = Math.max(u.value as number, r);
+
   mesh.material = set.main;
   mesh.renderOrder = renderOrder;
   mesh.userData.prepassMaterial = set.prepass;
