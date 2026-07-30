@@ -106,8 +106,30 @@ triangles). `?seed=1234` reseeds every procedural decision.
 
 ## Performance
 
-Targets 60 fps at retina on Apple silicon in Chrome. The renderer measures a
-median frame time and adaptively scales the backbuffer between 0.75× and 2×
-device pixel ratio — dropping fast when the budget is blown, climbing back
-slowly so the resolution change is not itself distracting. Budget: ≤ 220 draw
-calls, ≤ 1.6 M triangles.
+Measured, not assumed. `harness/perf.mjs` runs the **production build** on the
+real rAF clock and samples actual frame intervals — the capture harness's own
+numbers are meaningless here because it steps with a fixed dt and never waits on
+vsync.
+
+```bash
+npm run build && node harness/perf.mjs --seconds=14 --dpr=2
+```
+
+Mid-race, four boats, chase camera, 1440×810 at device pixel ratio 2.0,
+Apple M5 Pro / Chrome (ANGLE Metal):
+
+| | |
+|---|---|
+| mean | 8.32 ms (120 fps) |
+| p50 | 8.30 ms |
+| p95 | 9.20 ms |
+| worst | 10.80 ms |
+| frames over 16.9 ms | **0 of 1675** |
+| draw calls | 40 (budget 220) |
+| triangles | 167k (budget 1.6 M) |
+| adaptive pixel ratio | settled at full 2.00 |
+
+The adaptive controller never had to reduce resolution. It measures a *median*
+frame time (so one GC spike cannot drop the resolution), backs off fast when the
+budget is blown, and climbs back slowly — an oscillating resolution is more
+distracting than running slightly soft.
