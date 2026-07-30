@@ -123,8 +123,26 @@ export const CONFIG = {
     /** Nose-up pitch-rate impulse per m/s of landing impact. */
     slamPitchKick: 0.075,
 
-    /** Airtime detection: every probe this far above the surface = airborne. */
-    airborneThreshold: 0.45,
+    // ── Contact state ───────────────────────────────────────────────────────
+    /**
+     * Metres the hull's **lowest** point (the skeg tip, at y = -0.60) must clear
+     * the wave surface by before the boat counts as flying. Measured on the
+     * contact-point table in `boatPhysics.ts`, not on the buoyancy probe plane:
+     * the probe plane is 34 cm higher, so the old test read AIR with a third of
+     * a metre of skeg still in the water.
+     */
+    airborneClearance: 0.15,
+    /**
+     * Minimum flight duration before `state.airborne` is published. In this sea
+     * the hull breaks contact for two or three frames on most crests; without a
+     * gate the HUD's AIR badge strobes several times a second.
+     */
+    airMinDuration: 0.25,
+    /**
+     * Coyote time. Once flying, a clearance dip shorter than this does not end
+     * the flight — but any real water contact does, immediately.
+     */
+    airCoyote: 0.09,
 
     // ── Collision ───────────────────────────────────────────────────────────
     /** Radius of each of the two spheres approximating a hull. */

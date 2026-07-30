@@ -15,11 +15,13 @@ import { clamp01, formatTime, ordinal } from '../core/mathx';
 import { HEX } from '../core/palette';
 import {
   FONT_STACK,
+  PLATE_SKEW,
+  PLATE_W,
   cutPath,
   diamondPath,
-  halo,
   inkText,
   inked,
+  plate,
   rgba,
   segText,
   slantPath,
@@ -159,7 +161,7 @@ export class Screens {
     ] as const) {
       const bw2 = w * 0.34;
       const bar = slantPath(-bw2 * 0.5, dy, bw2, hh, 24 * s);
-      inked(g, bar, rgba(HEX.ink, al), rgba(edge, 0.9), 2.4 * s);
+      inked(g, bar, rgba(HEX.ink, al), rgba(edge, 0.9), PLATE_W * s);
     }
     g.restore();
 
@@ -230,7 +232,7 @@ export class Screens {
     const px = Math.round(h * 0.3);
     // Ink slab behind the word so it reads even over bright foam.
     const slab = slantPath(-w * 0.24, -px * 0.62, w * 0.48, px * 0.98, 34 * s);
-    inked(g, slab, rgba(HEX.ink, 0.86), rgba(HEX.raceLine, 0.9), 3.5 * s);
+    inked(g, slab, rgba(HEX.ink, 1), rgba(HEX.raceLine, 0.9), PLATE_W * s);
     inkText(g, 'GO!', 0, px * 0.3, {
       font: `900 ${px}px ${FONT_STACK}`,
       fill: rgba(HEX.raceLine, 1),
@@ -261,7 +263,7 @@ export class Screens {
     const tw = g.measureText(label).width + 12 * s * label.length * 0.12 + 56 * s;
     const hgt = 48 * s;
     const p = slantPath(cx - tw / 2, cy - hgt / 2, tw, hgt, 16 * s);
-    inked(g, p, rgba(HEX.ink, 0.85), rgba(HEX.hudPaper, 0.55 + 0.35 * Math.sin(pulse * 8)), 3 * s);
+    inked(g, p, rgba(HEX.ink, 1), rgba(HEX.hudPaper, 0.55 + 0.35 * Math.sin(pulse * 8)), PLATE_W * s);
     g.restore();
     inkText(g, label, cx, cy + 9 * s, {
       font: `800 ${Math.round(26 * s)}px ${FONT_STACK}`,
@@ -404,15 +406,14 @@ export class Screens {
       g.save();
       g.globalAlpha = e;
 
-      const plate = slantPath(rx, ry, rw, rowH, 22 * s);
-      halo(g, plate, rgba(HEX.ink, 0.45), 12 * s);
-      inked(
-        g,
-        plate,
-        rgba(HEX.hudInk, isPlayer ? 0.95 : 0.82),
-        isPlayer ? rgba(HEX.hudPaper, 0.95) : rgba(HEX.hudDim, 0.7),
-        isPlayer ? 3.6 * s : 2.4 * s,
-      );
+      // Same plate treatment as every panel in the game: opaque fill, hard ink
+      // keyline, one outline weight. Which row is yours is said by the chip, the
+      // rail and the name brightness, not by a heavier frame.
+      const row = slantPath(rx, ry, rw, rowH, rowH * PLATE_SKEW);
+      plate(g, row, s, {
+        fill: rgba(isPlayer ? HEX.hudInk : HEX.inkSoft, 1),
+        edge: rgba(HEX.hudPaper, isPlayer ? 0.95 : 0.72),
+      });
 
       // Colour chip welded to the left edge; the player's row also gets a
       // full-length hull-colour rail so it reads as *your* row, not merely as
@@ -467,10 +468,11 @@ export class Screens {
       // Finish time, right-aligned, in the same seven-segment face as the HUD.
       const tx = rx + rw - 24 * s;
       if (r.finished) {
+        // Lit segments only. The unlit field behind these turned "3:41.300" and
+        // "L1 1:11.200" into ambiguous glyphs at capture scale.
         segText(g, formatTime(r.finishTime), tx, ry + 11 * s, 25 * s, {
           lit: rgba(HEX.hudPaper, 1),
-          dim: rgba(HEX.hudDim, 0.1),
-          ink: rgba(HEX.ink, 0.8),
+          ink: rgba(HEX.ink, 1),
           inkWidth: 1.4 * s,
           align: 'right',
           skew: 0.09,
@@ -504,8 +506,7 @@ export class Screens {
       const pw = Math.min(rowW * 0.72, 424 * s);
       const px = boardCx - pw * 0.5;
       const plaque = cutPath(px, footY - 24 * s, pw, 46 * s, 14 * s, 0b0101);
-      halo(g, plaque, rgba(HEX.ink, 0.45), 10 * s);
-      inked(g, plaque, rgba(HEX.hudInk, 0.92), rgba(HEX.raceLine, 0.85), 2.4 * s);
+      plate(g, plaque, s, { edge: rgba(HEX.raceLine, 0.9) });
       inkText(g, 'FASTEST LAP', px + 18 * s, footY + 4 * s, {
         font: `800 ${Math.round(13 * s)}px ${FONT_STACK}`,
         fill: rgba(HEX.raceLine, 1),
@@ -522,7 +523,8 @@ export class Screens {
       const lapStr = isFinite(fl.bestLap) ? formatTime(fl.bestLap) : '0:00.000';
       segText(g, lapStr, px + pw - 24 * s, footY - 14 * s, 25 * s, {
         lit: rgba(HEX.hudPaper, 1),
-        dim: rgba(HEX.hudDim, 0.1),
+        ink: rgba(HEX.ink, 1),
+        inkWidth: 1.4 * s,
         align: 'right',
         skew: 0.09,
       });
@@ -543,14 +545,10 @@ export class Screens {
         for (let i = 0; i < laps.length; i++) {
           const x = sx + i * (cellW + 10 * s);
           const isBest = laps[i] === bestVal;
-          const cell = slantPath(x, sy, cellW, 38 * s, 12 * s);
-          inked(
-            g,
-            cell,
-            rgba(HEX.hudInk, 0.88),
-            isBest ? rgba(HEX.raceLine, 0.8) : rgba(HEX.hudDim, 0.55),
-            2 * s,
-          );
+          const cell = slantPath(x, sy, cellW, 38 * s, 38 * s * PLATE_SKEW);
+          plate(g, cell, s, {
+            edge: isBest ? rgba(HEX.raceLine, 0.9) : rgba(HEX.hudPaper, 0.72),
+          });
           inkText(g, `L${i + 1}`, x + 16 * s, sy + 26 * s, {
             font: `800 ${Math.round(14 * s)}px ${FONT_STACK}`,
             fill: rgba(isBest ? HEX.raceLine : HEX.hudDim, 1),
@@ -559,7 +557,8 @@ export class Screens {
           });
           segText(g, formatTime(laps[i]), x + cellW - 12 * s, sy + 10 * s, 18 * s, {
             lit: rgba(isBest ? HEX.raceLine : HEX.foamShade, 1),
-            dim: rgba(HEX.hudDim, 0.1),
+            ink: rgba(HEX.ink, 1),
+            inkWidth: 1.1 * s,
             align: 'right',
             skew: 0.09,
           });
@@ -603,7 +602,7 @@ export class Screens {
     const cx = w * 0.5;
     const cy = h * 0.4;
     const slab = slantPath(cx - w * 0.26, cy - 44 * s, w * 0.52, 88 * s, 30 * s);
-    inked(g, slab, rgba(HEX.ink, 0.86), rgba(HEX.boostHot, 0.9), 3.4 * s);
+    inked(g, slab, rgba(HEX.ink, 1), rgba(HEX.boostHot, 0.9), PLATE_W * s);
     inkText(g, 'FINISH', cx, cy + 22 * s, {
       font: `900 ${Math.round(62 * s)}px ${FONT_STACK}`,
       fill: rgba(HEX.hudPaper, 1),

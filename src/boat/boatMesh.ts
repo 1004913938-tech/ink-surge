@@ -640,9 +640,17 @@ export function createBoatMesh(id: number): BoatMesh {
       [front.hw, HUMP_BASE, front.z],
     );
 
-    // Air intake: a forward-facing scoop on the crown. Dark mouth, hard lip.
+    // Air intake: a forward-facing scoop on the crown, plus a lip standing a
+    // couple of centimetres proud of its forward face.
+    //
+    // `box` is (x0, x1, y0, y1, z0, z1) — it is NOT `taperBox`'s z-first order.
+    // The lip was originally written as `box(-1.235, -1.19, -0.15, 0.15, 0.6,
+    // 0.82)`, i.e. with the intended z pair in the x slots, which put a
+    // 0.045 × 0.30 × 0.22 m slab at x = -1.21: an orphan grey blade floating
+    // 1.2 m off the port beam, at the waterline, complete with its own ink
+    // outline. It appeared in five of fifteen review frames, once in mid-air.
     TRIM.taperBox(-1.66, -1.24, [-0.2, 0.2, 0.7, 0.795], [-0.155, 0.155, 0.66, 0.83]);
-    TRIM.box(-1.235, -1.19, -0.15, 0.15, 0.6, 0.82);
+    TRIM.box(-0.175, 0.175, 0.645, 0.85, -1.29, -1.235);
   }
 
   // ── Saddle ────────────────────────────────────────────────────────────────
@@ -710,13 +718,26 @@ export function createBoatMesh(id: number): BoatMesh {
   // legs. What actually works is a narrow dark wing plus a *vertical* fin in the
   // racer's own colour: the fin adds 25 cm of height to the silhouette without
   // adding any width, and it is the single element that survives at 100 m.
+  //
+  // The whole assembly is a chain — deck → pylon → wing → fin — and every link
+  // has to physically interpenetrate the next one. It did not: the pylons
+  // stopped 11 cm above the deck and the fin overhung the wing's leading edge
+  // by 14 cm with nothing but air below it (the cowling crown is only at
+  // y ≈ 0.51 that far aft). The review frames called it, correctly, a grey/red
+  // T-frame floating above the transom.
+  // Wing: z -2.44 → -2.14. Every number below is quoted against this span.
   TRIM.taperBox(-2.44, -2.14, [-0.5, 0.5, 0.805, 0.85], [-0.45, 0.45, 0.835, 0.88]);
-  HULL.taperBox(-2.4, -2.0, [-0.05, 0.05, 0.83, 1.14], [-0.042, 0.042, 0.8, 0.92]);
+  // Fin: lives entirely inside the wing's footprint, and its underside is below
+  // the wing's upper surface at both ends, so it is buried in the plate rather
+  // than balanced on it.
+  HULL.taperBox(-2.42, -2.16, [-0.05, 0.05, 0.82, 1.14], [-0.042, 0.042, 0.84, 0.99]);
   for (const sign of [-1, 1]) {
-    // Struts down to the cowling crown.
+    // Pylons. Bottom at y = 0.16 is ~9 cm *inside* the deck (whose crown is at
+    // y ≈ 0.25 this far aft) and the top is inside the wing's thickness, so the
+    // silhouette closes with no aperture for the outline hull to leak through.
     const sx0 = sign * 0.2;
     const sx1 = sign * 0.28;
-    TRIM.taperBox(-2.36, -2.2, [sx0, sx1, 0.36, 0.82], [sx0, sx1, 0.42, 0.85]);
+    TRIM.taperBox(-2.3, -2.16, [sx0, sx1, 0.16, 0.845], [sx0, sx1, 0.18, 0.862]);
   }
 
   // ── Nose spike ────────────────────────────────────────────────────────────
@@ -724,10 +745,19 @@ export function createBoatMesh(id: number): BoatMesh {
   // sits *inside* the hull and contributes nothing to the silhouette.
   TRIM.taperBox(2.2, 2.54, [-0.085, 0.085, 0.3, 0.66], [-0.02, 0.02, 0.47, 0.51]);
 
-  // ── Fin, skeg, exhausts ───────────────────────────────────────────────────
-  BRIGHT.box(-0.62, 0.62, -0.06, 0.065, -2.4, -2.33);
+  // ── Boarding step, skeg, exhausts ─────────────────────────────────────────
+  // The step used to start at z = -2.33, one centimetre clear of the transom
+  // (z = -2.32); it now overlaps it, because a 1 cm gap is still a gap and the
+  // step carries its own outline in the bright material.
+  BRIGHT.box(-0.62, 0.62, -0.06, 0.065, -2.42, -2.3);
+  // Skeg: a blade on the centreline, deepest at the transom (y = -0.62) and
+  // fairing back up into the keel by z = -1.66.
   TRIM.taperBox(-2.34, -1.66, [-0.048, 0.048, -0.62, -0.18], [-0.04, 0.04, -0.3, -0.2]);
-  TRIM.box(-0.24, 0.24, -0.63, -0.575, -2.28, -2.0);
+  // Cavitation plate, straddling the skeg. Its previous span (z -2.28 → -2.0 at
+  // y = -0.63) ran forward past the skeg's rising underside and hung in open
+  // water under the hull; kept short and 3 cm higher it stays inside the blade
+  // along its whole length.
+  TRIM.box(-0.24, 0.24, -0.6, -0.53, -2.34, -2.18);
   for (const sign of [-1, 1]) {
     TRIM.box(sign * 0.2, sign * 0.34, 0.115, 0.235, -2.44, -2.3);
   }

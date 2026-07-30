@@ -17,13 +17,24 @@
  *      take advantage.
  *
  * ── The three temperaments ─────────────────────────────────────────────────
- *  KAIRA — aggressive. Brakes 0.4 s later than anyone else, dives for the inside
- *          of a boat ahead instead of going around it, leans on rivals rather
- *          than yielding, and overcooks a corner about once a lap.
+ *  KAIRA — aggressive. Lives 3.6 m inside the line, brakes 0.24 s later than
+ *          anyone else, dives for the inside of a boat ahead instead of going
+ *          around it, leans on rivals rather than yielding, and overcooks a
+ *          corner about once a lap.
  *  NOX   — clean. Sits on the racing line, brakes early and precisely, gives way
  *          in traffic, and is boringly consistent. The benchmark.
- *  PIP   — erratic. Wanders 4 m either side of the line, breathes the throttle,
- *          and runs wide into corners two or three times a lap.
+ *  PIP   — erratic. Runs 3.9 m wide of the line and wanders another 4 m either
+ *          side of that, breathes the throttle, and runs wide into corners two
+ *          or three times a lap.
+ *
+ * Those three lane biases are load-bearing, not flavour. Four drivers reading
+ * one `lineOffset` table drive one groove, and a field on one groove is a train
+ * with interpenetrating hulls — which is exactly what the first build shipped.
+ *
+ * ── Collision avoidance ────────────────────────────────────────────────────
+ * Two terms, neither of them a temperament: a hard lateral separation inside
+ * 3.4 m abeam (larger than any hull half-width, applied undamped straight to the
+ * steering aim point), and a longitudinal speed cap behind a boat within 11 m.
  *
  * ── Rubber-banding ─────────────────────────────────────────────────────────
  * Capped at CONFIG.ai.rubberBand (11 %), asymmetric (a trailing boat gets the
@@ -67,6 +78,20 @@ interface Profile {
   /** Fraction of the track's speed profile the driver uses. */
   pace: number;
   /**
+   * Metres this driver habitually sits off the racing line, + = track right.
+   *
+   * Without this every AI reads the same `lineOffset` table and drives the same
+   * groove, so the field arrives at a corner nose-to-tail with the hulls
+   * overlapping — measured in shots/race_fix0/land.png, four boats single file
+   * inside two boat lengths, and in pack.png where the red and yellow hulls are
+   * touching. A persistent bias per temperament is what makes them arrive three
+   * abreast instead, which is also the only way the pack shot can demonstrate
+   * the per-racer colour separation it exists to prove.
+   *
+   * Faded out with corner severity: on a hairpin the line is the line.
+   */
+  laneBias: number;
+  /**
    * Seconds of lookahead used to read the speed profile. Small = brakes late.
    * This is the single most character-defining number in the file.
    */
@@ -94,6 +119,7 @@ interface Profile {
 const PROFILES: Record<string, Profile> = {
   aggressive: {
     pace: 1.005,
+    laneBias: -3.6, // lives on the inside, ready to close a door
     reaction: 0.10,
     discipline: 0.82,
     wanderAmp: 1.1,
@@ -108,6 +134,7 @@ const PROFILES: Record<string, Profile> = {
   },
   clean: {
     pace: 0.99,
+    laneBias: 0.5, // the benchmark: on the line, a shade to the right of it
     reaction: 0.34,
     discipline: 1.0,
     wanderAmp: 0.35,
@@ -122,6 +149,7 @@ const PROFILES: Record<string, Profile> = {
   },
   erratic: {
     pace: 1.0,
+    laneBias: 3.9, // sits out wide and drifts about out there
     reaction: 0.26,
     discipline: 0.55,
     wanderAmp: 4.2,
@@ -275,17 +303,24 @@ export class AiDrivers implements Subsystem {
     const lookDist = CONFIG.ai.lookaheadBase + Math.abs(fwd) * CONFIG.ai.lookaheadPerSpeed;
     const uAhead = u + lookDist / L;
     let lane = this.trk.lineOffset(uAhead) * b.profile.discipline;
+    // The driver's habitual lane, faded out where the corner dictates the line.
+    lane += b.profile.laneBias * (1 - severity * 0.75);
     // Wander: a slow lateral drift, not per-frame noise. Noise looks like a
     // broken controller; drift looks like a driver who is not quite settled.
     lane +=
       Math.sin(ctx.time * b.profile.wanderHz * Math.PI * 2 + b.phase) *
       b.profile.wanderAmp *
       (1 - severity * 0.6);
-    lane += this.trafficOffset(ctx, r, b, uAhead);
     if (b.mistake === Mistake.WideEntry) lane += b.mistakeLane;
     // Keep them inside a believable corridor, and honour the gate they must pass.
     lane = clamp(lane, -13, 13);
     b.lane = damp(b.lane, lane, 2.6, dt);
+
+    // Traffic is added AFTER the damper, deliberately. A 2.6 s⁻¹ lag on the
+    // racing line is character; the same lag on the term that keeps two hulls
+    // out of each other is a bug — at 29 m/s it is most of a boat length of
+    // interpenetration before the avoidance even reaches the steering.
+    const laneNow = clamp(b.lane + this.trafficOffset(ctx, r, b, uAhead), -16, 16);
 
     // ── Speed target ────────────────────────────────────────────────────────
     // Read the profile `reaction` seconds ahead. A late braker looks 0.10 s
@@ -299,11 +334,16 @@ export class AiDrivers implements Subsystem {
     if (b.mistake === Mistake.Lift) vTarget *= 0.62;
     // Off course: crawl back rather than blast across the sea at 29 m/s.
     if (offCourse) vTarget = Math.min(vTarget, 15);
+    // Don't drive into the back of the boat in front. This is the longitudinal
+    // half of collision avoidance and it is what breaks up the nose-to-tail
+    // train: a driver stuck behind someone either has to move out (the lateral
+    // term above) or lift.
+    vTarget = Math.min(vTarget, this.followCap(ctx, r));
     vTarget = clamp(vTarget, 5, cfg.boostTopSpeed);
 
     // ── Outputs ─────────────────────────────────────────────────────────────
     this.applySpeed(c, fwd, vTarget, severity);
-    c.steer = this.steerTo(r, b, u, b.lane, dt);
+    c.steer = this.steerTo(r, b, u, laneNow, dt);
 
     // ── Powerslide ──────────────────────────────────────────────────────────
     // The AI earns boost the same way the player does: hold the slide through a
@@ -386,12 +426,18 @@ export class AiDrivers implements Subsystem {
   /**
    * Lateral offset to add for other boats.
    *
-   * Two behaviours, and the personality picks between them:
+   * Three behaviours. The first two are temperament, the third is not optional:
    *   • *avoid* — see a hull ahead in your lane, move to the side it is not on.
    *   • *dive*  — see a hull ahead on a corner approach and take the inside line
    *     past it, accepting contact.
-   * Side-by-side contact always produces a push, whatever the temperament, or
-   * two boats simply grind along each other for a whole straight.
+   *   • *separate* — a hard, personality-independent push whenever another hull
+   *     is inside SEPARATION metres abeam. The hull is 4.6 × 1.9 m and the
+   *     physics approximates it with two spheres of radius 1.0, so two centres
+   *     3.4 m apart cannot touch whatever the yaw angle. The push saturates to
+   *     its full value at that distance rather than ramping from it, because a
+   *     term that is still ramping when the hulls meet has already failed —
+   *     which is what shots/race_fix0/pack.png shows, red and yellow overlapping
+   *     with no visible reaction.
    */
   private trafficOffset(ctx: GameContext, r: Racer, b: Brain, uAhead: number): number {
     const fx = Math.sin(r.state.heading);
@@ -399,6 +445,8 @@ export class AiDrivers implements Subsystem {
     const rx = -fz;
     const rz = fx;
     const R = CONFIG.ai.avoidRadius;
+    /** Centre separation, metres, below which hulls can touch. */
+    const SEPARATION = 3.4;
     let push = 0;
 
     for (const o of ctx.racers) {
@@ -407,6 +455,18 @@ export class AiDrivers implements Subsystem {
       const dz = o.root.position.z - r.root.position.z;
       const along = dx * fx + dz * fz;
       const side = dx * rx + dz * rz;
+
+      // ── Hard separation, both directions along the hull ───────────────────
+      // 4.6 m of hull plus a margin: anything inside this box is a contact
+      // waiting to happen, in front, behind or alongside.
+      if (Math.abs(along) < 5.4 && Math.abs(side) < SEPARATION) {
+        const bite = 1 - smoothstep(0, SEPARATION, Math.abs(side));
+        // Ties break on racer id, not on the rng: pulling a random number from a
+        // per-frame path would make the mistake schedule frame-rate dependent.
+        const away = side > 0 ? -1 : side < 0 ? 1 : r.id % 2 === 0 ? 1 : -1;
+        push += away * (2.5 + 7.5 * bite);
+      }
+
       if (along < -R || along > 30) continue;
 
       if (along > 3.0) {
@@ -423,13 +483,48 @@ export class AiDrivers implements Subsystem {
         const dir = wantDive ? insideSign : side > 0 ? -1 : 1;
         const strength = wantDive ? 5.0 * b.profile.aggression : 6.5 * b.profile.avoid;
         push += dir * urgency * strength;
-      } else {
-        // Alongside or overlapping. Always separate, so a pair cannot lock.
-        const overlap = 1 - smoothstep(0.8, 4.2, Math.abs(side));
-        if (overlap > 0.001) push += (side > 0 ? -1 : 1) * overlap * 5.5;
+      } else if (along > -3.0) {
+        // Alongside. Keep separating even outside the hard box, so a pair does
+        // not grind along each other for a whole straight.
+        const overlap = 1 - smoothstep(SEPARATION, 5.6, Math.abs(side));
+        if (overlap > 0.001) push += (side > 0 ? -1 : 1) * overlap * 3.0;
       }
     }
-    return clamp(push, -9, 9);
+    return clamp(push, -11, 11);
+  }
+
+  /**
+   * Speed cap imposed by the boat directly ahead.
+   *
+   * Only bites when someone is genuinely in the way — ahead, inside 2.6 m abeam
+   * — and it caps at their speed rather than braking hard, so the follower sits
+   * in the tow and looks for a way past instead of stamping on the brakes. Once
+   * the gap is under a hull length the cap goes 1.8 m/s *below* theirs, because a
+   * cap exactly equal to theirs holds a gap it cannot open, and the measured
+   * closest approach of a whole 3-lap race was a 2.2 m nose-to-tail overlap. A
+   * floor of 9 m/s stops a slow boat ahead from dragging the whole field to a
+   * crawl.
+   */
+  private followCap(ctx: GameContext, r: Racer): number {
+    const fx = Math.sin(r.state.heading);
+    const fz = Math.cos(r.state.heading);
+    const rx = -fz;
+    const rz = fx;
+    let cap = Infinity;
+    for (const o of ctx.racers) {
+      if (o === r) continue;
+      const dx = o.root.position.x - r.root.position.x;
+      const dz = o.root.position.z - r.root.position.z;
+      const along = dx * fx + dz * fz;
+      if (along < 0.6 || along > 12.0) continue;
+      const side = dx * rx + dz * rz;
+      if (Math.abs(side) > 2.6) continue;
+      // Closer = closer to matching their speed, then dropping below it.
+      const tight = 1 - smoothstep(4.6, 12.0, along);
+      const theirs = Math.max(9, Math.abs(o.state.forwardSpeed));
+      cap = Math.min(cap, theirs - tight * 1.8 + (1 - tight) * 8);
+    }
+    return cap;
   }
 
   // ── Mistakes ──────────────────────────────────────────────────────────────

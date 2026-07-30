@@ -30,16 +30,17 @@ import { HEX } from '../core/palette';
 import { clamp, clamp01, damp, formatTime, ordinal } from '../core/mathx';
 import {
   FONT_STACK,
+  PLATE_SKEW,
+  PLATE_W,
   chevronPath,
   cutPath,
-  diamondPath,
-  halo,
   hatch,
   inkText,
   inked,
-  mixHex,
+  plate,
   rgba,
   segText,
+  segWidth,
   slantPath,
 } from './inkDraw';
 import { Minimap } from './minimap';
@@ -48,9 +49,20 @@ import type { GameContext, HudAPI, Racer, TrackAPI } from '../core/types';
 
 /** Full-scale gauge reading. boostTopSpeed is 39 m/s ≈ 140 km/h. */
 const GAUGE_MAX_KMH = 150;
+const REDLINE_KMH = 120;
 /** Dial sweep, canvas angles (0 = +x, positive clockwise because y is down). */
 const DIAL_A0 = (130 * Math.PI) / 180;
 const DIAL_SWEEP = (280 * Math.PI) / 180;
+/** Even angular division of the scale — one mark per 10 km/h, long every third. */
+const TICKS = GAUGE_MAX_KMH / 10;
+/**
+ * Power band radius (inset from `gr`) and width. The band, the redline and the
+ * needle tip all live on this radius so the three cannot appear to disagree: the
+ * old band sat 24 px inside the tick ring, far enough that reading it against the
+ * scale was guesswork.
+ */
+const BAND_R = 20;
+const BAND_W = 9;
 
 interface Layout {
   s: number;
@@ -63,10 +75,13 @@ interface Layout {
   ry: number;
   rw: number;
   rh: number;
-  /** Top-left info slab. */
+  /** Top-left info slab — one plate, placement + lap + clock + splits. */
   ix: number;
   iy: number;
   iw: number;
+  /** Height of the placement/lap band, and of the whole slab. */
+  ih1: number;
+  ih: number;
   /** Boost meter origin. */
   bx: number;
   by: number;
@@ -88,7 +103,7 @@ export class Hud implements HudAPI {
   private screens = new Screens();
   private L: Layout = {
     s: 1, gx: 0, gy: 0, gr: 1, rx: 0, ry: 0, rw: 1, rh: 1,
-    ix: 0, iy: 0, iw: 1, bx: 0, by: 0, bw: 1, bh: 1,
+    ix: 0, iy: 0, iw: 1, ih1: 1, ih: 1, bx: 0, by: 0, bw: 1, bh: 1,
   };
 
   // ── Animation state ────────────────────────────────────────────────────────
@@ -160,7 +175,9 @@ export class Hud implements HudAPI {
       ry: gy - 42 * s,
       ix: 28 * s,
       iy: 26 * s,
-      iw: 306 * s,
+      iw: 336 * s,
+      ih1: 92 * s,
+      ih: 144 * s,
       bx: 30 * s,
       by: height - 78 * s,
       bw: 78 * s,
@@ -184,38 +201,55 @@ export class Hud implements HudAPI {
     g.save();
     g.translate(gx, gy);
 
-    // Dial plate: the arc closed back through the hub, so the open bottom of
-    // the sweep is a real cut in the shape rather than a clipped circle.
-    const plate = new Path2D();
-    plate.arc(0, 0, gr + 9 * s, DIAL_A0, DIAL_A0 + DIAL_SWEEP);
-    plate.arc(0, 0, gr - 46 * s, DIAL_A0 + DIAL_SWEEP, DIAL_A0, true);
-    plate.closePath();
-    halo(g, plate, rgba(HEX.ink, 0.4), 10 * s);
-    inked(g, plate, rgba(HEX.hudInk, 0.78), rgba(HEX.hudPaper, 0.92), 3.2 * s);
+    // Dial face: a *filled wedge* — the sweep arc closed back through the centre
+    // — not an annulus. As an annulus the hub area was open scene, and a whole
+    // yellow AI boat composited through the middle of the gauge
+    // (shots/pres_base/rider_closeup.png). The open bottom of the sweep is still
+    // a real cut in the shape rather than a clipped circle.
+    const hatchRect: [number, number, number, number] = [
+      -gr - 12 * s, -gr - 12 * s, (gr + 12 * s) * 2, (gr + 12 * s) * 2,
+    ];
+    const face = new Path2D();
+    face.moveTo(0, 0);
+    face.arc(0, 0, gr + 9 * s, DIAL_A0, DIAL_A0 + DIAL_SWEEP);
+    face.closePath();
+    plate(g, face, s, { hatchRect });
 
-    // Hatched shading in the dial's lower-left quadrant — drawn shading, not a
-    // gradient, so it matches the cel language of the scene behind it.
-    hatch(g, plate, -gr - 12 * s, -gr - 12 * s, (gr + 12 * s) * 2, (gr + 12 * s) * 2,
-      rgba(HEX.waterMid, 0.13), 9 * s, 1.3 * s);
+    // Hub disc over the wedge, so the *mouth* of the sweep reads as dial rather
+    // than as sea: with the wedge alone, the 80° cut at the bottom left a bright
+    // triangle of open water inside the instrument — the same bug as a
+    // transparent plate. Its edge doubles as the dial's inner rule.
+    const disc = new Path2D();
+    disc.arc(0, 0, gr - 40 * s, 0, Math.PI * 2);
+    inked(g, disc, rgba(HEX.hudInk, 1), rgba(HEX.hudDim, 0.55), 1.6 * s);
+    hatch(g, disc, hatchRect[0], hatchRect[1], hatchRect[2], hatchRect[3],
+      rgba(HEX.inkSoft, 0.85), 10 * s, 1.3 * s);
 
-    // Redline band on the outer edge.
-    const rlFrom = DIAL_A0 + DIAL_SWEEP * (118 / GAUGE_MAX_KMH);
-    g.strokeStyle = rgba(HEX.warn, 0.85);
-    g.lineWidth = 5 * s;
+    // Redline band, hard-ended, sitting on the same radius as the power band so
+    // the two read on one scale.
+    g.lineCap = 'butt';
+    const rlFrom = DIAL_A0 + DIAL_SWEEP * (REDLINE_KMH / GAUGE_MAX_KMH);
+    g.strokeStyle = rgba(HEX.ink, 1);
+    g.lineWidth = BAND_W * s + 4 * s;
     g.beginPath();
-    g.arc(0, 0, gr + 4.5 * s, rlFrom, DIAL_A0 + DIAL_SWEEP);
+    g.arc(0, 0, gr - BAND_R * s, rlFrom, DIAL_A0 + DIAL_SWEEP);
+    g.stroke();
+    g.strokeStyle = rgba(HEX.warn, 1);
+    g.lineWidth = BAND_W * s;
+    g.beginPath();
+    g.arc(0, 0, gr - BAND_R * s, rlFrom, DIAL_A0 + DIAL_SWEEP);
     g.stroke();
 
-    // Ticks. No numerals on the dial: at this radius they collide with the
-    // power band, and the digital readout beside the dial already carries the
-    // exact figure. The redline band is what marks the top of the scale.
-    for (let v = 0; v <= GAUGE_MAX_KMH; v += 10) {
-      const a = DIAL_A0 + DIAL_SWEEP * (v / GAUGE_MAX_KMH);
-      const major = v % 30 === 0;
-      const r0 = gr - 1 * s;
-      const r1 = gr - (major ? 18 : 9) * s;
-      g.strokeStyle = major ? rgba(HEX.hudPaper, 0.95) : rgba(HEX.hudDim, 0.85);
-      g.lineWidth = (major ? 3.6 : 1.8) * s;
+    // Ticks, on an even angular division of the scale: 16 marks at 10 km/h, every
+    // third one long. No numerals — the digital readout beside the dial carries
+    // the exact figure and the redline band marks the top of the scale.
+    for (let i = 0; i <= TICKS; i++) {
+      const a = DIAL_A0 + DIAL_SWEEP * (i / TICKS);
+      const major = i % 3 === 0;
+      const r0 = gr + 2 * s;
+      const r1 = gr - (major ? 13 : 7) * s;
+      g.strokeStyle = major ? rgba(HEX.hudPaper, 0.95) : rgba(HEX.hudDim, 0.9);
+      g.lineWidth = (major ? 3.4 : 1.8) * s;
       g.beginPath();
       g.moveTo(Math.cos(a) * r0, Math.sin(a) * r0);
       g.lineTo(Math.cos(a) * r1, Math.sin(a) * r1);
@@ -232,12 +266,10 @@ export class Hud implements HudAPI {
     // Spine welding the readout to the dial, so the two are one instrument
     // rather than two floating plates.
     const spine = slantPath(rx + rw - 6 * s, ry + rh * 0.42, gx - gr - rx - rw + 20 * s, 9 * s, 3 * s);
-    inked(g, spine, rgba(HEX.hudInk, 0.9), rgba(HEX.hudPaper, 0.55), 2 * s);
+    inked(g, spine, rgba(HEX.hudInk, 1), rgba(HEX.hudPaper, 0.55), 2 * s);
 
-    const plate2 = slantPath(rx, ry, rw, rh, 20 * s);
-    halo(g, plate2, rgba(HEX.ink, 0.4), 10 * s);
-    inked(g, plate2, rgba(HEX.hudInk, 0.8), rgba(HEX.hudPaper, 0.9), 3 * s);
-    hatch(g, plate2, rx, ry, rw, rh, rgba(HEX.waterMid, 0.12), 10 * s, 1.3 * s);
+    const readout = slantPath(rx, ry, rw, rh, rh * PLATE_SKEW);
+    plate(g, readout, s, { hatchRect: [rx, ry, rw, rh] });
     inkText(g, 'SPEED', rx + 18 * s, ry + 21 * s, {
       font: `800 ${Math.round(11 * s)}px ${FONT_STACK}`,
       fill: rgba(HEX.hudDim, 1),
@@ -257,46 +289,35 @@ export class Hud implements HudAPI {
     g.moveTo(rx + 14 * s, ry + 27 * s);
     g.lineTo(rx + rw - 10 * s, ry + 27 * s);
     g.stroke();
-    // Unlit three-digit field, baked once — it never changes. Kept very faint:
-    // at 0.15 the ghosts read as real digits and "77" looked like "8877".
-    segText(g, '888', rx + rw - 16 * s, ry + 33 * s, 44 * s, {
-      lit: rgba(HEX.hudDim, 0.09),
-      dim: null,
-      align: 'right',
-      skew: 0.1,
-    });
+    // No unlit "888" field is baked here. Even at 9 % alpha the leading ghost
+    // digit read as a real one — "88" became "888" at 4× magnification in
+    // shots/pres_base/hero.png. The lit digits are the whole display.
 
     // ── Boost meter: backing plate, caption, empty cells ────────────────────
     const { bx, by, bw, bh } = this.L;
     // The meter used to float as three unbacked chevrons in the corner while
     // every other cluster sat on a plate; giving it the same slab pulls the
     // bottom-left of the composition back into the same design language.
-    const bPlate = slantPath(
-      bx - 14 * s,
-      by - 34 * s,
-      3 * (bw + 7 * s) + 20 * s,
-      bh + 44 * s,
-      16 * s,
-    );
-    halo(g, bPlate, rgba(HEX.ink, 0.4), 10 * s);
-    inked(g, bPlate, rgba(HEX.hudInk, 0.72), rgba(HEX.hudPaper, 0.85), 3 * s);
-    hatch(g, bPlate, bx - 14 * s, by - 34 * s, 3 * (bw + 7 * s) + 20 * s, bh + 44 * s,
-      rgba(HEX.waterMid, 0.12), 10 * s, 1.3 * s);
-    inkText(g, 'DRIFT CHARGE', bx + 2 * s, by - 12 * s, {
+    const bpw = 3 * (bw + 7 * s) + 20 * s;
+    const bph = bh + 44 * s;
+    const bPlate = slantPath(bx - 14 * s, by - 34 * s, bpw, bph, bph * PLATE_SKEW);
+    plate(g, bPlate, s, { hatchRect: [bx - 14 * s, by - 34 * s, bpw, bph] });
+    inkText(g, 'DRIFT', bx + 2 * s, by - 12 * s, {
       font: `800 ${Math.round(11.5 * s)}px ${FONT_STACK}`,
-      fill: rgba(HEX.foamShade, 0.85),
+      fill: rgba(HEX.foamShade, 0.9),
       align: 'left',
       tracking: 3.2 * s,
     });
     for (let i = 0; i < 3; i++) {
       const x = bx + i * (bw + 7 * s);
       const cell = chevronPath(x, by, bw, bh, 11 * s);
-      inked(g, cell, rgba(HEX.hudInk, 0.8), rgba(HEX.hudPaper, 0.72), 2.6 * s);
-      hatch(g, cell, x, by, bw, bh, rgba(HEX.hudDim, 0.34), 8 * s, 1.3 * s);
-      // Tier index inside the cell, low contrast — a label, not a readout.
-      segText(g, String(i + 1), x + 17 * s, by + bh * 0.5 - 6 * s, 12 * s, {
-        lit: rgba(HEX.hudDim, 0.7),
-        dim: null,
+      // Empty cell: opaque body, authored hatch, and the tier index in *ink* on
+      // the paper — dark-on-light is legible at any size, where the old
+      // hudDim-on-hudDim numeral was a 20 %-alpha smudge.
+      inked(g, cell, rgba(HEX.inkSoft, 1), rgba(HEX.hudPaper, 0.92), PLATE_W * s);
+      hatch(g, cell, x, by, bw, bh, rgba(HEX.hudDim, 0.5), 8 * s, 1.3 * s);
+      segText(g, String(i + 1), x + 19 * s, by + bh * 0.5 - 6 * s, 12 * s, {
+        lit: rgba(HEX.hudPaper, 0.85),
         align: 'center',
         skew: 0.1,
       });
@@ -319,7 +340,11 @@ export class Hud implements HudAPI {
     const gLeft = Math.max(0, rx - 12 * s);
     this.CHROME_GAUGE = [gLeft, gTop, this.w - gLeft, this.h - gTop];
     const bTop = by - 44 * s;
-    this.CHROME_BOOST = [Math.max(0, bx - 12 * s), bTop, 380 * s, this.h - bTop];
+    // Left edge must clear the drift plate's *bottom*-left corner — the plate is a
+    // parallelogram, so its lowest corner sits a full skew to the left of its top
+    // one, and the ink keyline hangs 3 px outside that again. At `bx - 12` the
+    // blit sliced ~3 px off the plate's own outline.
+    this.CHROME_BOOST = [Math.max(0, bx - 24 * s), bTop, 400 * s, this.h - bTop];
   }
 
   private blitChrome(r: [number, number, number, number]) {
@@ -444,43 +469,42 @@ export class Hud implements HudAPI {
     g.save();
     g.translate(gx, gy);
 
-    // Power band — the filled arc from zero to the needle.
+    // Power band — the filled arc from zero to the needle. Same `frac`, same
+    // angular range and same radius as the needle and the redline, so the two
+    // indicators cannot tell different stories. Butt caps: a rounded cap is a
+    // photographic treatment and it also overshoots the value it is reporting.
+    const a = DIAL_A0 + DIAL_SWEEP * frac;
     if (frac > 0.002) {
-      const a1 = DIAL_A0 + DIAL_SWEEP * frac;
       g.lineCap = 'butt';
-      g.strokeStyle = rgba(HEX.ink, 0.9);
-      g.lineWidth = 14 * s;
+      g.strokeStyle = rgba(HEX.ink, 1);
+      g.lineWidth = (BAND_W + 4) * s;
       g.beginPath();
-      g.arc(0, 0, gr - 24 * s, DIAL_A0, a1);
+      g.arc(0, 0, gr - BAND_R * s, DIAL_A0, a);
       g.stroke();
-      g.strokeStyle = boosting ? rgba(HEX.boostHot, 1) : rgba(HEX.waterCrest, 0.96);
-      g.lineWidth = 9 * s;
+      g.strokeStyle = boosting ? rgba(HEX.boostHot, 1) : rgba(HEX.waterCrest, 1);
+      g.lineWidth = BAND_W * s;
       g.beginPath();
-      g.arc(0, 0, gr - 24 * s, DIAL_A0, a1);
+      g.arc(0, 0, gr - BAND_R * s, DIAL_A0, a);
       g.stroke();
-      if (boosting) {
-        // Second, brighter rail on the outside while the boost burns.
-        g.strokeStyle = rgba(HEX.boost, 0.95);
-        g.lineWidth = 3.4 * s;
-        g.beginPath();
-        g.arc(0, 0, gr - 14 * s, DIAL_A0, a1);
-        g.stroke();
-      }
     }
 
-    // Needle: tapered blade plus a stub counterweight.
-    const a = DIAL_A0 + DIAL_SWEEP * frac;
+    // Needle: tapered blade plus a stub counterweight. Long enough to cross the
+    // band and reach the tick roots, so needle, band and scale meet at one point.
     g.save();
     g.rotate(a);
-    const len = gr - 20 * s;
+    const len = gr - 6 * s;
+    // Slim blade. The needle is drawn over the power band, so every pixel of
+    // blade width hides a slice of the band's end and reads as the two indicators
+    // disagreeing — at the old width the visible cyan stopped ~7 degrees short of
+    // the needle even though both are driven by the same `frac`.
     const nd = new Path2D();
     nd.moveTo(len, 0);
-    nd.lineTo(len - 14 * s, -4.6 * s);
-    nd.lineTo(6 * s, -8.5 * s);
-    nd.lineTo(6 * s, 8.5 * s);
-    nd.lineTo(len - 14 * s, 4.6 * s);
+    nd.lineTo(len - 14 * s, -3.4 * s);
+    nd.lineTo(6 * s, -6.4 * s);
+    nd.lineTo(6 * s, 6.4 * s);
+    nd.lineTo(len - 14 * s, 3.4 * s);
     nd.closePath();
-    inked(g, nd, rgba(HEX.hull0, 1), rgba(HEX.ink, 1), 2.4 * s);
+    inked(g, nd, rgba(HEX.hull0, 1), rgba(HEX.ink, 1), 2 * s);
     const tail = new Path2D();
     tail.moveTo(-6 * s, -6 * s);
     tail.lineTo(-26 * s, -3.4 * s);
@@ -493,21 +517,19 @@ export class Hud implements HudAPI {
     // Hub.
     const hub = new Path2D();
     hub.arc(0, 0, 11 * s, 0, Math.PI * 2);
-    inked(g, hub, rgba(HEX.hudInk, 1), rgba(HEX.hudPaper, 0.9), 2.6 * s);
+    inked(g, hub, rgba(HEX.hudInk, 1), rgba(HEX.hudPaper, 0.9), PLATE_W * s);
     const dot = new Path2D();
     dot.arc(0, 0, 3.4 * s, 0, Math.PI * 2);
     inked(g, dot, rgba(HEX.hull0, 1), null, 0);
 
     g.restore();
 
-    // Digital readout. The unlit "888" field behind it is baked into the chrome
-    // layer, so only the lit digits are drawn here.
+    // Digital readout: lit digits only, right-aligned, no unlit field behind.
     const val = Math.round(clamp(this.shownKmh, 0, 999));
     const { rx, ry, rw } = this.L;
     segText(g, String(val), rx + rw - 16 * s, ry + 33 * s, 44 * s, {
       lit: boosting ? rgba(HEX.boostHot, 1) : rgba(HEX.hudPaper, 1),
-      dim: null,
-      ink: rgba(HEX.ink, 0.95),
+      ink: rgba(HEX.ink, 1),
       inkWidth: 2.6 * s,
       align: 'right',
       skew: 0.1,
@@ -526,7 +548,7 @@ export class Hud implements HudAPI {
     if (tag) {
       const tw = 62 * s;
       const tp = cutPath(gx - tw * 0.5, gy + 30 * s, tw, 23 * s, 7 * s, 0b0101);
-      inked(g, tp, rgba(HEX.hudInk, 0.92), rgba(tagCol, 0.95), 2.2 * s);
+      plate(g, tp, s, { edge: rgba(tagCol, 0.95) });
       inkText(g, tag, gx, gy + 47 * s, {
         font: `800 ${Math.round(13 * s)}px ${FONT_STACK}`,
         fill: rgba(tagCol, 1),
@@ -559,9 +581,14 @@ export class Hud implements HudAPI {
 
       g.save();
       g.clip(cell);
-      // Cell colour ramps pink → hot yellow across the three tiers, so the
-      // meter reads as one heating element rather than three separate lamps.
-      g.fillStyle = boosting ? rgba(HEX.boostHot, 1) : mixHex(HEX.boost, HEX.boostHot, i * 0.5);
+      // Cell colour ramps crest-cyan → hot yellow across the three tiers, so the
+      // meter reads as one element heating up rather than three separate lamps.
+      // It used to start at `boost` magenta, a colour that appears nowhere else
+      // in the racing frame; magenta is now reserved for the moment a boost
+      // actually fires (the BOOST callout and the frame rails).
+      // Two committed tones, not a gradient of mixes: crest cyan while the meter
+      // is charging, hot yellow on the last cell, which is the "ready" read.
+      g.fillStyle = rgba(boosting || i === 2 ? HEX.boostHot : HEX.waterCrest, 1);
       g.fillRect(x - 2 * s, by - 2 * s, (bw + 4 * s) * f, bh + 4 * s);
       // Leading edge highlight so the fill has a drawn front, not a soft ramp.
       if (f < 0.999) {
@@ -571,7 +598,7 @@ export class Hud implements HudAPI {
       g.restore();
 
       // Re-ink the cell over the fill.
-      inked(g, cell, null, rgba(HEX.hudPaper, 0.8), 2.4 * s);
+      inked(g, cell, null, rgba(HEX.hudPaper, 0.92), PLATE_W * s);
 
       // Tier-up flash: a white wash plus an expanding outline.
       const tf = this.tierFlash[i];
@@ -608,30 +635,47 @@ export class Hud implements HudAPI {
       g.restore();
     }
 
-    // Drift annunciator: slip angle read-out while powersliding.
-    if (st.drifting) {
-      const slip =
-        (Math.atan2(Math.abs(st.lateralSpeed), Math.max(1, Math.abs(st.forwardSpeed))) * 180) /
-        Math.PI;
-      const y = by - 52 * s;
-      const tw = 138 * s;
-      const tp = slantPath(bx - 6 * s, y - 20 * s, tw, 26 * s, 10 * s);
-      inked(g, tp, rgba(HEX.ink, 0.88), rgba(HEX.boost, 0.95), 2.2 * s);
-      inkText(g, 'DRIFT', bx + 8 * s, y - 2 * s, {
-        font: `800 ${Math.round(14 * s)}px ${FONT_STACK}`,
-        fill: rgba(HEX.boost, 1),
-        align: 'left',
-        skew: 0.14,
-        tracking: 2.2 * s,
-      });
-      // Slip angle in the type face with a real degree sign — the segment face
-      // renders "11" as two bare bars, which reads as a tally, not an angle.
-      inkText(g, `${Math.round(slip)}\u00B0`, bx + tw - 18 * s, y - 2 * s, {
-        font: `900 ${Math.round(19 * s)}px ${FONT_STACK}`,
-        fill: rgba(HEX.hudPaper, 1),
-        align: 'right',
-        skew: 0.14,
-      });
+    // Slip indicator — a graphic, drawn *inside* the drift plate's caption row
+    // rather than as a fifth floating widget. It replaces a "DRIFT 8 deg"
+    // numeric telemetry read-out: degrees of slip is a dev overlay, and it
+    // arrived on its own magenta pill with its own border weight, which is a
+    // good part of what made the HUD read as four unrelated design systems.
+    //
+    // Reads as: a centre notch, and a wedge that slides toward the side the
+    // stern is sliding to, growing and heating up as the slide deepens.
+    const slip = clamp(st.lateralSpeed / 7, -1, 1);
+    if (st.drifting || Math.abs(slip) > 0.1) {
+      const trackW = 104 * s;
+      const cx = bx + 3 * (bw + 7 * s) - 4 * s - trackW;
+      const cy = by - 17 * s;
+      const mag = Math.abs(slip);
+      g.strokeStyle = rgba(HEX.hudDim, 0.8);
+      g.lineWidth = 2 * s;
+      g.beginPath();
+      g.moveTo(cx, cy);
+      g.lineTo(cx + trackW, cy);
+      g.stroke();
+      g.strokeStyle = rgba(HEX.hudPaper, 0.9);
+      g.lineWidth = 2.2 * s;
+      g.beginPath();
+      g.moveTo(cx + trackW * 0.5, cy - 6 * s);
+      g.lineTo(cx + trackW * 0.5, cy + 6 * s);
+      g.stroke();
+      const dir = slip >= 0 ? 1 : -1;
+      const px = cx + trackW * (0.5 + slip * 0.44);
+      const wl = (8 + mag * 10) * s;
+      const wedge = new Path2D();
+      wedge.moveTo(px + dir * wl, cy);
+      wedge.lineTo(px - dir * wl * 0.4, cy - (5 + mag * 4) * s);
+      wedge.lineTo(px - dir * wl * 0.4, cy + (5 + mag * 4) * s);
+      wedge.closePath();
+      inked(
+        g,
+        wedge,
+        st.drifting ? rgba(mag > 0.6 ? HEX.boostHot : HEX.waterCrest, 1) : rgba(HEX.hudDim, 1),
+        rgba(HEX.ink, 1),
+        2 * s,
+      );
     }
   }
 
@@ -662,30 +706,33 @@ export class Hud implements HudAPI {
 
   private drawInfoSlab(ctx: GameContext, s: number) {
     const g = this.ctx2d;
-    const { ix, iy, iw } = this.L;
+    const { ix, iy, iw, ih1, ih } = this.L;
     const p = ctx.player;
-    const h1 = 96 * s;
 
-    // Main slab.
-    const slab = slantPath(ix, iy, iw, h1, 24 * s);
+    // ONE plate for the whole cluster.
+    //
+    // The split times used to live on a second plate hung *below* this one,
+    // outside its frame, with its own thinner outline and its own colour — the
+    // clearest single symptom of the HUD being four design systems. LAST/BEST are
+    // part of "how is my race going", so they are inside the same frame, divided
+    // by a rule instead of by a border.
+    const slab = slantPath(ix, iy, iw, ih, ih * PLATE_SKEW);
+    plate(g, slab, s, { hatchRect: [ix, iy, iw, ih] });
+
     const lead = p.place === 1;
-    halo(g, slab, rgba(HEX.ink, 0.42), 11 * s);
-    inked(
-      g,
-      slab,
-      rgba(HEX.hudInk, 0.8),
-      lead ? rgba(HEX.boostHot, 0.95) : rgba(HEX.hudPaper, 0.9),
-      3.4 * s,
-    );
-    hatch(g, slab, ix, iy, iw, h1, rgba(HEX.waterMid, 0.12), 10 * s, 1.3 * s);
-
-    // Divider between the placement and the lap block.
+    // Divider between the placement and the lap block. Leaning with the plate.
     const dx = ix + 124 * s;
-    g.strokeStyle = rgba(HEX.hudPaper, 0.45);
+    g.strokeStyle = rgba(HEX.hudPaper, 0.4);
     g.lineWidth = 2 * s;
     g.beginPath();
-    g.moveTo(dx + 24 * s, iy + 6 * s);
-    g.lineTo(dx, iy + h1 - 6 * s);
+    g.moveTo(dx + 20 * s, iy + 8 * s);
+    g.lineTo(dx - 2 * s, iy + ih1 - 6 * s);
+    g.stroke();
+    // Rule above the split row, following the same lean.
+    const y2 = iy + ih1;
+    g.beginPath();
+    g.moveTo(ix + (ih - ih1) * PLATE_SKEW + 8 * s, y2);
+    g.lineTo(ix + iw - 8 * s, y2);
     g.stroke();
 
     // ── Placement. The suffix is set small and raised, like a race programme.
@@ -694,7 +741,7 @@ export class Hud implements HudAPI {
     const num = String(p.place);
     const suf = ordinal(p.place).slice(String(p.place).length).toUpperCase();
     g.save();
-    g.translate(ix + 66 * s, iy + h1 * 0.5);
+    g.translate(ix + 66 * s, iy + ih1 * 0.5);
     g.scale(pop, pop);
     const flashCol =
       flash > 0
@@ -704,18 +751,17 @@ export class Hud implements HudAPI {
         : lead
           ? rgba(HEX.boostHot, 1)
           : rgba(HEX.hudPaper, 1);
+    // No offset colour ghost here. Magenta is the boost colour; on the placement
+    // numeral it was a fifth accent in a frame that already had four.
     inkText(g, num, -6 * s, 25 * s, {
-      font: `900 ${Math.round(72 * s)}px ${FONT_STACK}`,
+      font: `900 ${Math.round(70 * s)}px ${FONT_STACK}`,
       fill: flashCol,
       ink: rgba(HEX.ink, 1),
       inkWidth: 6.5 * s,
       align: 'center',
       skew: 0.17,
-      ghost: rgba(HEX.boost, 0.55),
-      ghostDx: 4 * s,
-      ghostDy: 4 * s,
     });
-    inkText(g, suf, 26 * s, -8 * s, {
+    inkText(g, suf, 24 * s, -8 * s, {
       font: `800 ${Math.round(22 * s)}px ${FONT_STACK}`,
       fill: rgba(HEX.hudDim, 1),
       align: 'left',
@@ -729,7 +775,7 @@ export class Hud implements HudAPI {
       const rise = (1 - flash) * 26 * s;
       g.save();
       g.globalAlpha = flash;
-      g.translate(ix + 108 * s, iy + h1 * 0.5 - (up ? rise : -rise));
+      g.translate(ix + 108 * s, iy + ih1 * 0.5 - (up ? rise : -rise));
       const arr = new Path2D();
       const d = up ? -1 : 1;
       arr.moveTo(0, 11 * s * d);
@@ -745,7 +791,7 @@ export class Hud implements HudAPI {
     }
 
     // ── Lap counter.
-    const lx = ix + 148 * s;
+    const lx = ix + 150 * s;
     inkText(g, 'LAP', lx, iy + 26 * s, {
       font: `800 ${Math.round(12 * s)}px ${FONT_STACK}`,
       fill: rgba(HEX.hudDim, 1),
@@ -755,53 +801,64 @@ export class Hud implements HudAPI {
     const lapNum = String(Math.min(p.lap + 1, CONFIG.race.laps));
     segText(g, `${lapNum}/${CONFIG.race.laps}`, lx, iy + 32 * s, 30 * s, {
       lit: rgba(HEX.hudPaper, 1),
-      dim: null,
-      ink: rgba(HEX.ink, 0.9),
-      inkWidth: 1.8 * s,
+      ink: rgba(HEX.ink, 1),
+      inkWidth: 1.2 * s,
       align: 'left',
       skew: 0.1,
     });
 
-    // ── Race clock.
+    // ── Race clock. Lit segments only — the unlit ghosts behind this readout
+    // made 1s and 7s ambiguous at capture scale.
     const t = Math.max(0, ctx.race.raceTime);
-    segText(g, formatTime(t), lx, iy + 70 * s, 19 * s, {
-      lit: rgba(HEX.waterCrest, 0.95),
-      dim: rgba(HEX.hudDim, 0.15),
+    segText(g, formatTime(t), lx, iy + 66 * s, 19 * s, {
+      lit: rgba(HEX.waterCrest, 1),
       align: 'left',
       skew: 0.1,
     });
 
-    // ── Split plate: last lap and best lap.
-    const y2 = iy + h1 + 8 * s;
-    const h2 = 46 * s;
-    const split = slantPath(ix + 6 * s, y2, iw - 34 * s, h2, 18 * s);
-    halo(g, split, rgba(HEX.ink, 0.38), 8 * s);
-    inked(g, split, rgba(HEX.hudInk, 0.7), rgba(HEX.hudDim, 0.8), 2.2 * s);
-
+    // ── Split row: last lap and best lap, inside the frame.
+    const sy = y2 + 12 * s;
     const last = p.lapTimes.length ? p.lapTimes[p.lapTimes.length - 1] : NaN;
     const bestIsNew =
       p.lapTimes.length > 0 && isFinite(p.bestLap) && Math.abs(p.bestLap - last) < 1e-6;
     const cols: [string, number, string][] = [
-      ['LAST', last, rgba(HEX.hudPaper, 0.95)],
-      ['BEST', p.bestLap, bestIsNew ? rgba(HEX.raceLine, 1) : rgba(HEX.foamShade, 0.95)],
+      ['LAST', last, rgba(HEX.hudPaper, 1)],
+      ['BEST', p.bestLap, bestIsNew ? rgba(HEX.raceLine, 1) : rgba(HEX.foamShade, 1)],
     ];
     cols.forEach(([label, value, col], i) => {
-      const cx = ix + 22 * s + i * (iw - 76 * s) * 0.5;
-      inkText(g, label, cx, y2 + 17 * s, {
-        font: `800 ${Math.round(10.5 * s)}px ${FONT_STACK}`,
+      const cx = ix + 20 * s + i * (iw - 44 * s) * 0.5;
+      inkText(g, label, cx, sy + 22 * s, {
+        font: `800 ${Math.round(11 * s)}px ${FONT_STACK}`,
         fill: rgba(HEX.hudDim, 1),
         align: 'left',
-        tracking: 2.4 * s,
+        tracking: 2.2 * s,
       });
-      // With no lap recorded yet the display shows its unlit field only, which
-      // reads as "no data" instead of as a genuine 0:00.000.
       const has = isFinite(value) && value > 0;
-      segText(g, has ? formatTime(value) : '0:00.000', cx, y2 + 22 * s, 16 * s, {
-        lit: has ? col : rgba(HEX.hudDim, 0.14),
-        dim: has ? rgba(HEX.hudDim, 0.12) : null,
-        align: 'left',
-        skew: 0.1,
-      });
+      const tx = cx + 40 * s;
+      if (has) {
+        // Full-brightness digits. These were previously drawn at ~10 % alpha as
+        // an "unlit field", i.e. unreadable in every capture.
+        segText(g, formatTime(value), tx, sy + 6 * s, 17 * s, {
+          lit: col,
+          ink: rgba(HEX.ink, 1),
+          inkWidth: 1.2 * s,
+          align: 'left',
+          skew: 0.1,
+        });
+      } else {
+        // No lap yet: draw dashes at a legible tone. A ghosted 0:00.000 reads as
+        // a broken display; a dash reads as "no data", which is the truth.
+        g.strokeStyle = rgba(HEX.hudDim, 0.9);
+        g.lineWidth = 3 * s;
+        const dw = segWidth('0:00.000', 17 * s);
+        for (let k = 0; k < 3; k++) {
+          const x0 = tx + 4 * s + k * dw * 0.33;
+          g.beginPath();
+          g.moveTo(x0, sy + 14 * s);
+          g.lineTo(x0 + dw * 0.2, sy + 14 * s);
+          g.stroke();
+        }
+      }
     });
   }
 
@@ -824,18 +881,21 @@ export class Hud implements HudAPI {
       const isPlayer = r.isPlayer;
       // Rows stagger right as they go down: the ladder reads as a ranked stack.
       const rx = x + i * 7 * s;
-      const plate = slantPath(rx, y, w - i * 7 * s, rowH, 11 * s);
-      inked(
-        g,
-        plate,
-        rgba(HEX.hudInk, isPlayer ? 0.9 : 0.66),
-        isPlayer ? rgba(HEX.hudPaper, 0.92) : rgba(HEX.hudDim, 0.6),
-        isPlayer ? 2.8 * s : 1.8 * s,
-      );
+      const plateW = w - i * 7 * s;
+      const row = slantPath(rx, y, plateW, rowH, rowH * PLATE_SKEW);
+      // One weight, one outline colour, opaque fill — for every row. The old
+      // ladder drew non-player rows at 0.66 alpha with a 1.8 px dim outline, and
+      // a pink buoy panel plus a white mast rendered straight through
+      // "2 KAIRA" and "3 NOX" (shots/pres_base/pack.png). Whose row it is is
+      // said by the hull-colour chip and the name's brightness, not by the frame.
+      plate(g, row, s, {
+        fill: rgba(isPlayer ? HEX.hudInk : HEX.inkSoft, 1),
+        edge: rgba(HEX.hudPaper, isPlayer ? 0.95 : 0.7),
+      });
 
       // Colour chip.
-      const chip = slantPath(rx + 3 * s, y + 3 * s, 7 * s, rowH - 6 * s, 9 * s);
-      inked(g, chip, rgba(hex, 1), rgba(HEX.ink, 0.85), 1.4 * s);
+      const chip = slantPath(rx + 4 * s, y + 4 * s, 8 * s, rowH - 8 * s, (rowH - 8 * s) * PLATE_SKEW);
+      inked(g, chip, rgba(hex, 1), rgba(HEX.ink, 1), 1.6 * s);
 
       // Place number in the type face, not the segment face: a seven-segment
       // "1" is a bare vertical bar and at ladder size it reads as a tally mark
@@ -857,7 +917,7 @@ export class Hud implements HudAPI {
 
       // Gap to the leader, estimated from spline progress and current pace.
       const gapTxt = this.gapText(ctx, r, leader);
-      inkText(g, gapTxt, rx + w - i * 7 * s - 10 * s, y + rowH - 9 * s, {
+      inkText(g, gapTxt, rx + plateW - 10 * s, y + rowH - 9 * s, {
         font: `800 ${Math.round(12.5 * s)}px ${FONT_STACK}`,
         fill:
           gapTxt === 'LEAD'

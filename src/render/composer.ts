@@ -81,16 +81,34 @@ const EdgeShader = {
     uThickness: { value: 1.15 },
     uDepthThreshold: { value: 0.0060 },
     /**
-     * 1 − dot(n, n'), so a 30° crease is 0.134 and a 45° crease is 0.29. The
-     * original 0.42 needed a *55° break* before it would ink anything, which is
-     * why the hull's chine — an authored, per-face-normal crease — never drew a
-     * line in any capture. 0.13 catches the creases that are actually modelled.
+     * 1 − dot(n, n'), so a 30° crease is 0.134, a 36° crease is 0.19 and a 60°
+     * crease is 0.50. The original 0.42 needed a *55° break* before it would ink
+     * anything, which is why the hull's chine — an authored, per-face-normal
+     * crease — never drew a line in any capture.
+     *
+     * 0.235 is the window between two things that are both present in this
+     * geometry: the boat is authored non-indexed, so every non-planar quad has a
+     * ~15-40° break along its triangulation diagonal, and at 0.13 those diagonals
+     * inked as a dotted hatch across the deck and hull flanks (visible at 4x in
+     * shots/cel_fix4 and still faintly at 0.185 in shots/cel_fix6). The chine is a
+     * 50-70° break — 0.41 to 0.66 — so it clears 0.235 with room to spare, which
+     * shots/cel_fix6/countdown.png confirms: the flank crease is inked.
      */
-    uNormalThreshold: { value: 0.13 },
+    uNormalThreshold: { value: 0.235 },
     uEdgeStrength: { value: 0.95 },
-    uFlareStrength: { value: 0.30 },
-    uVignette: { value: 0.26 },
-    uDither: { value: 1.0 },
+    uFlareStrength: { value: 0.24 },
+    uVignette: { value: 0.09 },
+    /**
+     * Off. This was ±1 LSB of interleaved-gradient noise applied to *every*
+     * pixel of the final image, to hide 8-bit contouring in the sky gradient.
+     * What it actually did was make the whole frame per-pixel unique: 92.3% of
+     * sampled water pixels in shots/r2/course.png differed from all four of
+     * their neighbours, and a 626×62 patch of the player's deck held 4666
+     * distinct colours. A cel image is flat fills; anything that perturbs every
+     * pixel is the opposite of the brief, and it would boil at 60 fps. The sky's
+     * contouring is now solved where it belongs — by banding the sky on purpose.
+     */
+    uDither: { value: 0.0 },
   },
   vertexShader: FULLSCREEN_VERT,
   fragmentShader: /* glsl */ `
@@ -117,12 +135,42 @@ const EdgeShader = {
       return fract(52.9829189 * fract(dot(p, vec2(0.06711056, 0.00583715))));
     }
 
-    /** Applied last, in the composite, so nothing downstream re-quantises. */
+    /**
+     * Applied last, in the composite, so nothing downstream re-quantises.
+     *
+     * The vignette is *stepped*. A continuous pow(radius, 2.4) multiply is a
+     * smooth gradient laid over the entire image, which by itself is enough to
+     * stop any flat fill from being flat — a deck spanning 600 px picked up 40
+     * distinct values from the vignette alone. Two hard rings at eyeballed radii
+     * keep the corner weight (it does carry the composition) while leaving every
+     * fill inside a ring exactly flat.
+     */
     vec3 finish(vec3 col, vec2 uv) {
-      float v = 1.0 - uVignette * pow(length(uv - 0.5) * 1.42, 2.4);
+      vec2 d = (uv - 0.5) * vec2(1.0, 0.94);
+      float r = length(d) * 1.42;
+      float v = 1.0 - uVignette * (step(0.44, r) * 0.38 + step(0.63, r) * 0.62);
       col *= v;
       float lsb = 0.0034 * pow(max(max(col.r, col.g), col.b), 0.55) * uDither;
       return col + (ditherNoise(gl_FragCoord.xy) - 0.5) * lsb;
+    }
+
+    /**
+     * The flare, quantised into two hard shells.
+     *
+     * The streak buffer is a blurred field, so adding it directly paints a soft
+     * radial glow — which is exactly what shots/r2/sky.png shows around the sun
+     * (a soft white ellipse in a soft yellow halo) and what put a soft white
+     * blob on the rider's helmet in shots/r2/rider_closeup.png. Thresholding its
+     * luminance turns the same buffer into a *shape* with a crisp boundary: the
+     * blur decides the outline of the shape, the steps decide that it has one.
+     */
+    vec3 flareAt(vec2 uv) {
+      vec3 f = texture2D(tFlare, uv).rgb;
+      float l = dot(f, vec3(0.2126, 0.7152, 0.0722));
+      float m = step(0.030, l) * 0.42 + step(0.115, l) * 0.58;
+      // Normalised to its own hue so the two shells are flat fills, not a ramp.
+      vec3 hue = f / max(max(max(f.r, f.g), f.b), 1e-4);
+      return hue * m * uFlareStrength;
     }
 
     void main() {
@@ -137,7 +185,7 @@ const EdgeShader = {
 
       // Sky / anything that never wrote the G-buffer: leave it untouched.
       if (dc.a < 0.5 || edgeBias <= 0.001) {
-        vec3 outc = scene + texture2D(tFlare, vUv).rgb * uFlareStrength;
+        vec3 outc = scene + flareAt(vUv);
         gl_FragColor = vec4(finish(outc, vUv), 1.0);
         return;
       }
@@ -147,7 +195,7 @@ const EdgeShader = {
       // 3×3 Sobel kernels, applied to all three signals in one sweep.
       const vec3 kx = vec3(-1.0, 0.0, 1.0);
       float gxDepth = 0.0, gyDepth = 0.0;
-      float normalDiff = 0.0;
+      float normalSum = 0.0;
       float idDiff = 0.0;
 
       for (int j = -1; j <= 1; j++) {
@@ -162,8 +210,14 @@ const EdgeShader = {
           gxDepth += sd.r * wx;
           gyDepth += sd.r * wy;
 
+          // Mean, not max. A max over the 3x3 fires on a *single* aliased
+          // sample, which is what a grazing surface produces in quantity — one
+          // facet a pixel wide, one wildly different normal, one dot of ink. A
+          // real crease runs through the kernel and shows up in three or four of
+          // the eight neighbours, so the mean separates the two: a line scores
+          // ~0.83 of the true break, an isolated alias ~0.27.
           vec3 sNormal = sn.rgb * 2.0 - 1.0;
-          normalDiff = max(normalDiff, 1.0 - dot(centreNormal, sNormal));
+          normalSum += 1.0 - dot(centreNormal, sNormal);
           idDiff = max(idDiff, abs(sd.g - centreId) > 0.002 ? 1.0 : 0.0);
         }
       }
@@ -171,16 +225,25 @@ const EdgeShader = {
       // Relative depth gradient → distance-invariant line weight.
       float depthGrad = length(vec2(gxDepth, gyDepth)) / max(centreDepth, 1e-4);
       float depthEdge = smoothstep(uDepthThreshold, uDepthThreshold * 3.4, depthGrad);
-      float normalEdge = smoothstep(uNormalThreshold, uNormalThreshold * 1.75, normalDiff);
+      float normalDiff = (normalSum / 8.0) * 2.2;
+      float normalEdge = 0.0;
 
       // Grazing surfaces are the one place a normal-difference Sobel lies. A
       // panel seen almost edge-on packs many facets into a few pixels, so the
       // G-buffer normal is undersampled and every tessellation seam reads as a
       // crease — dense diagonal hatch across the boat's foredeck in
-      // shots/cel_r2/outline_check.png. Fade the normal signal as the surface
-      // turns away from the eye and only genuine, resolvable creases survive.
+      // shots/cel_r2/outline_check.png.
+      //
+      // Fading the signal out there (what this did before) throws the baby out:
+      // the hull's chine is a 50-70° authored break on a *flank*, i.e. exactly a
+      // grazing surface, and multiplying its response by ~0 is why that crease
+      // has never been inked in any capture despite the boat being authored
+      // non-indexed with per-face normals to provide it. Raise the *threshold*
+      // instead — a grazing surface must break harder to earn a line, so real
+      // creases survive and tessellation seams (a few degrees) do not.
       float facing = abs(centreNormal.z);
-      normalEdge *= smoothstep(0.14, 0.42, facing);
+      float grazeThr = uNormalThreshold * mix(2.4, 1.0, smoothstep(0.10, 0.45, facing));
+      normalEdge = smoothstep(grazeThr, grazeThr * 1.75, normalDiff);
 
       // A very large depth gradient *is* a silhouette, and the inverted hull
       // already inked it. Rolling *both* screen-space signals off there is what
@@ -197,10 +260,23 @@ const EdgeShader = {
       float edge = clamp(max(max(depthEdge * 0.85, normalEdge), idDiff * (1.0 - silhouette * 0.9) * 0.8), 0.0, 1.0);
       edge *= edgeBias * uEdgeStrength;
 
+      // A line is drawn or it is not there — two weights, hard thresholds.
+      //
+      // The smoothstep tail was producing ink at 1-2% opacity all over any
+      // tessellated surface whose facets differ by a couple of degrees, and 1-2%
+      // ink in a 1 px pattern is exactly the horizontal scanline striping the
+      // critic measured across the hull and deck (values alternating de4836 /
+      // e24936 down the deck in shots/cel_fix3/outline_check.png). It is
+      // sub-pixel high-frequency detail on a moving object, so it shimmers at
+      // speed. Clipping the tail to zero removes it at the source, and the two
+      // surviving weights keep the line from reading as one uniform machine
+      // stroke.
+      edge = step(0.34, edge) * (0.60 + 0.40 * step(0.62, edge));
+
       // Ink is multiplied in rather than mixed to white-point, so lines sit
       // *in* the artwork instead of on top of it.
       vec3 col = mix(scene, uInkColor + scene * 0.20, edge);
-      col += texture2D(tFlare, vUv).rgb * uFlareStrength;
+      col += flareAt(vUv);
 
       gl_FragColor = vec4(finish(col, vUv), 1.0);
     }
@@ -216,10 +292,23 @@ const EdgeShader = {
  * keep its foam *below* white to work around it. At 0.94 only the sun, the sun's
  * own drawn flare and a genuine specular glint qualify, which is the correct set.
  *
- * Materials can also opt out entirely via `flareMask: 0` on `createCelMaterial`,
- * which lands in the G-buffer's blue channel. Geometry that never writes the
- * G-buffer (particles, the sky) keeps the luminance test only, so the sun still
- * flares while foam does not.
+ * Materials opt out entirely via `flareMask: 0` on `createCelMaterial`, which
+ * lands in the G-buffer's blue channel.
+ *
+ * ── Nothing outside the G-buffer flares ────────────────────────────────────
+ * Geometry that never writes the G-buffer used to keep the luminance test only,
+ * which meant the two brightest things in the game — the sky's sun and every
+ * foam/spray particle — were the two things guaranteed to bloom. That is where
+ * shots/r2/sky.png's photographic sun came from: a drawn hard-edged disc, an
+ * anime flare made entirely of step()s, and then a quarter-res blur smeared a
+ * soft white ellipse, a soft yellow halo and four soft tapered spikes on top of
+ * it. The sun's flare is *drawn*, in sky.ts, and does not want a lens model
+ * over it; foam wants to be able to reach white without turning to airbrush,
+ * which the water subsystem asked for explicitly.
+ *
+ * So the rule is inverted: no G-buffer, no flare. What is left flaring is a
+ * genuine specular glint on a hull or a helmet — the only case where a bloom is
+ * doing artistic work — and any surface can still opt out with `flareMask: 0`.
  */
 const ThresholdShader = {
   uniforms: {
@@ -241,8 +330,9 @@ const ThresholdShader = {
       // step(), not smoothstep(): the flare should have a defined shape.
       float m = step(uThreshold, lum);
       vec4 g = texture2D(tDepthId, vUv);
-      // g.a < 0.5 → nothing wrote the G-buffer here; allow.
-      float allow = g.a < 0.5 ? 1.0 : step(0.5, g.b);
+      // g.a < 0.5 → nothing wrote the G-buffer here (sky, particles, foam,
+      // outline shells): never flares. See the note above.
+      float allow = g.a < 0.5 ? 0.0 : step(0.5, g.b);
       gl_FragColor = vec4(c * m * allow * uIntensity, 1.0);
     }
   `,

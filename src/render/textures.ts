@@ -278,16 +278,15 @@ export function makeGlossMatcap(
 
     const hy = R - horizon * size;
 
-    // Sky band: a narrow *strip* along the very top of the disc. It has to be
-    // narrow and dim, because a flat up-facing plane (a deck) samples one point
-    // of the disc and so takes the tone as a flat fill — a wide bright strip
-    // paints the whole deck pale blue instead of reading as gloss.
-    g.fillStyle = hex(sky.clone().multiplyScalar(0.5));
-    g.fillRect(0, 0, size, hy * 0.20);
-
-    // Sea bounce: a matching strip along the bottom, dimmer and cooler.
-    g.fillStyle = hex(sea.clone().multiplyScalar(0.6));
-    g.fillRect(0, size - hy * 0.16, size, size);
+    // Sky and sea washes: *gone*. Any strip that covers a broad band of normal
+    // directions gets sampled as a flat fill by a flat panel, and the boat is
+    // mostly flat panels — the foredeck and the transom plate came out uniformly
+    // pale blue in shots/r2/outline_check.png, which read as bare untextured
+    // card, and the strip's edge sliding across a curving surface was one of the
+    // gradients on the hull. What is left is marks only, on black: a matcap that
+    // contributes *nothing* unless the normal actually lands on a drawn mark.
+    // `sky` and `sea` survive only as a faint cool tint on the rim sliver, which
+    // is a line rather than an area.
 
     // One hard key blob, up-left, matching SUN_DIR's screen-space lean, and a
     // detached spark: two marks read as intent, one reads as an accident.
@@ -299,11 +298,18 @@ export function makeGlossMatcap(
     g.ellipse(R * 1.30, R * 0.80, R * 0.075, R * 0.040, 0.35, 0, Math.PI * 2);
     g.fill();
 
-    // Rim sliver along the lower-right: the "turn" of a glossy form.
-    g.strokeStyle = hex(hot.clone().multiplyScalar(0.55));
-    g.lineWidth = size * 0.022;
+    // Rim sliver along the lower-right: the "turn" of a glossy form. Cooled
+    // toward the sea tone, and a second, shorter sliver up-top toward the sky
+    // tone — two lines instead of two areas.
+    g.strokeStyle = hex(hot.clone().lerp(sea, 0.45).multiplyScalar(0.62));
+    g.lineWidth = size * 0.020;
     g.beginPath();
     g.arc(R, R, R * 0.968, Math.PI * -0.28, Math.PI * 0.40);
+    g.stroke();
+    g.strokeStyle = hex(hot.clone().lerp(sky, 0.5).multiplyScalar(0.55));
+    g.lineWidth = size * 0.016;
+    g.beginPath();
+    g.arc(R, R, R * (0.955 - horizon), Math.PI * 1.06, Math.PI * 1.44);
     g.stroke();
     g.restore();
 

@@ -29,9 +29,23 @@
  *    rather than fades. It is drawn bright but under the flare threshold, so the
  *    post pass streaks it instead of smothering it.
  *
- * The gradient is also dithered. A 3-tone blue ramp across 1600 device pixels
- * lands well inside 8-bit quantisation and contours visibly; an ordered dither at
- * ±1 LSB removes it without touching the graphic banding we put there on purpose.
+ * ── What the r2 capture still got wrong ────────────────────────────────────
+ * The gradient was smooth and the sun was a lens.
+ *
+ * 1. **A 600-colour sky.** The bands were joined by "narrow" smoothsteps and
+ *    then *dithered* to hide 8-bit contouring, which is a photographic solution
+ *    to a graphic problem: 69 distinct colours in 72 samples down one column of
+ *    shots/r2/sky.png, 606 unique colours in a 400×400 patch. The sky is the
+ *    largest surface in the game and it was its most photoreal element. It is
+ *    now six flat committed bands with hard horizontal thresholds, plus two hard
+ *    radial bands around the sun, and no dither at all.
+ *
+ * 2. **The flare was the post pass, not the drawing.** The disc, annulus and rays
+ *    here are all step()s, but the composite let anything outside the G-buffer
+ *    bloom — and the sky is outside the G-buffer, so a quarter-res blur painted a
+ *    soft white ellipse, a soft yellow halo and four soft tapered spikes straight
+ *    over the top of them. That rule is inverted in composer.ts now: no G-buffer,
+ *    no flare. What you see around the sun is drawn.
  */
 
 import {
@@ -65,11 +79,17 @@ export function createSky(): Mesh {
       uFlare: { value: paletteTone(PAL.sunFlare) },
       uCloudLit: { value: paletteTone(PAL.cloudLit) },
       uCloudShade: { value: paletteTone(PAL.cloudShade) },
-      uCloudRim: { value: paletteTone(PAL.foam) },
-      // Higher = *less* cloud (it is a threshold on the noise field). 0.485 put
-      // 60% of the frame under a single blown-white mass in shots/cel_r1/sky.png;
-      // scattered cumulus with real sky between them wants ~0.60.
-      uCloudCover: { value: 0.585 },
+      // The cloud contour is a *drawn blue line*, not a highlight. It was
+      // PAL.foam — a near-white — which is why shots/r2/sky.png shows a pale
+      // perimeter around the main mass reading as a second, offset contour
+      // outside the shadow band rather than as an edge.
+      uCloudRim: { value: paletteTone(PAL.skyMid).lerp(paletteTone(PAL.cloudShade), 0.40) },
+      // Higher = *less* cloud (it is a threshold on the noise field). Raised from
+      // 0.585 after two layers of two-octave field covered nearly the whole upper
+      // frame in shots/cel_fix6/countdown.png and the sky read as flat overcast
+      // grey-blue — a different palette from the racing shots. Committed sky means
+      // real zenith blue between the masses in every shot.
+      uCloudCover: { value: 0.645 },
       uWind: { value: new Vector3(0.0075, 0, 0.0042) },
     },
     vertexShader: /* glsl */ `
@@ -108,82 +128,70 @@ export function createSky(): Mesh {
         return mix(mix(hash(i), hash(i + vec2(1,0)), f.x),
                    mix(hash(i + vec2(0,1)), hash(i + vec2(1,1)), f.x), f.y);
       }
-      float fbm(vec2 p) {
-        float v = 0.0, a = 0.5;
-        for (int i = 0; i < 5; i++) { v += a * noise(p); p *= 2.03; a *= 0.5; }
-        return v;
-      }
       /**
-       * Three octaves only, for the *silhouette* field. Five octaves put enough
-       * high-frequency detail near the threshold that the cloud edge came out
-       * lacy and amoeba-like; cumulus silhouettes are lumpy but closed, so the
-       * shape field is deliberately smoother than the shading field.
-       */
-      float fbm3(vec2 p) {
-        float v = 0.0, a = 0.5;
-        for (int i = 0; i < 3; i++) { v += a * noise(p); p *= 2.11; a *= 0.5; }
-        return v / 0.875;
-      }
-
-      /** 8×8 ordered dither, ±0.5 LSB, to break 8-bit contouring. */
-      float bayer(vec2 c) {
-        vec2 p = floor(mod(c, 8.0));
-        float b = 0.0;
-        // Interleaved-gradient noise is smoother than a real Bayer matrix here
-        // and costs one dot product; the goal is only to spread quantisation.
-        b = fract(52.9829189 * fract(dot(p, vec2(0.06711056, 0.00583715))));
-        return b;
-      }
-
-      /**
-       * One cel cloud layer.
+       * Two octaves, for the *silhouette* field.
        *
-       * 'body' is a hard threshold on the warped fbm — that single step() is what
-       * makes the silhouette a painted shape. 'lit' is a second, higher threshold
-       * so the sun-facing mass reads as a separate flat tone, and 'rim' is the
-       * thin band *between* two nearby thresholds on the same field, which is the
-       * inked edge you see on anime cumulus. Nothing here fades.
+       * Three was still too many. High-frequency content sitting near the
+       * threshold does two things, both visible in shots/r2/sky.png: it punches
+       * detached islands *inside* the mass (specks at 1339,1037 and 1512,1123)
+       * and it frays the outline into the five-fingered amoeba the critic called
+       * spilled milk. A cumulus silhouette is lumpy but closed, so the shape
+       * field is deliberately the smoothest field in the shader.
        */
-      vec4 cloudLayer(vec2 uv, float scale, float cover, float sunward, float rimWidth) {
+      float fbm2(vec2 p) {
+        float v = 0.0, a = 0.5;
+        for (int i = 0; i < 2; i++) { v += a * noise(p); p *= 2.11; a *= 0.5; }
+        return v / 0.75;
+      }
+      /**
+       * The cloud shape field. Factored out because the shading needs to sample
+       * it at an *offset*, which is the whole trick below.
+       */
+      float cloudField(vec2 q, vec2 drift) {
+        float warp = fbm2(q * 1.55 - drift * 1.5);
+        return fbm2(q * 1.12 + vec2(warp, warp * 0.72) * 0.58 + drift);
+      }
+
+      /**
+       * One cel cloud layer: three flat tones and one contour, nothing else.
+       *
+       * The bands are built by *eroding the silhouette from the anti-sun side*
+       * rather than by thresholding a second noise field. Sample the same shape
+       * field a short step away from the sun: if that sample has left the cloud,
+       * this pixel is within one band-width of the away-from-sun edge, so it is
+       * in shadow. Two step lengths give two shadow depths, and the result is a
+       * lit mass with a shadow crescent that always follows the form and always
+       * agrees with SUN_DIR — which a threshold on an unrelated low-frequency
+       * field does not, and did not: in shots/cel_fix2/sky.png entire masses
+       * landed on one side of that threshold and came out flat white, exactly the
+       * volume-less "spilled milk" the critic measured in r2.
+       *
+       * 'contour' lets the small high layer skip the line entirely. Three layers
+       * each drawing their own contour crossed into line spaghetti wherever they
+       * overlapped near the horizon (shots/r2/outline_check.png, 1008,187).
+       */
+      vec4 cloudLayer(vec2 uv, float scale, float cover, vec2 sunUv, float contour) {
         vec2 drift = uWind.xz * uTime * scale;
         vec2 p = uv * scale;
-        float warp = fbm3(p * 1.9 - drift * 1.6);
-        float d = fbm3(p * 1.25 + vec2(warp, warp * 0.7) * 0.75 + drift);
-        float base = fbm(p * 0.62 + drift * 0.5);
+        float d = cloudField(p, drift);
 
-        float body = step(cover, d);
-        if (body < 0.5) return vec4(0.0);
+        if (step(cover, d) < 0.5) return vec4(0.0);
 
-        // Interior: three flat tones. The lit threshold sits well above the
-        // silhouette threshold so the white is a *shape inside* the cloud rather
-        // than the whole cloud — at cover+0.085 nearly every cloud pixel passed
-        // and the layer came out as one flat white mass.
-        // Thresholds close to the silhouette, so the white core is a large,
-        // confident shape. At +0.055 / +0.105 only the biggest masses ever
-        // reached the core tone and every small cloud came out uniformly grey
-        // (shots/cel_r4/sun_face.png).
-        float litMask = step(cover + 0.026, d);
-        float coreMask = step(cover + 0.060, d + base * 0.05);
-        // The value plan is pale: a fair-weather cumulus is *bright* even in
-        // shadow. Dropping the base to 0.80 and the under-shadow to 0.62 turned
-        // the mid-sky clouds into grey smudges in shots/cel_r2/sky.png — read as
-        // smog, not as cloud. Shadow is a cool blue-lilac at ~0.86 of the shade
-        // tone, not a grey at 0.6.
-        vec3 col = uCloudShade * 0.94;
-        col = mix(col, mix(uCloudShade, uCloudLit, 0.35), litMask);
-        col = mix(col, uCloudLit, coreMask);
+        // Lit by default. A fair-weather cumulus is bright even in shadow, so
+        // the shadow bands stay pale — dropping them further turned the mid-sky
+        // clouds into smog in shots/cel_r2/sky.png.
+        vec3 col = uCloudLit;
 
-        // Warm the sun side by one more hard step. Anime clouds get a warm
-        // shoulder, never a gradient.
-        col = mix(col, uCloudLit + uFlare * 0.20, step(0.62, sunward) * coreMask * 0.8);
+        // Erode from the anti-sun side: wide band → cloudShade, narrow band
+        // nearer the edge → one step deeper.
+        float shadeWide = 1.0 - step(cover, cloudField(p - sunUv * 0.34, drift));
+        float shadeDeep = 1.0 - step(cover, cloudField(p - sunUv * 0.13, drift));
+        col = mix(col, uCloudShade, shadeWide);
+        col = mix(col, mix(uCloudShade, uCloudRim, 0.34), shadeDeep);
 
-        // Under-shadow: the base of each mass drops a step. Uses the
-        // low-frequency field so the shadow follows the mass, not the noise.
-        col = mix(col, uCloudShade * 0.78, step(base, 0.40) * (1.0 - coreMask) * 0.8);
-
-        // Inked rim: a thin band just inside the silhouette.
-        float rim = step(cover, d) - step(cover + rimWidth, d);
-        col = mix(col, uCloudRim, rim * 0.85);
+        // The contour: a single thin band just inside the silhouette.
+        float edge = 1.0 - step(cover + 0.018, d);
+        col = mix(col, uCloudRim, edge * contour);
 
         return vec4(col, 1.0);
       }
@@ -208,28 +216,41 @@ export function createSky(): Mesh {
         vec3 L = normalize(uSunDir);
 
         // ── Banded gradient ─────────────────────────────────────────────────
-        // Three tones with *narrow smoothsteps* rather than one long ramp.
-        // Fully hard steps in the sky read as a rendering error at this scale,
-        // so the transitions are tight but not zero-width — the compromise
-        // that keeps it graphic while still reading as atmosphere.
-        vec3 sky = mix(uHaze, uHorizon, smoothstep(-0.02, 0.075, h));
-        sky = mix(sky, uMid, smoothstep(0.06, 0.26, h));
-        sky = mix(sky, uZenith, smoothstep(0.30, 0.78, h));
+        // Six flat bands, hard horizontal thresholds, no interpolation anywhere.
+        //
+        // This was three tones joined by "narrow" smoothsteps, on the theory that
+        // fully hard steps would read as a rendering error. Measured on the
+        // result: 69 distinct colours in 72 samples down one column and 606
+        // unique colours in a 400×400 patch (shots/r2/sky.png). The sky is the
+        // largest surface in most frames, so a 600-colour gradient is the single
+        // most photoreal thing in the game and it drags everything else toward
+        // realism with it. Committed bands instead.
+        //
+        // The thresholds are not evenly spaced: they crowd toward the horizon,
+        // where the eye reads the sky as compressed, and open out overhead where
+        // one big field of zenith blue is what an anime background actually is.
+        vec3 sky = uHaze;
+        sky = mix(sky, mix(uHorizon, uHaze, 0.42), step(0.019, h));
+        sky = mix(sky, uHorizon, step(0.056, h));
+        sky = mix(sky, mix(uHorizon, uMid, 0.62), step(0.108, h));
+        sky = mix(sky, uMid, step(0.186, h));
+        sky = mix(sky, mix(uMid, uZenith, 0.55), step(0.315, h));
+        sky = mix(sky, uZenith, step(0.545, h));
 
-        // A deliberate extra band near the horizon — the pale bloom you see in
-        // anime skies where the haze layer meets clear air.
-        sky = mix(sky, uHaze, smoothstep(0.115, 0.015, abs(h - 0.035)) * 0.45);
-
-        // Broad warm bias around the sun's side of the sky. Not a glow: it is a
-        // wide, low-amplitude tint that ties the sun into the gradient, so the
-        // disc does not look pasted onto an unrelated blue field.
-        // Lifting toward the *haze* tone rather than adding the yellow flare
-        // colour: adding yellow to a blue field makes grey-purple mud, which is
-        // what turned the zenith violet in shots/cel_r1/sky.png. Real skies (and
-        // anime skies) desaturate toward the sun, they do not turn orange.
-        float sunSide = max(dot(normalize(vec3(dir.x, dir.y * 0.7, dir.z)), L), 0.0);
-        sky = mix(sky, uHaze, pow(sunSide, 4.0) * 0.30);
-        sky += uFlare * pow(sunSide, 40.0) * 0.16;
+        // Two more bands, this time radial around the sun, replacing what was a
+        // smooth pow(sunSide, 4) desaturation plus a pow(sunSide, 40) glow —
+        // i.e. an atmosphere model. Anime skies desaturate toward the sun in
+        // *steps*, and the step edges are part of the drawing.
+        //
+        // Circular, and *close in*. Squashing the axis (dir.y * 0.78) made the
+        // bands ellipses, which is half of why the critic read the sun as a lens
+        // — a sun is a circle. And at 0.955 the outer band was a 17° disc: a pale
+        // 800 px roundel sitting in the sky like a ghost image
+        // (shots/cel_fix1/sky.png). These two sit just outside the drawn figure,
+        // at ~9.5° and ~6.5°, so they read as the halo an animator paints round
+        // the sun rather than as an object of their own.
+        float sunSide = dot(dir, L);
+        sky = mix(sky, mix(sky, uHaze, 0.42), step(0.9942, sunSide));
 
         // ── Cel clouds ──────────────────────────────────────────────────────
         // Flattened-dome projection: 'dir.xz / (h + k)'. A true plane ('/h')
@@ -239,26 +260,40 @@ export function createSky(): Mesh {
 
           // High layer: small, many, drifting faster in uv terms.
           vec2 uvHi = dir.xz / (h + 0.42);
-          float sunwardHi = dot(normalize(vec3(dir.x, 0.30, dir.z)), L);
-          vec4 hi = cloudLayer(uvHi, 1.35, uCloudCover + 0.055, sunwardHi, 0.020);
+          // The sun's direction inside the cloud plane, which is what the
+          // shading erosion steps along.
+          vec2 sunUv = normalize(L.xz + vec2(1e-5));
+          // No contour on the small layer: three layers each drawing their own
+          // line crossed into spaghetti wherever they overlapped.
+          // Scales up across all three layers (1.35 → 2.30, 0.72 → 1.18,
+          // 0.26 → 0.42). With a two-octave shape field the features come out
+          // much larger for the same scale, and the low layer turned into one
+          // 1000 px mass filling the middle of shots/cel_fix1/sky.png. Several
+          // separate masses with sky between them is the composition.
+          vec4 hi = cloudLayer(uvHi, 3.60, uCloudCover + 0.055, sunUv, 0.0);
 
           // Low layer: bigger masses, slower, sits under the high one.
           vec2 uvLo = dir.xz / (h + 0.20);
-          vec4 lo = cloudLayer(uvLo + 31.7, 0.72, uCloudCover, sunwardHi, 0.014);
+          vec4 lo = cloudLayer(uvLo + 31.7, 1.95, uCloudCover + 0.020, sunUv, 1.0);
 
           // Flat-bottomed bank hugging the horizon — the cumulus shelf that
           // anchors any anime seascape. Masked to a band in h so it cannot
           // climb into the clear sky above it.
-          float bankBand = smoothstep(0.010, 0.040, h) * (1.0 - smoothstep(0.065, 0.155, h));
+          // Narrower and weaker than it was. A solid shelf across the whole
+          // horizon is the "horizon smear" failure: in shots/cel_fix4/countdown.png
+          // the bank plus the low layer covered the entire upper frame and the sky
+          // read as flat overcast grey-blue — a different palette from the racing
+          // shots, which is half of the "not committed across screens" defect.
+          float bankBand = smoothstep(0.008, 0.030, h) * (1.0 - smoothstep(0.052, 0.115, h));
           vec2 uvBank = dir.xz / (h + 0.085);
           // The bank reads as a shelf only if it is *solid*. Dropping its cover
           // below the other layers made it a lace curtain across the whole
           // horizon (shots/cel_probe3/sun_wide.png), so it now sits slightly
           // above them and gets a coarser field.
-          vec4 bank = cloudLayer(uvBank * 0.36 + 77.0, 0.26, uCloudCover + 0.030, sunwardHi, 0.008);
+          vec4 bank = cloudLayer(uvBank * 0.36 + 77.0, 0.62, uCloudCover + 0.075, sunUv, 1.0);
 
           sky = mix(sky, lo.rgb, lo.a * horizonFade * 0.96);
-          sky = mix(sky, bank.rgb, bank.a * bankBand * 0.92);
+          sky = mix(sky, bank.rgb, bank.a * bankBand * 0.88);
           sky = mix(sky, hi.rgb, hi.a * horizonFade);
         }
 
@@ -267,11 +302,15 @@ export function createSky(): Mesh {
         // whose length steps in two stages. There is no inverse-square falloff
         // anywhere in here, and nothing that the post blur can turn into haze:
         // the whole figure is made of step()s.
+        // Four concentric elements at most, counting the haze band above: a
+        // white disc, a sun-tone collar, a gap, one detached flare ring. Adding
+        // a fifth and sixth (which two extra haze bands did) turns the figure
+        // into a bullseye — shots/cel_fix2/sky.png reads as a target, not a sun.
         float sd = dot(dir, L);
         float disc  = step(0.99955, sd);
-        float halo  = step(0.9980, sd) * (1.0 - disc);
-        float gap   = step(0.9958, sd) * (1.0 - step(0.9980, sd));
-        float ring  = step(0.9946, sd) * (1.0 - step(0.9958, sd));
+        float halo  = step(0.9984, sd) * (1.0 - disc);
+        float gap   = 0.0;
+        float ring  = step(0.9952, sd) * (1.0 - step(0.9964, sd));
 
         // Rays. 'ang' is measured in the plane perpendicular to the sun so the
         // spokes stay straight and evenly spaced regardless of where the sun is.
@@ -289,9 +328,13 @@ export function createSky(): Mesh {
         // middle, reading as a compass rose (shots/cel_probe3/sun_face.png).
         // Perpendicular distance with a linear taper gives the widest-at-the-sun
         // triangle an animator draws, and the edge is still a single step().
+        // Lengths pulled in from 0.300/0.235: the long pair used to reach ~17°
+        // from the sun, and with the sun near the top-left of the frame the
+        // upper-left spoke ran off the edge of the image (shots/r2/sky.png,
+        // clipped at 0,122). The whole figure now fits inside a compact rosette.
         float rays = 0.0;
-        rays = max(rays, rayPair(tang,  0.0,       0.300, 0.0130));
-        rays = max(rays, rayPair(tang,  1.5707963, 0.235, 0.0105));
+        rays = max(rays, rayPair(tang,  0.0,       0.205, 0.0125));
+        rays = max(rays, rayPair(tang,  1.5707963, 0.165, 0.0100));
         // The diagonals stop *inside* the annulus. When they reached it the
         // ring plus radial spokes read as a ship's wheel rather than as a sun.
         rays = max(rays, rayPair(tang,  0.7853982, 0.062, 0.0042));
@@ -304,12 +347,10 @@ export function createSky(): Mesh {
         sky = mix(sky, uSun, halo);
         sky = mix(sky, uSunCore, disc);
 
-        // ── Dither ──────────────────────────────────────────────────────────
-        // Amplitude tracks the sRGB derivative so one LSB of output is one LSB
-        // of dither at every brightness.
-        float lsb = 0.0038 * pow(max(max(sky.r, sky.g), sky.b), 0.55);
-        sky += (bayer(gl_FragCoord.xy) - 0.5) * lsb;
-
+        // No dither. It existed to hide 8-bit contouring in a long smooth ramp;
+        // there is no longer a long smooth ramp to contour, and perturbing every
+        // pixel of the largest surface in the frame is the opposite of a limited
+        // palette. The banding is the drawing now.
         gl_FragColor = vec4(sky, 1.0);
       }
     `,

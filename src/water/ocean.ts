@@ -33,13 +33,19 @@
  *    hard-coded there, so retuning the mesh cannot silently desync the filter.
  */
 
-import { BufferAttribute, BufferGeometry, Mesh, Texture } from 'three';
+import { BufferAttribute, BufferGeometry, Mesh, Texture, Vector3 } from 'three';
 import { CONFIG } from '../core/config';
 import { createOceanMaterial } from './oceanMaterial';
 import { WaterFX } from './foam';
 import { maxWaveHeight, sampleHeight, sampleOcean } from './gerstner';
 import type { OceanSample } from './gerstner';
 import type { GameContext, OceanSampler, Subsystem } from '../core/types';
+
+/**
+ * Scratch for the per-frame camera direction. Module scope, because the frame
+ * loop must not allocate.
+ */
+const _camFwd = new Vector3();
 
 /** Deterministic per-ring hash, so the mesh is identical on every run. */
 function ringHash(i: number): number {
@@ -190,6 +196,17 @@ export class Ocean implements Subsystem, OceanSampler {
     // Undo the parent's offset so wake ribbons and spray stay in absolute world
     // space; both of them address the wave field by world XZ.
     this.fx.group.position.set(-cx, 0, -cz);
+
+    // ── Publish the view elevation, once per frame ────────────────────────────
+    // The shader needs "how much is the camera looking along the water rather
+    // than down at it" to scale its one view-dependent shading term. Measuring
+    // that per fragment (`1 - abs(V.y)`) makes it a radial function of the point
+    // under the camera, and quantising a radial function draws concentric rings —
+    // which is what put fingerprint whorls in the aerial capture. One scalar for
+    // the whole frame cannot have azimuthal or radial structure, by construction.
+    ctx.camera.getWorldDirection(_camFwd);
+    const graze = 1 - Math.min(1, Math.abs(_camFwd.y));
+    this.handles.material.uniforms.uGraze.value = graze * graze;
 
     // FX run after the boats have moved. Ocean is order 20 and boat physics is
     // order 30, so what we read here is last frame's hull position — one frame

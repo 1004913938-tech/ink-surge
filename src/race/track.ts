@@ -62,12 +62,13 @@
  */
 
 import {
-  AdditiveBlending,
   BufferAttribute,
   BufferGeometry,
-  DoubleSide,
+  DynamicDrawUsage,
+  FrontSide,
   Group,
   Mesh,
+  NormalBlending,
   ShaderMaterial,
   Vector3,
 } from 'three';
@@ -75,7 +76,8 @@ import { CONFIG } from '../core/config';
 import { PAL } from '../core/palette';
 import { angleDelta, clamp, clamp01, smoothstep } from '../core/mathx';
 import { applyCel, createCelMaterial, SHARED } from '../render/celMaterial';
-import { GERSTNER_GLSL, waveUniformArrays } from '../water/gerstner';
+import type { CelChunks } from '../render/celMaterial';
+import { GERSTNER_GLSL, sampleHeight, waveUniformArrays } from '../water/gerstner';
 import type { Checkpoint, GameContext, Subsystem, TrackAPI, TrackPoint } from '../core/types';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -238,6 +240,12 @@ export class Track implements TrackAPI, Subsystem {
     minSelfSeparation: number;
     closureGap: number;
     curvatureScale: number;
+    /** Worst measured gap between the drawn racing line and the water, metres. */
+    ribbonSagitta: number;
+    /** Smallest plan-view footprint of any gate part, metres. Proves depth. */
+    gateMinPlanDepth: number;
+    /** Clear height under the gate arch above the water, metres. */
+    gateArchClearance: number;
   };
 
   /** Live corner preview for the player, refreshed every frame. */
@@ -250,6 +258,11 @@ export class Track implements TrackAPI, Subsystem {
   };
 
   private ribbon!: Mesh;
+  /** Which gate each lamp vertex belongs to, and the state written for it. */
+  private lampGate!: Float32Array;
+  private lampState!: Float32Array;
+  private lampAttr!: BufferAttribute;
+  private lampTarget = -1;
 
   constructor() {
     const built = buildCentreline();
@@ -260,7 +273,7 @@ export class Track implements TrackAPI, Subsystem {
     this.tx = built.tx;
     this.tz = built.tz;
     this.pk = built.pk;
-    this.design = built.design;
+    this.design = { ...built.design, ribbonSagitta: 0, gateMinPlanDepth: 0, gateArchClearance: 0 };
 
     this.buildPreview();
     this.buildSpeedProfile();
@@ -269,6 +282,13 @@ export class Track implements TrackAPI, Subsystem {
     this.buildCheckpoints();
     this.buildRibbon();
     this.buildGates();
+
+    if (CONFIG.debug.harness || CONFIG.debug.enabled) {
+      // The design table is the only record of what the circuit actually *is*
+      // rather than what the layout comment claims, so under the harness it goes
+      // to the console where a verification run can read it back.
+      console.info('[track] design', JSON.stringify(this.design));
+    }
   }
 
   // ── Station helpers ───────────────────────────────────────────────────────
@@ -692,44 +712,55 @@ export class Track implements TrackAPI, Subsystem {
   // ── The racing-line ribbon ────────────────────────────────────────────────
 
   /**
-   * A glowing lane painted on the water, not a thread.
+   * A HINT LINE, not a lane.
    *
-   * The previous ribbon was 3 m wide, additive at alpha 0.3, and two vertices
-   * across. From a chase camera it foreshortened to a green hair (verified in
-   * shots/m1/hero.png). This one is:
+   * Two earlier versions were wrong in opposite directions. The first was 3 m
+   * wide, two vertices across, and foreshortened to a green hair. The reaction
+   * to that — a 7.2 m lane with 0.62 m glow rails, animated chevrons, a dashed
+   * centre spine and a brightness gain that multiplied its alpha by up to 4.6 at
+   * grazing angles — went far past the brief. Measured in shots/race_fix0 it was
+   * the brightest thing in the frame, covered roughly a third of the screen, and
+   * its vertical rails drew a razor-straight silhouette across a wave
+   * (shots/race_fix0/rider_closeup.png, the green edge under the hull). It was
+   * hiding the water it was supposed to sit on, and its additive brightness
+   * cleared the composite's flare threshold, so a *graphic* element was
+   * generating photographic bloom.
    *
-   *   • 7.2 m wide — a lane a 1.9 m boat sits inside, with bright rails at the
-   *     edges and a dashed centre;
-   *   • fitted with 0.62 m glow rails, so at the grazing angles a chase camera
-   *     actually uses there is real screen area to see rather than a
-   *     foreshortened sliver;
-   *   • brightened with distance to cancel that foreshortening, and only faded
-   *     out past 800 m so it does not fight the horizon;
-   *   • tinted and chevron-skewed by the *upcoming* corner — this is the
-   *     in-world corner-preview indicator.
+   * So this one is a hint and nothing more:
    *
-   * Every vertex is lifted onto the wave surface by the shared Gerstner code,
-   * so the lane rides the swell instead of slicing through it.
+   *   • 2.3 m across — one boat width (beam is 1.9 m), so it reads as a line the
+   *     hull covers rather than a road the hull sits inside;
+   *   • flat on the water. No rails, no vertical geometry at all, which is what
+   *     removes the straight-edge-across-a-wave artefact;
+   *   • alpha 0.26, one hard step up to 0.36 at the outer 22 % so it has a drawn
+   *     edge. No dashes, no chevrons, no distance gain, no grazing gain. Peak
+   *     composited luminance is ~0.37, far below the flare threshold of 0.985,
+   *     so it cannot bloom;
+   *   • tinted in three hard steps by the *upcoming* corner — green clear, pink
+   *     for a corner, red for the hairpin. This is the only marking left on it,
+   *     and it is the in-world corner-preview indicator the brief asked for;
+   *   • sampled every metre along and every 0.38 m across, and every vertex is
+   *     lifted onto the shared Gerstner surface. `design.ribbonSagitta` reports
+   *     the measured worst-case deviation between the drawn strip and the water
+   *     (see `measureRibbonError`) — the budget is 10 cm.
    */
   private buildRibbon() {
-    const SEGS = Math.max(600, Math.round(this.length / 1.5));
-    const W = 3.6;
-    // (lateral fraction, height, railT) across the lane.
-    const PROFILE: readonly [number, number, number][] = [
-      [-1.0, 0.62, 1.0],
-      [-1.0, 0.05, 0.0],
-      [-0.74, 0.05, 0.0],
-      [0.0, 0.05, 0.0],
-      [0.74, 0.05, 0.0],
-      [1.0, 0.05, 0.0],
-      [1.0, 0.62, 1.0],
-    ];
-    const P = PROFILE.length;
+    // 1 m stations. Σ(aᵢ·kᵢ²) over the wave table is 0.41 1/m, which bounds the
+    // surface's second derivative, so a 1 m chord can sag at most 1²·0.41/8 ≈
+    // 5 cm. Measured for real below rather than trusted.
+    const STEP = 1.0;
+    const SEGS = Math.max(600, Math.round(this.length / STEP));
+    /** Half-width, metres. Hull beam is 1.9 m. */
+    const W = 1.15;
+    /** Spans across the line. 6 → 0.38 m per span. */
+    const LAT = 6;
+    const P = LAT + 1;
+
     const vcount = (SEGS + 1) * P;
     const positions = new Float32Array(vcount * 3);
-    const uvs = new Float32Array(vcount * 2);
-    const info = new Float32Array(vcount * 3); // railT, curvature, severity
-    const indices = new Uint32Array(SEGS * (P - 1) * 6);
+    const lat = new Float32Array(vcount); // signed lateral fraction, −1…1
+    const sev = new Float32Array(vcount); // severity of the corner ahead, 0…1
+    const indices = new Uint32Array(SEGS * LAT * 6);
 
     let ii = 0;
     for (let i = 0; i <= SEGS; i++) {
@@ -747,26 +778,20 @@ export class Track implements TrackAPI, Subsystem {
       tanz /= tl;
       const rx = -tanz;
       const rz = tanx;
-      const along = (u * this.length) / 9.0; // one chevron period per 9 m
-      const k = this.pk[si];
-      const sv = this.sev[si];
+      const sv = Math.abs(this.sev[si]);
 
       for (let p = 0; p < P; p++) {
-        const [lat, hy, rail] = PROFILE[p];
+        const l = -1 + (2 * p) / LAT;
         const o = (i * P + p) * 3;
-        positions[o + 0] = cx + rx * lat * W;
-        positions[o + 1] = hy;
-        positions[o + 2] = cz + rz * lat * W;
-        const o2 = (i * P + p) * 2;
-        uvs[o2 + 0] = lat;
-        uvs[o2 + 1] = along;
-        info[o + 0] = rail;
-        info[o + 1] = k;
-        info[o + 2] = sv;
+        positions[o + 0] = cx + rx * l * W;
+        positions[o + 1] = 0;
+        positions[o + 2] = cz + rz * l * W;
+        lat[i * P + p] = l;
+        sev[i * P + p] = sv;
       }
 
       if (i < SEGS) {
-        for (let p = 0; p < P - 1; p++) {
+        for (let p = 0; p < LAT; p++) {
           const a = i * P + p;
           const b = a + 1;
           const c = a + P;
@@ -783,8 +808,8 @@ export class Track implements TrackAPI, Subsystem {
 
     const geo = new BufferGeometry();
     geo.setAttribute('position', new BufferAttribute(positions, 3));
-    geo.setAttribute('uv', new BufferAttribute(uvs, 2));
-    geo.setAttribute('aInfo', new BufferAttribute(info, 3));
+    geo.setAttribute('aLat', new BufferAttribute(lat, 1));
+    geo.setAttribute('aSev', new BufferAttribute(sev, 1));
     geo.setIndex(new BufferAttribute(indices, 1));
     geo.boundingSphere = null;
 
@@ -792,111 +817,74 @@ export class Track implements TrackAPI, Subsystem {
       name: 'racingLine',
       transparent: true,
       depthWrite: false,
-      blending: AdditiveBlending,
-      side: DoubleSide,
+      // Normal blending, deliberately. Additive is what made this element glow
+      // brighter than the sun's own flare, and additive over a bright crest can
+      // only ever brighten — it cannot read as a translucent mark *on* water.
+      blending: NormalBlending,
+      // FrontSide, and the winding is checked: with DoubleSide and depthWrite
+      // off, both faces of every coplanar triangle blend, so a nominal alpha of
+      // 0.26 composites at 0.45 and the "30 % hint" is a 45 % wash.
+      side: FrontSide,
       uniforms: {
         uWaveA: { value: waveUniformArrays.uWaveA },
         uWaveB: { value: waveUniformArrays.uWaveB },
         uTime: SHARED.uTime,
         uCameraPos: SHARED.uCameraPos,
         uColor: { value: PAL.raceLine.clone() },
-        uGlow: { value: PAL.raceLineGlow.clone() },
         uWarm: { value: PAL.boost.clone() },
         uHot: { value: PAL.warn.clone() },
       },
       vertexShader: /* glsl */ `
         ${GERSTNER_GLSL}
         uniform vec3 uCameraPos;
-        attribute vec3 aInfo;
-        varying vec2 vUv;
-        varying vec3 vInfo;
+        attribute float aLat;
+        attribute float aSev;
+        varying float vLat;
+        varying float vSev;
         varying float vDist;
-        varying float vGraze;
         void main() {
-          vUv = uv;
-          vInfo = aInfo;
+          vLat = aLat;
+          vSev = aSev;
           vec3 world = (modelMatrix * vec4(position, 1.0)).xyz;
           vec3 pos; vec3 nrm; float jac;
           gerstnerSurface(world.xz, uTime, pos, nrm, jac);
-          // Ride the wave: the lane sits on the surface along the surface normal,
-          // and the rails stand up from it.
-          pos += nrm * 0.16 + vec3(0.0, position.y, 0.0);
-          vec3 toCam = uCameraPos - pos;
-          vDist = length(toCam);
-          // How edge-on the lane is. A grazing lane covers few pixels, so the
-          // fragment stage lifts its brightness to compensate.
-          vGraze = 1.0 - abs(dot(normalize(toCam), nrm));
+          vDist = length(uCameraPos - pos);
+          // The lift grows with distance because the ocean mesh does not: its
+          // outer LOD rings evaluate the same field on a coarser grid, so far
+          // water sits *above* the exactly-evaluated line and chops it into
+          // dashes (visible on the far side of the circuit in
+          // shots/race_fix1/course.png). 9 cm near, 70 cm at half a kilometre —
+          // at which range 70 cm is a fraction of a pixel of parallax.
+          pos += nrm * (0.09 + 0.61 * smoothstep(90.0, 620.0, vDist));
           gl_Position = projectionMatrix * viewMatrix * vec4(pos, 1.0);
         }
       `,
       fragmentShader: /* glsl */ `
         precision highp float;
-        uniform vec3 uColor, uGlow, uWarm, uHot;
-        uniform float uTime;
-        varying vec2 vUv;
-        varying vec3 vInfo;
+        uniform vec3 uColor, uWarm, uHot;
+        varying float vLat;
+        varying float vSev;
         varying float vDist;
-        varying float vGraze;
 
         void main() {
-          float x = abs(vUv.x);
-          float rail = vInfo.x;
-          float sev = abs(vInfo.z);
-          float dir = vInfo.z >= 0.0 ? 1.0 : -1.0;
-
-          // ── Corner-preview colour ramp ────────────────────────────────────
-          // Green when the lane is clear, hot pink as a corner comes up, red at
-          // hairpin severity. This is the in-world warning; it is on the water
-          // ahead of you, which is where you are already looking.
-          vec3 col = mix(uColor, uWarm, smoothstep(0.22, 0.72, sev));
-          col = mix(col, uHot, smoothstep(0.68, 1.0, sev));
-
-          // ── Lane structure ────────────────────────────────────────────────
-          float lane   = 1.0 - step(0.985, x);
-          float edge   = step(0.70, x) * (1.0 - step(0.985, x));
-          float centre = 1.0 - step(0.085, x);
-
-          // Chevrons: skewed toward the middle so they read as arrows pointing
-          // along the direction of travel, and leaned into the coming corner.
-          float lean = 0.42 + sev * 0.55 * dir * sign(vUv.x);
-          float ch = fract(vUv.y - uTime * (0.85 + sev * 0.9) - x * lean);
-          float arrow = 1.0 - step(0.30 + sev * 0.16, ch);
-
-          // Dashed centre spine — a second, faster rhythm so speed reads.
-          float dash = 1.0 - step(0.52, fract(vUv.y * 2.0 - uTime * 1.9));
-
-          float a = 0.0;
-          vec3 c = vec3(0.0);
-          // Flat lane fill: dim, so the water still reads through it.
-          a += lane * 0.16;
-          c += uGlow * lane * 0.13;
-          // Bright rails painted on the water.
-          a += edge * 0.62;
-          c += col * edge * 0.85;
-          // Chevrons inside the lane.
-          a += arrow * lane * (1.0 - edge) * 0.42;
-          c += col * arrow * lane * (1.0 - edge) * 0.5;
-          // Centre spine.
-          a += centre * dash * 0.5;
-          c += uGlow * centre * dash * 0.55;
-
-          // ── Glow rails ────────────────────────────────────────────────────
-          // The vertical lip. Fades out with height so it reads as light
-          // bleeding off the surface, not as a wall.
-          float railFade = pow(1.0 - rail, 1.6);
-          a = mix(a, railFade * 0.55, step(0.001, rail));
-          c = mix(c, col * railFade * 0.9, step(0.001, rail));
-
-          // ── Distance and grazing compensation ─────────────────────────────
-          // A lane seen at 300 m through a chase camera foreshortens to a few
-          // pixels; without this it is the green hair the first build shipped.
-          float gain = 1.0 + smoothstep(40.0, 340.0, vDist) * 1.5;
-          gain *= 1.0 + smoothstep(0.55, 0.98, vGraze) * 0.85;
-          a *= gain;
-          c *= gain;
-          // Only fade right out where it would clutter the horizon.
-          float far = 1.0 - smoothstep(760.0, 1500.0, vDist);
-          gl_FragColor = vec4(c * far, clamp(a, 0.0, 1.0) * far);
+          float x = abs(vLat);
+          // Three hard steps, not a gradient: this is a drawn mark.
+          vec3 col = mix(uColor, uWarm, step(0.34, vSev));
+          col = mix(col, uHot, step(0.72, vSev));
+          float body = 1.0 - step(1.0, x);
+          float edge = step(0.78, x) * body;
+          float a = body * 0.26 + edge * 0.10;
+          // Fade out before the horizon so the far side of the circuit does not
+          // draw a green thread across the skyline.
+          a *= 1.0 - smoothstep(520.0, 1150.0, vDist);
+          // …and fade *in* over the first 30 m. A line on the water seen from a
+          // camera near the waterline foreshortens hardest right in front of the
+          // lens, so the nearest 20 m paints the largest area of screen and
+          // carries the least information — it is the stretch you are already
+          // driving on. Measured at 7.3 % of the countdown frame before this
+          // clause, 2.9 % after.
+          a *= smoothstep(8.0, 30.0, vDist);
+          gl_FragColor = vec4(col, a);
         }
       `,
     });
@@ -905,85 +893,212 @@ export class Track implements TrackAPI, Subsystem {
     this.ribbon.name = 'racingLine';
     this.ribbon.frustumCulled = false;
     this.ribbon.renderOrder = 2;
-    this.ribbon.userData.skipPrepass = true; // glow, never inked
+    this.ribbon.userData.skipPrepass = true; // a translucent mark, never inked
     this.group.add(this.ribbon);
+
+    this.design.ribbonSagitta = this.measureRibbonError(STEP);
+  }
+
+  /**
+   * Worst-case deviation, in metres, between the drawn ribbon and the water.
+   *
+   * The strip is a polyline in the wave field's flat parameter space, lifted to
+   * the surface at each station. Between two stations it is a straight chord,
+   * and the surface bows away from it by the sagitta of the height field over
+   * that step. This measures exactly that: the height at the midpoint of a step
+   * versus the average of the heights at its ends, using `sampleOcean` — the
+   * same field the vertex shader lifts with — swept over a set of phases so a
+   * lucky instant cannot flatter the number.
+   */
+  private measureRibbonError(step: number): number {
+    let worst = 0;
+    const stride = 3; // every 3rd station: the field is smooth at this scale
+    for (const t of [0, 3.7, 8.1, 13.3, 21.9]) {
+      for (let i = 0; i < this.N; i += stride) {
+        const ax = this.px[i],
+          az = this.pz[i];
+        const tx = this.tx[i],
+          tz = this.tz[i];
+        // Two points one `step` apart along the line, and their midpoint.
+        const bx = ax + tx * step,
+          bz = az + tz * step;
+        const mx = ax + tx * step * 0.5,
+          mz = az + tz * step * 0.5;
+        const ha = sampleHeight(ax, az, t);
+        const hb = sampleHeight(bx, bz, t);
+        const hm = sampleHeight(mx, mz, t);
+        const err = Math.abs((ha + hb) * 0.5 - hm);
+        if (err > worst) worst = err;
+      }
+    }
+    return worst;
   }
 
   // ── Gates ─────────────────────────────────────────────────────────────────
 
   /**
-   * Twelve floating gates for the price of four meshes.
+   * Twelve floating ARCHES the boat drives through, for the price of five meshes.
    *
-   * The first version built four `Mesh`es *per gate* — 48 meshes, 144 draw
-   * calls, and they still read as "tiny lollipops" at racing distance. This
-   * version merges all twelve gates into four geometries (structure, port
-   * panels, starboard panels, accent) so the whole set costs 12 draw calls
-   * including outlines and G-buffer.
+   * ── What was wrong before ──────────────────────────────────────────────────
+   * The previous gate was two masts, each carrying a flat 3.5 × 4.6 × 0.24 m
+   * sign with a lighter inner rectangle and a cross-vane. Three things about
+   * that were fatal, all visible in shots/race_fix0:
    *
-   * Floating is done entirely on the GPU: every vertex carries `aAnchor`, the
-   * world XZ of the pylon it belongs to, and the vertex chunk evaluates the
-   * shared Gerstner field there to lift, surge and tilt the whole pylon as one
-   * rigid body. No CPU work per frame, and it is in register with the ocean
-   * mesh by construction because both evaluate the same field at the same point.
+   *   • From the aerial camera the whole thing collapsed to a one-pixel
+   *     horizontal bar, because a 0.24 m plate has no plan-view depth
+   *     (course.png). A marker that vanishes from a legal camera angle cannot
+   *     ship.
+   *   • The visual language was highway signage — two flat coloured plates with
+   *     a lighter panel and yellow bars on a grey T-pole (pack.png at
+   *     1051,1008–1397,1620). In land.png the two masts of one gate sit 34 m
+   *     apart with nothing between them, so they read as two unrelated road
+   *     signs rather than as one gate.
+   *   • Nothing about it said "checkpoint", passed or unpassed.
+   *
+   * ── What it is now ─────────────────────────────────────────────────────────
+   * A truss arch: two floating pylons whose masts LEAN INBOARD, a chamfered
+   * beam spanning between their tops, two diagonal braces per side, and a
+   * hard-banded lamp bar slung under the beam that carries the pass state. The
+   * boat passes *through* it. Every part is a chamfered solid — the thinnest
+   * plan-view depth anywhere on a gate is `design.gateMinPlanDepth` (0.44 m), so
+   * no camera angle can flatten it, and the 0.16 m chamfers give the cel ramp a
+   * bevel facet to land a value break on instead of a single hard corner.
+   *
+   * The visual span is capped below the checkpoint `halfWidth`: checkpoints are
+   * odometer milestones (see raceState.ts), so the arch is free to be narrower
+   * than the notional opening — and it has to be, or the two legs are too far
+   * apart to read as one structure.
+   *
+   * ── Floating ───────────────────────────────────────────────────────────────
+   * Entirely on the GPU. Every vertex carries `aAnchor`, the world XZ of the
+   * GATE CENTRE (it used to be the pylon centre, which would tear an arch in
+   * half: two pylons sampling the field at points 26 m apart heave
+   * independently and the beam between them would stretch). The whole gate now
+   * moves as one rigid body, and the first-order tilt term is exactly the
+   * linear extrapolation of the surface slope — `cross(axis, local).y` works out
+   * to ∇h·local — so with the damping factor at 1.0 both feet sit on the water
+   * even though only the centre is sampled.
    */
   private buildGates() {
     const structure = new Mesher();
-    const panelPort = new Mesher();
-    const panelStbd = new Mesher();
+    const wingPort = new Mesher();
+    const wingStbd = new Mesher();
     const accent = new Mesher();
+    const lamp = new Mesher();
+
+    const UP: V3 = [0, 1, 0];
+    let minPlan = Infinity;
+    let minClear = Infinity;
 
     for (const cp of this.checkpoints) {
       const fx = cp.forward.x;
       const fz = cp.forward.z;
       const rx = -fz;
       const rz = fx;
-      const mastTop = cp.isStart ? 9.4 : 7.8;
+      const cx = cp.position.x;
+      const cz = cp.position.z;
+      const R: V3 = [rx, 0, rz];
+      const F: V3 = [fx, 0, fz];
+
+      const vw = Math.min(cp.halfWidth, 13.0);
+      const mastTop = cp.isStart ? 10.4 : 8.7;
+      /** How far the mast top leans inboard. This is what makes it an arch. */
+      const lean = 1.8;
+      const inner = vw - lean;
+      const archY = mastTop - 0.6;
+      const lampY = archY - 1.0;
 
       for (const side of [-1, 1] as const) {
-        const ax = cp.position.x + rx * side * cp.halfWidth;
-        const az = cp.position.z + rz * side * cp.halfWidth;
-        const panel = side < 0 ? panelPort : panelStbd;
+        const px = cx + rx * side * vw;
+        const pz = cz + rz * side * vw;
+        const tx = cx + rx * side * inner;
+        const tz = cz + rz * side * inner;
+        const wing = side < 0 ? wingPort : wingStbd;
+        /** Centre of the leaning mast at height y. */
+        const mastAt = (y: number): [number, number] => {
+          const fr = clamp01((y - 0.78) / (mastTop - 0.78));
+          return [px + (tx - px) * fr, pz + (tz - pz) * fr];
+        };
 
-        // Float collar: two stacked frustums at the waterline. Wide enough to
-        // read as a moored buoy rather than a stick pushed into the sea.
-        structure.frustum(ax, az, -1.15, 1.05, 0.0, 1.95, 9, true, false);
-        structure.frustum(ax, az, 0.0, 1.95, 0.82, 1.25, 9, false, false);
-        // Mast.
-        structure.frustum(ax, az, 0.7, 0.52, mastTop, 0.3, 7, false, true);
+        // Float collar: two stacked frustums at the waterline, wide enough to
+        // read as something moored rather than a stick pushed into the sea, and
+        // wide enough to be the gate's plan-view signature from the aerial.
+        structure.prism(px, pz, -1.35, 1.3, px, pz, 0.0, 2.35, 9, true, false, cx, cz);
+        structure.prism(px, pz, 0.0, 2.35, px, pz, 0.9, 1.45, 9, false, false, cx, cz);
+        // The leaning mast.
+        structure.prism(px, pz, 0.78, 0.6, tx, tz, mastTop, 0.36, 7, false, true, cx, cz);
         // Waterline stripe, so the gate has a value break where it meets the sea.
-        accent.frustum(ax, az, 0.16, 2.02, 0.44, 2.02, 9, false, false);
+        accent.prism(px, pz, 0.22, 2.44, px, pz, 0.56, 2.44, 9, false, false, cx, cz);
 
-        // The sign panel. Faces oncoming traffic (normal along −forward), so it
-        // presents its full area to a boat approaching the gate.
-        const py = mastTop - 2.6;
-        panel.slab(ax, az, rx, rz, fx, fz, 0, py, 3.5, 4.6, 0.24);
-        accent.slab(ax, az, rx, rz, fx, fz, 0, py, 2.1, 3.0, 0.42);
-        // A short cross-vane below it: breaks the mast silhouette and gives the
-        // Sobel pass an interior edge to find.
-        structure.slab(ax, az, rx, rz, fx, fz, 0, py - 3.0, 4.4, 0.42, 0.42);
+        // Marker paddles: two chamfered blades jutting INBOARD from the mast,
+        // horizontal, carrying the side identity — aqua to port, pink to
+        // starboard.
+        //
+        // The previous shape here was a vertical plate, and a vertical coloured
+        // plate on a post is a road sign no matter how thick it is
+        // (shots/race_fix1/pack.png at 915,620–1010,830). Turning the blade
+        // horizontal changes what it reads as — a navigation daymark — and it
+        // also gives the gate its largest plan-view element, which is the angle
+        // the old panels disappeared from.
+        for (const py of [3.3, 5.4]) {
+          const [mx, mz] = mastAt(py);
+          wing.chamferBox(
+            [mx - rx * side * 1.25, py, mz - rz * side * 1.25],
+            [rx, 0, rz], UP, [fx, 0, fz],
+            [1.35, 0.24, 0.66], 0.14, cx, cz,
+          );
+        }
+        minPlan = Math.min(minPlan, 1.32);
+
+        // Two diagonal braces from the mast up to the beam. A truss, not a pole:
+        // this is the single change that stops the gate reading as signage.
+        for (const [hb, frac] of [[mastTop - 3.4, 0.46], [mastTop - 1.6, 0.2]] as const) {
+          const fr = clamp01((hb - 0.78) / (mastTop - 0.78));
+          const bax = px + (tx - px) * fr;
+          const baz = pz + (tz - pz) * fr;
+          const bbx = cx + rx * side * inner * frac;
+          const bbz = cz + rz * side * inner * frac;
+          const dxb = bbx - bax;
+          const dyb = archY - 0.5 - hb;
+          const dzb = bbz - baz;
+          const len = Math.hypot(dxb, dyb, dzb) || 1;
+          const a0: V3 = [dxb / len, dyb / len, dzb / len];
+          // Perpendicular to the strut, inside the gate plane.
+          const a1: V3 = [
+            F[1] * a0[2] - F[2] * a0[1],
+            F[2] * a0[0] - F[0] * a0[2],
+            F[0] * a0[1] - F[1] * a0[0],
+          ];
+          const a1l = Math.hypot(a1[0], a1[1], a1[2]) || 1;
+          structure.chamferBox(
+            [(bax + bbx) * 0.5, (hb + archY - 0.5) * 0.5, (baz + bbz) * 0.5],
+            a0, [a1[0] / a1l, a1[1] / a1l, a1[2] / a1l], F,
+            [len * 0.5, 0.21, 0.22], 0.08, cx, cz,
+          );
+          minPlan = Math.min(minPlan, 0.44);
+        }
       }
 
-      // The start/finish gantry: a banner beam spanning the two masts. It is the
-      // only gate with a horizontal element, which is what makes the line
-      // instantly identifiable from the air and from the cockpit.
-      if (cp.isStart) {
-        const span = cp.halfWidth * 2;
-        accent.beam(
-          cp.position.x,
-          cp.position.z,
-          rx,
-          rz,
-          fx,
-          fz,
-          mastTop - 0.9,
-          span,
-          1.5,
-          0.5,
-        );
-      }
+      // The spanning beam, and the lamp bar under it. The beam is structure
+      // white, not the accent tone: a saturated yellow bar on grey legs read as
+      // scaffolding, and it stole the eye from the lamp — which is the element
+      // that actually carries information.
+      structure.chamferBox([cx, archY, cz], R, UP, F, [inner + 0.55, 0.44, 0.34], 0.16, cx, cz);
+      minPlan = Math.min(minPlan, 0.68);
+      lamp.beginGate(cp.index);
+      lamp.chamferBox([cx, lampY, cz], R, UP, F, [inner * 0.9, 0.27, 0.4], 0.12, cx, cz);
+      lamp.endGate();
+      minPlan = Math.min(minPlan, 0.8);
+      minClear = Math.min(minClear, lampY - 0.27);
     }
 
-    const mk = (m: Mesher, color: (typeof PAL)['gate'], name: string, widthPx: number) => {
+    const mk = (
+      m: Mesher,
+      color: (typeof PAL)['gate'],
+      name: string,
+      widthPx: number,
+      extra?: { chunks?: CelChunks; flareMask?: number },
+    ) => {
       const geo = m.build();
       const mesh = new Mesh(geo);
       mesh.name = name;
@@ -998,32 +1113,40 @@ export class Track implements TrackAPI, Subsystem {
           specSize: 0.9,
           specStrength: 0.4,
           flatShading: true,
+          flareMask: extra?.flareMask ?? 1,
           chunks: {
             uniforms: {
               uWaveA: { value: waveUniformArrays.uWaveA },
               uWaveB: { value: waveUniformArrays.uWaveB },
+              ...(extra?.chunks?.uniforms ?? {}),
             },
             vertexHead: /* glsl */ `
               ${GERSTNER_NO_TIME}
               attribute vec2 aAnchor;
+              ${extra?.chunks?.vertexHead ?? ''}
             `,
             vertexBody: /* glsl */ `
               {
-                // Rigid-body float: sample the wave field once at the pylon's
-                // anchor, then move the whole pylon with it.
+                // Rigid-body float: sample the wave field once at the gate's
+                // centre, then move the whole arch with it.
                 vec3 wpos; vec3 wnrm; float wjac;
                 gerstnerSurface(aAnchor, uTime, wpos, wnrm, wjac);
                 vec3 local = transformed - vec3(aAnchor.x, 0.0, aAnchor.y);
-                // First-order rotation toward the surface normal. Exact Rodrigues
-                // is not worth it for a ±20° tilt on a mast, and this keeps the
-                // outline and G-buffer variants byte-identical.
-                vec3 axis = vec3(wnrm.z, 0.0, -wnrm.x) * 0.72;
+                // First-order rotation toward the surface normal. For a
+                // horizontal offset this evaluates to exactly ∇h·local, i.e. the
+                // linear extrapolation of the surface, which is why the far leg
+                // of a 26 m arch still lands on the water. Undamped for that
+                // reason — the old 0.72 left one foot in the air on a swell.
+                vec3 axis = vec3(wnrm.z, 0.0, -wnrm.x);
                 local += cross(axis, local);
                 objectNormal += cross(axis, objectNormal);
                 smoothNormal += cross(axis, smoothNormal);
                 transformed = vec3(wpos.x, wpos.y, wpos.z) + local;
               }
+              ${extra?.chunks?.vertexBody ?? ''}
             `,
+            fragmentHead: extra?.chunks?.fragmentHead ?? '',
+            fragmentBody: extra?.chunks?.fragmentBody ?? '',
           },
         }),
       );
@@ -1035,20 +1158,91 @@ export class Track implements TrackAPI, Subsystem {
     };
 
     mk(structure, PAL.foamShade, 'gateStructure', 2.4);
-    mk(panelPort, PAL.gate, 'gatePanelPort', 2.6);
-    mk(panelStbd, PAL.gateFar, 'gatePanelStbd', 2.6);
+    mk(wingPort, PAL.gate, 'gateWingPort', 2.6);
+    mk(wingStbd, PAL.gateFar, 'gateWingStbd', 2.6);
     mk(accent, PAL.buoy, 'gateAccent', 2.2);
+
+    // ── The pass-state lamp ───────────────────────────────────────────────────
+    // One float per vertex says which of three states its gate is in, rewritten
+    // only when the player's target gate changes (12 times a lap), so there is
+    // no per-frame CPU cost. The fragment chunk then paints a HARD band: no
+    // falloff, no gradient, three discrete looks.
+    this.lampGate = lamp.gateIndex();
+    this.lampState = new Float32Array(this.lampGate.length);
+    const lampMesh = mk(lamp, PAL.buoy, 'gateLamp', 2.2, {
+      flareMask: 0, // a graphic band, never a photographic glow
+      chunks: {
+        uniforms: {
+          uLampNext: { value: PAL.boostHot.clone() },
+          uLampDone: { value: PAL.gate.clone() },
+          uLampWait: { value: PAL.hudDim.clone() },
+        },
+        vertexHead: 'attribute float aState;\nvarying float vState;',
+        vertexBody: 'vState = aState;',
+        fragmentHead: 'uniform vec3 uLampNext, uLampDone, uLampWait;\nvarying float vState;',
+        fragmentBody: /* glsl */ `
+          {
+            // 0 = still to come, 1 = the gate you are driving at, 2 = collected.
+            float blink = step(0.5, fract(uTime * 1.4));
+            if (vState > 1.5) {
+              baseColor = uLampDone;
+              celShade = vec3(0.40);
+            } else if (vState > 0.5) {
+              baseColor = mix(uColor, uLampNext, blink);
+              celShade = vec3(1.5);
+            } else {
+              // Three HUES, not three brightnesses: a still-to-come gate that is
+              // the same yellow as the live one, only dimmer, does not answer
+              // "which gate am I driving at" at racing distance.
+              baseColor = uLampWait;
+              celShade = vec3(0.62);
+            }
+          }
+        `,
+      },
+    });
+    this.lampAttr = new BufferAttribute(this.lampState, 1);
+    this.lampAttr.setUsage(DynamicDrawUsage);
+    lampMesh.geometry.setAttribute('aState', this.lampAttr);
+    this.refreshGateLamps(1);
+
+    this.design.gateMinPlanDepth = minPlan;
+    this.design.gateArchClearance = minClear;
+  }
+
+  /**
+   * Repaint the lamp states. Called only when the target gate changes.
+   *
+   * `target` is the gate the player is driving at; 0 means the finish line, in
+   * which case every numbered gate has been collected.
+   */
+  private refreshGateLamps(target: number) {
+    for (let v = 0; v < this.lampGate.length; v++) {
+      const g = this.lampGate[v];
+      let st = 0;
+      if (g === target) st = 1;
+      else if (target === 0 ? g !== 0 : g > 0 && g < target) st = 2;
+      this.lampState[v] = st;
+    }
+    this.lampAttr.needsUpdate = true;
   }
 
   // ── Per frame ─────────────────────────────────────────────────────────────
 
   /**
    * The gates and the ribbon are entirely GPU-driven, so all this does is
-   * refresh the player's corner-preview readout for the HUD and the AI.
+   * refresh the player's corner-preview readout for the HUD and the AI, and
+   * repaint the gate lamps on the frames where the target gate changes.
    */
   update(ctx: GameContext) {
     const proj = this.project(ctx.player.root.position);
     this.cornerPreview(proj.u, this.preview);
+
+    const target = ctx.player.nextCheckpoint;
+    if (target !== this.lampTarget) {
+      this.lampTarget = target;
+      this.refreshGateLamps(target);
+    }
   }
 }
 
@@ -1311,6 +1505,9 @@ function buildCentreline() {
 // Geometry mesher
 // ─────────────────────────────────────────────────────────────────────────────
 
+/** A point or an axis. Construction-time only, so the tuples are free. */
+type V3 = readonly [number, number, number];
+
 /**
  * Accumulates flat-shaded triangles plus the per-vertex `aAnchor` the gate
  * float shader needs. Non-indexed with per-face normals on purpose: hard facets
@@ -1321,6 +1518,20 @@ class Mesher {
   private pos: number[] = [];
   private nrm: number[] = [];
   private anc: number[] = [];
+  /** Which gate each vertex belongs to — drives the lamp pass-state attribute. */
+  private gate: number[] = [];
+  private currentGate = -1;
+
+  /** Tag every vertex pushed from here on as belonging to gate `index`. */
+  beginGate(index: number) {
+    this.currentGate = index;
+  }
+  endGate() {
+    this.currentGate = -1;
+  }
+  gateIndex(): Float32Array {
+    return Float32Array.from(this.gate);
+  }
 
   private tri(
     ax: number, ay: number, az: number,
@@ -1339,6 +1550,7 @@ class Mesher {
     for (let i = 0; i < 3; i++) {
       this.nrm.push(nx, ny, nz);
       this.anc.push(anchorX, anchorZ);
+      this.gate.push(this.currentGate);
     }
   }
 
@@ -1353,14 +1565,27 @@ class Mesher {
     this.tri(ax, ay, az, cx, cy, cz, dx, dy, dz, anchorX, anchorZ);
   }
 
-  /** Tapered prism around a vertical axis at (cx, cz). */
-  frustum(
-    cx: number, cz: number,
-    y0: number, r0: number,
-    y1: number, r1: number,
+  private triV(a: V3, b: V3, c: V3, anchorX: number, anchorZ: number) {
+    this.tri(a[0], a[1], a[2], b[0], b[1], b[2], c[0], c[1], c[2], anchorX, anchorZ);
+  }
+  private quadV(a: V3, b: V3, c: V3, d: V3, anchorX: number, anchorZ: number) {
+    this.triV(a, b, c, anchorX, anchorZ);
+    this.triV(a, c, d, anchorX, anchorZ);
+  }
+
+  /**
+   * Tapered prism between two arbitrary centres — a leaning mast is a prism
+   * whose top centre is not above its bottom centre, which the old
+   * vertical-axis-only version could not express.
+   */
+  prism(
+    x0: number, z0: number, y0: number, r0: number,
+    x1: number, z1: number, y1: number, r1: number,
     sides: number,
     capBottom: boolean,
     capTop: boolean,
+    anchorX: number,
+    anchorZ: number,
   ) {
     for (let i = 0; i < sides; i++) {
       const a0 = (i / sides) * Math.PI * 2;
@@ -1368,61 +1593,125 @@ class Mesher {
       const s0 = Math.sin(a0), c0 = Math.cos(a0);
       const s1 = Math.sin(a1), c1 = Math.cos(a1);
       this.quad(
-        cx + s0 * r0, y0, cz + c0 * r0,
-        cx + s1 * r0, y0, cz + c1 * r0,
-        cx + s1 * r1, y1, cz + c1 * r1,
-        cx + s0 * r1, y1, cz + c0 * r1,
-        cx, cz,
+        x0 + s0 * r0, y0, z0 + c0 * r0,
+        x0 + s1 * r0, y0, z0 + c1 * r0,
+        x1 + s1 * r1, y1, z1 + c1 * r1,
+        x1 + s0 * r1, y1, z1 + c0 * r1,
+        anchorX, anchorZ,
       );
-      if (capTop) this.tri(cx, y1, cz, cx + s0 * r1, y1, cz + c0 * r1, cx + s1 * r1, y1, cz + c1 * r1, cx, cz);
-      if (capBottom) this.tri(cx, y0, cz, cx + s1 * r0, y0, cz + c1 * r0, cx + s0 * r0, y0, cz + c0 * r0, cx, cz);
+      if (capTop) {
+        this.tri(x1, y1, z1, x1 + s0 * r1, y1, z1 + c0 * r1, x1 + s1 * r1, y1, z1 + c1 * r1, anchorX, anchorZ);
+      }
+      if (capBottom) {
+        this.tri(x0, y0, z0, x0 + s1 * r0, y0, z0 + c1 * r0, x0 + s0 * r0, y0, z0 + c0 * r0, anchorX, anchorZ);
+      }
     }
   }
 
   /**
-   * A flat slab. `(rx, rz)` is the across-gate axis, `(fx, fz)` the along-track
-   * axis, so a slab with `thickness` along f faces oncoming traffic.
+   * A box with every one of its twelve edges bevelled.
+   *
+   * Six inset rectangular faces + twelve edge quads + eight corner triangles.
+   * The bevel is the point: a hard 90° corner gives the cel ramp exactly one
+   * value step, whereas a 45° facet gives it a narrow intermediate band, which
+   * is what an animator draws on a solid. It also guarantees the form has
+   * silhouette area in all three axes, so no camera angle can flatten it to a
+   * line — which is precisely how the old zero-thickness sign panels failed.
+   *
+   * `e0/e1/e2` are orthonormal axes, `h` their half-extents, `c` the bevel.
    */
-  slab(
-    ax: number, az: number,
-    rx: number, rz: number,
-    fx: number, fz: number,
-    lateral: number, y: number,
-    width: number, height: number, thickness: number,
+  chamferBox(
+    centre: V3,
+    e0: V3, e1: V3, e2: V3,
+    h: V3,
+    c: number,
+    anchorX: number,
+    anchorZ: number,
   ) {
-    const hw = width * 0.5, hh = height * 0.5, ht = thickness * 0.5;
-    const ox = ax + rx * lateral;
-    const oz = az + rz * lateral;
-    const corner = (u: number, v: number, w: number) => [
-      ox + rx * u * hw + fx * w * ht,
-      y + v * hh,
-      oz + rz * u * hw + fz * w * ht,
-    ] as const;
-    const p = [
-      corner(-1, -1, -1), corner(1, -1, -1), corner(1, 1, -1), corner(-1, 1, -1),
-      corner(-1, -1, 1), corner(1, -1, 1), corner(1, 1, 1), corner(-1, 1, 1),
+    const cc = Math.min(c, h[0] * 0.49, h[1] * 0.49, h[2] * 0.49);
+    const at = (a: number, b: number, d: number): V3 => [
+      centre[0] + e0[0] * a + e1[0] * b + e2[0] * d,
+      centre[1] + e0[1] * a + e1[1] * b + e2[1] * d,
+      centre[2] + e0[2] * a + e1[2] * b + e2[2] * d,
     ];
-    const face = (a: number, b: number, c: number, d: number) =>
-      this.quad(
-        p[a][0], p[a][1], p[a][2], p[b][0], p[b][1], p[b][2],
-        p[c][0], p[c][1], p[c][2], p[d][0], p[d][1], p[d][2], ax, az,
+    // Per corner (sx, sy, sz), the three vertices that replace it: one on each
+    // of the three faces that met there.
+    const q = (s0: number, s1: number, s2: number, axis: 0 | 1 | 2): V3 =>
+      at(
+        s0 * (axis === 0 ? h[0] : h[0] - cc),
+        s1 * (axis === 1 ? h[1] : h[1] - cc),
+        s2 * (axis === 2 ? h[2] : h[2] - cc),
       );
-    face(0, 1, 2, 3); // −f
-    face(5, 4, 7, 6); // +f
-    face(4, 0, 3, 7); // −r
-    face(1, 5, 6, 2); // +r
-    face(3, 2, 6, 7); // top
-    face(4, 5, 1, 0); // bottom
+
+    /** Outward direction from axis weights — the winding oracle. */
+    const out = (w0: number, w1: number, w2: number): V3 => [
+      e0[0] * w0 + e1[0] * w1 + e2[0] * w2,
+      e0[1] * w0 + e1[1] * w1 + e2[1] * w2,
+      e0[2] * w0 + e1[2] * w1 + e2[2] * w2,
+    ];
+
+    // Six inset faces.
+    for (const s of [-1, 1] as const) {
+      this.quadOut(q(s, -1, -1, 0), q(s, 1, -1, 0), q(s, 1, 1, 0), q(s, -1, 1, 0), out(s, 0, 0), anchorX, anchorZ);
+      this.quadOut(q(-1, s, -1, 1), q(1, s, -1, 1), q(1, s, 1, 1), q(-1, s, 1, 1), out(0, s, 0), anchorX, anchorZ);
+      this.quadOut(q(-1, -1, s, 2), q(1, -1, s, 2), q(1, 1, s, 2), q(-1, 1, s, 2), out(0, 0, s), anchorX, anchorZ);
+    }
+
+    // Twelve edge bevels. Each is the strip between two faces, so its two pairs
+    // of vertices come from the two axes that are *not* the edge's direction.
+    for (const s1 of [-1, 1] as const) {
+      for (const s2 of [-1, 1] as const) {
+        // Along e0, between the e1 face and the e2 face.
+        this.quadOut(q(-1, s1, s2, 1), q(1, s1, s2, 1), q(1, s1, s2, 2), q(-1, s1, s2, 2), out(0, s1, s2), anchorX, anchorZ);
+        // Along e1, between the e2 face and the e0 face.
+        this.quadOut(q(s1, -1, s2, 2), q(s1, 1, s2, 2), q(s1, 1, s2, 0), q(s1, -1, s2, 0), out(s1, 0, s2), anchorX, anchorZ);
+        // Along e2, between the e0 face and the e1 face.
+        this.quadOut(q(s1, s2, -1, 0), q(s1, s2, 1, 0), q(s1, s2, 1, 1), q(s1, s2, -1, 1), out(s1, s2, 0), anchorX, anchorZ);
+      }
+    }
+
+    // Eight corner triangles.
+    for (const s0 of [-1, 1] as const) {
+      for (const s1 of [-1, 1] as const) {
+        for (const s2 of [-1, 1] as const) {
+          this.triOut(
+            q(s0, s1, s2, 0), q(s0, s1, s2, 1), q(s0, s1, s2, 2),
+            out(s0, s1, s2), anchorX, anchorZ,
+          );
+        }
+      }
+    }
   }
 
-  /** Horizontal banner beam spanning the gate, anchored to the gate centre. */
-  beam(
-    cx: number, cz: number,
-    rx: number, rz: number,
-    fx: number, fz: number,
-    y: number, span: number, height: number, thickness: number,
-  ) {
-    this.slab(cx, cz, rx, rz, fx, fz, 0, y, span, height, thickness);
+  /**
+   * Emit a triangle wound so its face normal agrees with `outward`.
+   *
+   * Deriving winding by hand for 26 faces across three arbitrary axes is how you
+   * ship a solid with a handful of inside-out facets that read as holes, because
+   * the cel material culls back faces. One dot product removes the whole class of
+   * mistake.
+   */
+  private triOut(a: V3, b: V3, c: V3, outward: V3, anchorX: number, anchorZ: number) {
+    const ux = b[0] - a[0], uy = b[1] - a[1], uz = b[2] - a[2];
+    const vx = c[0] - a[0], vy = c[1] - a[1], vz = c[2] - a[2];
+    const nx = uy * vz - uz * vy;
+    const ny = uz * vx - ux * vz;
+    const nz = ux * vy - uy * vx;
+    if (nx * outward[0] + ny * outward[1] + nz * outward[2] >= 0) this.triV(a, b, c, anchorX, anchorZ);
+    else this.triV(c, b, a, anchorX, anchorZ);
+  }
+
+  private quadOut(a: V3, b: V3, c: V3, d: V3, outward: V3, anchorX: number, anchorZ: number) {
+    const ux = b[0] - a[0], uy = b[1] - a[1], uz = b[2] - a[2];
+    const vx = c[0] - a[0], vy = c[1] - a[1], vz = c[2] - a[2];
+    const nx = uy * vz - uz * vy;
+    const ny = uz * vx - ux * vz;
+    const nz = ux * vy - uy * vx;
+    if (nx * outward[0] + ny * outward[1] + nz * outward[2] >= 0) {
+      this.quadV(a, b, c, d, anchorX, anchorZ);
+    } else {
+      this.quadV(d, c, b, a, anchorX, anchorZ);
+    }
   }
 
   build(): BufferGeometry {

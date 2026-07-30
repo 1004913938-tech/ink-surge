@@ -136,18 +136,22 @@ export interface CelMaterialOptions {
   ambientColor?: Color;
   /** Master scale on the ambient bounce. */
   ambientStrength?: number;
-  /** Inverted-hull outline. Width is in *screen pixels* and stays constant. */
+  /**
+   * Inverted-hull outline. Width is in *device pixels* and is constant at every
+   * distance — and clamped to `outlineMaxPx`, a pipeline-wide ceiling, so no
+   * material can put a heavier line in the frame than any other.
+   */
   outline?: boolean;
   outlineWidthPx?: number;
   outlineColor?: Color;
+  /** Ceiling on ink weight, device px. Shared by the whole image; leave it. */
+  outlineMaxPx?: number;
   /**
-   * Projected radius (in pixels) below which the outline starts to thin.
-   * Above it the line is exactly `outlineWidthPx` at every distance. Set 0 to
-   * disable the taper entirely and get a truly constant width.
+   * Projected radius (device px) under which the ink line fades out entirely.
+   * A 15 px rider cannot carry a 3 px line on each side — it becomes a
+   * silhouette. The line never *thins*; it fades. Set 0 to keep it at all sizes.
    */
-  outlineTaperPx?: number;
-  /** Floor on the taper, so a distant object keeps *some* line. */
-  outlineTaperFloor?: number;
+  outlineFadePx?: number;
   /**
    * 0 = this surface never contributes to the stylised flare. Written to the
    * G-buffer, so the threshold pass can keep hard white foam and spray out of
@@ -242,9 +246,9 @@ const VERT_COMMON = /* glsl */ `
   uniform float uNear;
   uniform float uFar;
   uniform float uOutlineWidthPx;
+  uniform float uOutlineMaxPx;
   uniform float uOutlineRadius;
-  uniform float uOutlineTaperPx;
-  uniform float uOutlineTaperFloor;
+  uniform float uOutlineFadePx;
   uniform vec3 uCameraPos;
 
   varying vec3 vWorldNormal;
@@ -253,6 +257,8 @@ const VERT_COMMON = /* glsl */ `
   varying vec3 vViewPos;
   varying vec2 vUv;
   varying vec3 vColor4;
+  /** Outline coverage, 0 on objects too small on screen to carry an ink line. */
+  varying float vOutlineFade;
 
   CHUNK_VERTEX_HEAD
 
@@ -260,6 +266,7 @@ const VERT_COMMON = /* glsl */ `
     vec3 transformed = position;
     vec3 objectNormal = normal;
     vec3 smoothNormal = aSmoothNormal;
+    vOutlineFade = 1.0;
     vUv = uv;
     #ifdef USE_VERTEX_COLORS
       vColor4 = color;
@@ -313,15 +320,33 @@ const VERT_COMMON = /* glsl */ `
  * coincident geometry (thin plates, the transom lip) always loses the depth
  * test rather than dithering against it.
  *
- * ── The taper ──────────────────────────────────────────────────────────────
- * Truly constant width is wrong at the small end: at 100 m a boat is ~50 px
- * long and a 5 px line on each side eats 20% of the silhouette, which is why
- * the player's vermilion hull read as a solid black speck in
- * shots/cel_r0/outline_far.png. The width is therefore held exactly constant
- * until the object's *projected radius* drops below `uOutlineTaperPx`, and only
- * then thins in proportion to apparent size. The ratio of line to form stays
- * bounded, which is the artistic intent behind "constant width" in the first
- * place. Set `outlineTaperPx: 0` for a strictly constant line.
+ * ── Why the width is clamped, and why it never tapers ──────────────────────
+ * `uOutlineMaxPx` is a *pipeline-wide* ceiling, not a per-material preference.
+ * Callers used to pick their own width (the hull asked for 5 px, the rider for
+ * 2.3) and the result measured 13-17 device px of ink across the hull in
+ * shots/r2/outline_check.png against 1-4 px on the same boat in outline_far.png.
+ * One ink weight for the whole image is the requirement, so every material is
+ * clamped to the same ceiling here and the earlier size-proportional taper is
+ * gone entirely: at any distance where the line is drawn at all it is exactly
+ * the same number of device pixels.
+ *
+ * The failure the taper was papering over is real, but thinning is the wrong
+ * answer to it — a 1 px broken line reads as dirt. Instead the line *fades out*
+ * as a whole (`vOutlineFade`, alpha) once the object's projected radius drops
+ * under `uOutlineFadePx`, so a boat 300 m away, or a rider 15 px tall, loses its
+ * ink rather than being swallowed by it.
+ *
+ * ── Why the magnitude has a floor ──────────────────────────────────────────
+ * The push used to be weighted by `smoothstep(0.02, 0.30, |vn.xy|)`, i.e. the
+ * shell only grew where the smoothed normal already lay in the screen plane. On
+ * coarse geometry — this hull is a few dozen faces — the true silhouette usually
+ * falls *inside* a face, and the vertices of that face can be 20-40° off tangent,
+ * so they got a fraction of the width and the ring collapsed. That is exactly
+ * the gap pattern measured in shots/r2/outline_check.png: strong ink along the
+ * top gunwale (where faces do turn through the silhouette) and none at all along
+ * the hull bottom, the bow leading edge, or the underside of the windshield
+ * plate. The weight is now a floor-and-ramp: never less than 68% of the width,
+ * so no edge of a closed shell can lose its line.
  *
  * The normal used is `aSmoothNormal`: an area-weighted normal merged across
  * split vertices. Using the shading normal instead tears the hull open at
@@ -333,24 +358,28 @@ const OUTLINE_PUSH = /* glsl */ `
     float depth = max(-mvPosition.z, uNear);
     float unitsPerPixel = (2.0 * depth * uTanHalfFov) / uResolution.y;
 
-    // Apparent size of this object, in pixels of radius.
-    float projPx = uOutlineRadius / max(unitsPerPixel, 1e-6);
-    float taper = 1.0;
-    if (uOutlineTaperPx > 0.0 && uOutlineRadius > 0.0) {
-      taper = clamp(projPx / uOutlineTaperPx, uOutlineTaperFloor, 1.0);
-    }
-    float w = uOutlineWidthPx * taper;
+    // One ink weight for the whole image, in device pixels.
+    float w = min(uOutlineWidthPx, uOutlineMaxPx);
 
     vec2 dir = vn.xy;
     float len = length(dir);
-    dir = len > 1.0e-4 ? dir / len : vec2(0.0);
-    // Weight by how much of the normal actually lies in the screen plane, so
-    // the expansion ramps in smoothly around the silhouette instead of popping
-    // to full width the instant vn.xy is non-zero.
-    mvPosition.xy += dir * (w * unitsPerPixel * smoothstep(0.02, 0.30, len));
+    dir = len > 1.0e-4 ? dir / len : vec2(1.0, 0.0);
+    // Floor-and-ramp, not a gate: see the note above. 0.68 is enough to close
+    // the ring on a 30° face without letting a face pointing straight at the
+    // camera drag its shell out sideways into view.
+    float mag = mix(0.68, 1.0, smoothstep(0.0, 0.26, len));
+    mvPosition.xy += dir * (w * mag * unitsPerPixel);
     // Away from the eye (view space looks down -Z), so a coincident shell
-    // always loses the depth test instead of dithering against it.
-    mvPosition.z -= unitsPerPixel * 1.2;
+    // always loses the depth test instead of dithering against it. Scaled with
+    // the push, because a shell displaced w pixels sideways across a grazing
+    // surface is also displaced in depth and will otherwise surface through it.
+    mvPosition.z -= unitsPerPixel * (2.0 + w);
+
+    // Apparent size of this object, in pixels of radius → line alpha.
+    float projPx = uOutlineRadius / max(unitsPerPixel, 1e-6);
+    vOutlineFade = (uOutlineFadePx > 0.0 && uOutlineRadius > 0.0)
+      ? smoothstep(uOutlineFadePx * 0.45, uOutlineFadePx, projPx)
+      : 1.0;
   }
 `;
 
@@ -422,55 +451,60 @@ const FRAG_MAIN = /* glsl */ `
     // (shots/cel_r4/rider_closeup.png at 3×).
     lit += uAmbientColor * (celAmbient * uAmbientStrength) * mix(vec3(1.0), baseColor, 0.62);
 
+    // ── Everything below this line is a *mask*, never a gradient ────────────
+    // Each remaining term is thresholded to a hard shape and then *substituted*
+    // into the surface tone with mix() rather than added to it. Adding was the
+    // defect: three additive terms (spec + rim + matcap), each smoothly varying
+    // in amplitude, summed into a continuously varying surface, and the ramp's
+    // banding underneath was buried. Measured on the player's deck in
+    // shots/r2/outline_check.png: 4666 distinct colours in a 626×62 patch with
+    // no step anywhere across it — quantised Lambert plus three airbrushes.
+    // Substitution keeps the flat fill flat: a pixel is either the band tone or
+    // the highlight tone, and the boundary between them is one pixel wide.
+
     // ── Banded specular ─────────────────────────────────────────────────────
-    // Two hard thresholds on the Blinn term, never a pow() falloff. The result
-    // is a highlight with a stepped shoulder — a *shape*, which is what reads
-    // as drawn rather than rendered.
-    //
-    // Gated by the diffuse band: an unshadowed step() on N·H puts highlights on
-    // faces the key light never reaches, which is the single most PBR-looking
-    // mistake available here.
+    // Two hard thresholds on the Blinn term, never a pow() falloff, gated by
+    // the diffuse band: an unshadowed step() on N·H puts highlights on faces
+    // the key light never reaches, the single most PBR-looking mistake here.
     vec3 H = normalize(L + V);
     float spec = dot(N, H);
     float specLight = step(0.5, ndl);
-    float s1 = step(uSpecSize, spec);
-    float s2 = step(uSpecSize2, spec);
-    lit += uSpecColor * uSpecStrength * specLight * (s1 * 0.42 + s2 * 0.58);
+    float specMask = specLight * (step(uSpecSize, spec) * 0.42 + step(uSpecSize2, spec) * 0.58);
+    lit = mix(lit, uSpecColor, clamp(specMask * uSpecStrength * 2.0, 0.0, 1.0));
 
     // ── Fresnel rim ─────────────────────────────────────────────────────────
-    // Quantised to two steps so the rim is a drawn edge, not an airbrush, and
-    // clipped to the *upper* half of the form: a rim that runs all the way round
-    // is a glow, whereas a rim that stops partway is a drawn light-line.
+    // Two steps on the fresnel term, so the rim is a drawn edge and not an
+    // airbrush, and gated — not weighted — everywhere else: on the lit side of
+    // the form only, and off up-facing planes, where a rim floods a whole deck
+    // with a pale wash instead of drawing a line. Every factor here is a step()
+    // for the same reason: a smoothly varying stroke width reads as a shaded
+    // shell, not as a line an animator drew.
     float fres = 1.0 - max(dot(N, V), 0.0);
     float rim = pow(fres, uRimPower);
-    float rimSide = step(-0.15, dot(N, L)) * 0.55 + step(0.30, dot(N, L)) * 0.45;
-    // Bias toward up-facing edges — sky bounce comes from above, and biasing it
-    // keeps the rim from ringing the whole silhouette like a halo.
-    // Biased to the *flanks*, not to up-facing planes: a deck's normal points at
-    // the sky, so an up-biased rim floods the whole deck with a pale wash instead
-    // of drawing a line (visible on the foredeck in shots/cel_r3/outline_check.png).
-    float rimUp = (0.55 + 0.45 * smoothstep(-0.4, 0.30, N.y)) * (1.0 - 0.45 * smoothstep(0.55, 0.95, N.y));
+    float rimSide = step(-0.18, dot(N, L)) * 0.42 + step(0.28, dot(N, L)) * 0.58;
+    float rimFlank = 1.0 - step(0.74, N.y) * 0.85;
     // Thresholds are low on purpose. A rim confined to the last 2% of the form
-    // is completely hidden underneath the inverted-hull ink line, which is 3-5 px
-    // wide and sits in exactly that band — the first captures had a
-    // mathematically correct rim that could not be seen anywhere. These two steps
-    // put the light-line *inboard* of the ink, which is where an animator draws it.
-    float rimStep = step(0.24, rim) * 0.45 + step(0.52, rim) * 0.55;
-    lit += uRimColor * (rimStep * uRimStrength * rimSide * rimUp);
+    // is completely hidden underneath the inverted-hull ink line, which sits in
+    // exactly that band — the first captures had a mathematically correct rim
+    // that could not be seen anywhere. These two steps put the light-line
+    // *inboard* of the ink, which is where an animator draws it.
+    float rimMask = (step(0.26, rim) * 0.40 + step(0.55, rim) * 0.60) * rimSide * rimFlank;
+    lit = mix(lit, uRimColor, clamp(rimMask * uRimStrength, 0.0, 1.0));
 
     // ── Faked reflection ────────────────────────────────────────────────────
     // A drawn matcap, sampled by the view-space normal. Deliberately not a
     // cubemap: an accurate reflection is the fastest way to make a surface read
-    // as physically based. The default disc is two flat zones split by a hard
-    // horizon (see makeGlossMatcap), and it is admitted only where the key light
-    // already reaches, so it reads as a drawn sheen sitting on the lit planes
-    // rather than as an environment probe wrapped round the whole object.
+    // as physically based. The disc is a *drawing* (see makeGlossMatcap), so its
+    // marks are admitted through two hard thresholds — a flat plane that samples
+    // an unmarked part of the disc picks up exactly nothing, which is what stops
+    // the foredeck reading as a pale bare panel.
     #ifdef USE_MATCAP
       vec3 vn = normalize(vViewNormal);
       vec2 mUv = vn.xy * 0.5 + 0.5;
       vec3 mc = texture2D(uMatcap, mUv).rgb;
-      float glossGate = step(0.56, ndl);
-      lit += mc * (uMatcapStrength * glossGate) * mix(vec3(1.0), baseColor, 0.55);
+      float mcl = max(max(mc.r, mc.g), mc.b);
+      float mcMask = (step(0.10, mcl) * 0.45 + step(0.30, mcl) * 0.55) * step(0.56, ndl);
+      lit = mix(lit, mix(uSpecColor, baseColor, 0.30), clamp(mcMask * uMatcapStrength, 0.0, 1.0));
     #endif
 
     gl_FragColor = vec4(lit, uOpacity);
@@ -602,10 +636,10 @@ export function createCelMaterial(opts: CelMaterialOptions = {}): CelMaterialSet
     uSpecSize2: { value: opts.specSize2 ?? 0.985 },
     uSpecStrength: { value: opts.specStrength ?? 0.3 },
     uMatcap: { value: opts.matcap === null ? null : (opts.matcap ?? getDefaultMatcap()) },
-    // Small by default, but non-zero: the brief wants the drawn matcap actually
-    // in use, and a low-strength two-tone disc is what puts a graphic sheen on
-    // the curved planes of a hull or a helmet.
-    uMatcapStrength: { value: opts.matcapStrength ?? 0.5 },
+    // The disc is now marks-on-black and its contribution is thresholded, so
+    // this is the opacity of a *mark* rather than the weight of a wash. 0.5 was
+    // painting the whole foredeck pale blue off the disc's sky strip.
+    uMatcapStrength: { value: opts.matcapStrength ?? 0.34 },
     uAmbientColor: { value: paletteTone(opts.ambientColor ?? PAL.waterMid).lerp(paletteTone(PAL.skyHorizon), 0.52) },
     uAmbientStrength: { value: opts.ambientStrength ?? 0.62 },
     uOpacity: { value: opts.opacity ?? 1.0 },
@@ -613,16 +647,18 @@ export function createCelMaterial(opts: CelMaterialOptions = {}): CelMaterialSet
     uEdgeBias: { value: opts.edgeBias ?? 1.0 },
     uFlareMask: { value: opts.flareMask ?? 1.0 },
     uOutlineWidthPx: { value: opts.outlineWidthPx ?? 2.6 },
+    // 2.8 device px = 1.4 CSS px at retina. Measured against frames rather than
+    // chosen: at 3.6 the line closes up the gap between the gunwale and the
+    // rub-rail on the player's hull at close range, at 2.2 it disappears into
+    // the water's own ink at mid distance.
+    uOutlineMaxPx: { value: opts.outlineMaxPx ?? 2.8 },
     uOutlineColor: { value: paletteTone(opts.outlineColor ?? PAL.ink) },
     // Filled in per mesh by applyCel from the geometry's bounding sphere.
-    // 0 means "unknown", which disables the taper rather than guessing.
+    // 0 means "unknown", which disables the fade rather than guessing.
     uOutlineRadius: { value: 0.0 },
-    // 130 px of projected radius ≈ 30 m for a boat, which is where a 5 px line
-    // starts to eat the silhouette (measured: at 60 m the hull is 70 px long and
-    // an untapered line turned the whole stern into an ink mass —
-    // shots/cel_probe3/ol_60m.png).
-    uOutlineTaperPx: { value: opts.outlineTaperPx ?? 130 },
-    uOutlineTaperFloor: { value: opts.outlineTaperFloor ?? 0.38 },
+    // Projected radius, device px. Below ~18 px of radius (36 px across) a
+    // 2.8 px line on each side is a fifth of the form, so it goes.
+    uOutlineFadePx: { value: opts.outlineFadePx ?? 19 },
     // Shared references — assigning the same IUniform object keeps every
     // material in the scene in sync from a single write per frame.
     uTime: SHARED.uTime,
@@ -685,6 +721,7 @@ export function createCelMaterial(opts: CelMaterialOptions = {}): CelMaterialSet
         varying vec3 vWorldNormal;
         varying vec3 vWorldPos;
         varying vec3 vViewPos;
+        varying float vOutlineFade;
         void main() {
           // Ink is not flat black and it is not one value all the way round.
           // A brush line thins and lightens where light rakes across the form
@@ -695,10 +732,17 @@ export function createCelMaterial(opts: CelMaterialOptions = {}): CelMaterialSet
           float lightSide = dot(normalize(vWorldNormal), normalize(uSunDir)) * 0.5 + 0.5;
           float lift = step(0.56, lightSide) * 0.55 + step(0.80, lightSide) * 0.45;
           vec3 ink = uOutlineColor + uAmbientColor * (lift * 0.022);
-          gl_FragColor = vec4(ink, 1.0);
+          // Alpha, not width, is how a line leaves at distance. See OUTLINE_PUSH.
+          if (vOutlineFade < 0.004) discard;
+          gl_FragColor = vec4(ink, vOutlineFade);
         }
       `,
       side: BackSide,
+      // Transparent so the fade is a fade and not a dashed, sub-pixel line.
+      // The shell still depth-tests against the scene, so it is only ever
+      // visible in the ring outside the silhouette it belongs to.
+      transparent: true,
+      depthWrite: true,
     });
   }
 

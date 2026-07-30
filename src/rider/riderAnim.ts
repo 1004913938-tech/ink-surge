@@ -144,23 +144,34 @@ function poseBrace(p: Pose, s: Signals) {
  */
 function poseTuck(p: Pose, s: Signals) {
   poseRide(p, s);
-  setE(p, B.hips, 0.2, 0, 0);
-  setE(p, B.spine, 0.34 + s.build.hunch, 0, 0);
-  setE(p, B.chest, 0.2, 0, 0);
-  setE(p, B.neck, -0.28, 0, 0);
-  setE(p, B.head, -0.3, 0, 0);
-  setE(p, B.clavL, 0, 0, -0.16);
-  setE(p, B.clavR, 0, 0, 0.16);
+  // These numbers are roughly double the first pass. At the old amplitudes a
+  // capture at airTime = 0.3 s was indistinguishable from the ride pose — the
+  // crit read it, correctly, as "zero tuck". A tuck has to be a *silhouette*
+  // change: the head drops below the shoulder line, the back domes over the
+  // bars, and the knees come up in front of the hips.
+  setE(p, B.hips, 0.26, 0, 0);
+  setE(p, B.spine, 0.48 + s.build.hunch, 0, 0);
+  setE(p, B.chest, 0.28, 0, 0);
+  // Neck and head lift hard *against* the fold: the total forward pitch of the
+  // torso is over 60°, and if the head went with it the rider would be looking
+  // at the deck. It has to fold and still watch the landing.
+  setE(p, B.neck, -0.36, 0, 0);
+  setE(p, B.head, -0.46, 0, 0);
+  setE(p, B.clavL, 0, 0, -0.28);
+  setE(p, B.clavR, 0, 0, 0.28);
   // Knees up: fold the thigh forward and let the shin trail.
-  setE(p, B.thighL, -0.44, 0.04, 0);
-  setE(p, B.thighR, -0.44, -0.04, 0);
-  setE(p, B.shinL, 0.5, 0, 0);
-  setE(p, B.shinR, 0.5, 0, 0);
+  setE(p, B.thighL, -0.58, 0.06, 0);
+  setE(p, B.thighR, -0.58, -0.06, 0);
+  setE(p, B.shinL, 0.7, 0, 0);
+  setE(p, B.shinR, 0.7, 0, 0);
   // Scarf streams straight out behind and lifts on the way up.
-  setE(p, B.scarfA, 0.3, 0, 0);
-  setE(p, B.scarfB, 0.24, 0, 0);
-  setE(p, B.scarfC, 0.18, 0, 0);
-  p[HIP_OFF + 1] = 0.035;
+  setE(p, B.scarfA, 0.34, 0, 0);
+  setE(p, B.scarfB, 0.26, 0, 0);
+  setE(p, B.scarfC, 0.2, 0, 0);
+  // Hips forward and slightly down: the rider comes off the seat and folds over
+  // the bars, rather than being lifted clear of the boat.
+  p[HIP_OFF + 1] = -0.018;
+  p[HIP_OFF + 2] = 0.035;
 }
 
 /**
@@ -169,18 +180,24 @@ function poseTuck(p: Pose, s: Signals) {
  */
 function poseLand(p: Pose, s: Signals) {
   poseRide(p, s);
-  setE(p, B.hips, 0.08, 0, 0);
-  setE(p, B.spine, 0.3 + s.build.hunch, 0, 0);
-  setE(p, B.chest, 0.02, 0, 0);
-  setE(p, B.neck, -0.24, 0, 0);
-  setE(p, B.head, -0.34, 0, 0);
-  setE(p, B.clavL, 0, 0, -0.24);
-  setE(p, B.clavR, 0, 0, 0.24);
-  setE(p, B.thighL, -0.3, 0, 0);
-  setE(p, B.thighR, -0.3, 0, 0);
-  setE(p, B.shinL, 0.72, 0, 0);
-  setE(p, B.shinR, 0.72, 0, 0);
-  p[HIP_OFF + 1] = -0.075;
+  // The absorb is the biggest single deformation in the whole rig, because it is
+  // the only one the player *feels* — it has to arrive as a visible squash on
+  // the frame of impact. 11 cm of hip drop on a 1.1 m torso is about a tenth of
+  // the figure's height; anything less and the shot reads as "no crouch".
+  setE(p, B.hips, 0.16, 0, 0);
+  setE(p, B.spine, 0.46 + s.build.hunch, 0, 0);
+  setE(p, B.chest, 0.06, 0, 0);
+  setE(p, B.neck, -0.34, 0, 0);
+  setE(p, B.head, -0.46, 0, 0);
+  // Shoulders up around the ears: a compression, not a slouch.
+  setE(p, B.clavL, 0, 0, -0.4);
+  setE(p, B.clavR, 0, 0, 0.4);
+  setE(p, B.thighL, -0.46, 0, 0);
+  setE(p, B.thighR, -0.46, 0, 0);
+  setE(p, B.shinL, 1.0, 0, 0);
+  setE(p, B.shinR, 1.0, 0, 0);
+  p[HIP_OFF + 1] = -0.115;
+  p[HIP_OFF + 2] = 0.012;
 }
 
 /**
@@ -428,13 +445,21 @@ export class RiderAnimator {
     s.pitch = st.pitch;
 
     // ── State weights ───────────────────────────────────────────────────────
-    s.wAir = damp(s.wAir, st.airborne ? 1 : 0, st.airborne ? 5.5 : 11, ctx.dt);
-    // Landing is an impulse: spike the weight, then let it bleed out. The
-    // bleed rate sets how long the absorb reads for.
-    if (st.landingImpact > 1.0) {
-      s.wLand = Math.max(s.wLand, clamp01(st.landingImpact / 9));
+    // The tuck has to be *there* by the time the boat is a fifth of a second off
+    // the water, which is when a jump reads. At the old rate of 5.5 the weight
+    // was still under 0.8 at airTime = 0.3 and the pose was being averaged away
+    // against the ride pose — the `air` shot showed an upright rider mid-flight.
+    s.wAir = damp(s.wAir, st.airborne ? 1 : 0, st.airborne ? 13 : 9, ctx.dt);
+    // Landing is an impulse: spike the weight, then let it bleed out. The bleed
+    // rate sets how long the absorb reads for.
+    //
+    // The divisor was 9, which meant a routine 2 m/s re-entry produced a weight
+    // of 0.22 — a 20% crouch, i.e. none. Any landing worth an impact sound gets
+    // most of the absorb; only the divisor's tail distinguishes a hard one.
+    if (st.landingImpact > 0.8) {
+      s.wLand = Math.max(s.wLand, 0.55 + clamp01(st.landingImpact / 6) * 0.45);
     }
-    s.wLand = damp(s.wLand, 0, 3.1, ctx.dt);
+    s.wLand = damp(s.wLand, 0, 2.4, ctx.dt);
     s.wBrace = damp(s.wBrace, clamp01(racer.controls.brake * 0.8 + clamp01(-s.lonG) * 0.7), 6, ctx.dt);
     s.wDrift = damp(s.wDrift, st.drifting ? 1 : 0, 6, ctx.dt);
 
@@ -538,6 +563,44 @@ export class RiderAnimator {
     P_OUT[B.shinR * 3] += absorb;
     P_OUT[B.spine * 3] += absorb * 0.25;
 
+    // IDLE + BIAS. Four racers driving the same racing line at the same speed
+    // get near-identical signals, so every pose-machine output above is nearly
+    // the same for all of them — which is exactly what the crit saw: "all four
+    // racers hold the identical upright pose". Two layers fix that, and both are
+    // needed:
+    //
+    //   BIAS   a *constant* asymmetry per racer. Phase offsets alone are not
+    //          enough, because four riders on the same cycle still pass through
+    //          the same neutral shape every period. A standing cant means they
+    //          never share a silhouette at all.
+    //   IDLE   three slow, mutually-prime oscillators read at `s.t`, which
+    //          already carries this rider's `phase` and `tempo`. Small in
+    //          amplitude — this is breathing and balance, not animation — but
+    //          it is the phase difference, not the size, that the eye reads at
+    //          pack distance.
+    const bias = b.bias * free;
+    P_OUT[B.chest * 3 + 2] += bias * 0.055;
+    P_OUT[B.spine * 3 + 1] += bias * 0.05;
+    P_OUT[B.clavL * 3 + 2] += -bias * 0.09;
+    P_OUT[B.clavR * 3 + 2] += -bias * 0.05;
+    P_OUT[B.head * 3 + 1] += bias * 0.13;
+    P_OUT[B.head * 3 + 2] += -bias * 0.07;
+
+    const idle = free * (1 - s.wLand * 0.6);
+    const i1 = Math.sin(s.t * 0.83);
+    const i2 = Math.sin(s.t * 1.27 + 1.1);
+    const i3 = Math.sin(s.t * 0.61 + 2.3);
+    P_OUT[B.spine * 3] += i1 * 0.05 * idle;
+    P_OUT[B.chest * 3 + 1] += i2 * 0.07 * idle;
+    P_OUT[B.chest * 3 + 2] += i3 * 0.055 * idle;
+    P_OUT[B.neck * 3 + 1] += i2 * 0.06 * idle;
+    P_OUT[B.head * 3 + 1] += (i2 * 0.15 + i3 * 0.1) * idle;
+    P_OUT[B.head * 3] += i1 * 0.08 * idle;
+    P_OUT[B.clavL * 3 + 2] += -i3 * 0.06 * idle;
+    P_OUT[B.clavR * 3 + 2] += i1 * 0.06 * idle;
+    P_OUT[HIP_OFF] += i3 * 0.013 * idle;
+    P_OUT[HIP_OFF + 1] += i1 * 0.011 * idle;
+
     // Engine buzz — tiny, high frequency, only at speed. Reads as vibration
     // through the bars rather than as animation.
     const buzz = Math.sin(s.t * 41) * 0.0022 * s.speedFrac * grounded;
@@ -563,18 +626,29 @@ export class RiderAnimator {
     // tail is aimed in something much closer to world space: hanging when
     // stopped, streaming just above the horizontal at full chat.
     const torsoPitch = P_OUT[B.hips * 3] + P_OUT[B.spine * 3] + P_OUT[B.chest * 3];
-    const stream = (-0.35 + 0.86 * s.speedFrac - torsoPitch) * (1 - s.wCeleb * 0.5);
+    //
+    // The speed term was 0.86, which is not enough to beat the torso pitch it is
+    // being corrected against: at 84 km/h the chase capture showed the tail
+    // hanging dead-straight down the rider's back, which is what a scarf does at
+    // a standstill. 1.4 puts the tail at about the horizontal by full chat and
+    // still lets it hang when the boat is stopped.
+    const stream = (-0.3 + 1.4 * s.speedFrac - torsoPitch) * (1 - s.wCeleb * 0.5);
     for (let i = 0; i < 3; i++) {
       const bone = B.scarfA + i;
       const lag = 1 + i * 0.7;
       const ph = s.t * (3.1 + i * 0.7) - i * 0.9;
       P_OUT[bone * 3] += stream * SCARF_SHARE[i] + SCARF_CURL[i];
       P_OUT[bone * 3] += Math.sin(ph) * 0.06 * flow * lag;
-      P_OUT[bone * 3 + 1] += Math.sin(ph * 0.77 + 0.6) * 0.3 * flow * lag;
+      // Twist was ±0.3 · flow · lag, which on the tail segment is over 40° — and
+      // rolling a ribbon 40° is precisely how you turn its broad face away and
+      // present the edge. Cut to a suggestion of flutter.
+      P_OUT[bone * 3 + 1] += Math.sin(ph * 0.77 + 0.6) * 0.14 * flow * lag;
       // A standing yaw bias fans the tail off to one side, so it presents some
-      // of its face from every camera angle instead of vanishing edge-on.
+      // of its face from every camera angle instead of vanishing edge-on. Held
+      // small: at -0.1 · lag the tail swung out level with the shoulder and read
+      // as a shard sticking out of the rider rather than as cloth trailing.
       P_OUT[bone * 3 + 2] +=
-        -0.1 * lag + Math.cos(ph * 0.9) * 0.09 * flow * lag - s.slip * 0.1 * lag;
+        -0.045 * lag + Math.cos(ph * 0.9) * 0.05 * flow * lag - s.slip * 0.08 * lag;
       // The heave snaps the scarf up on a hard landing.
       P_OUT[bone * 3] += clamp(-s.heaveA * 0.0022, -0.2, 0.3) * lag * 0.4;
     }
@@ -617,6 +691,12 @@ export class RiderAnimator {
     out.y -= s.wAir * 0.02;
     // Landing: arms brace against the bars.
     out.z -= s.wLand * 0.02;
+
+    // Wrist, not palm. Everything above is a *bar* position; the IK end effector
+    // is the wrist joint, which sits PALM_ALONG_HAND behind the grip along the
+    // hand's own axis. Without this the fists floated a hand's length past the
+    // bar and the arms locked out straight at full extension.
+    out.add(m.palmOffset);
 
     // Celebration: right arm punches the air and pumps; left stays on the bar.
     // Rider space is hips-relative, so "above the head" is ~0.9 m, not 1.6 —

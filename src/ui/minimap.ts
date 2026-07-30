@@ -14,7 +14,17 @@
 
 import { HEX } from '../core/palette';
 import { clamp01 } from '../core/mathx';
-import { cutPath, diamondPath, halo, hatch, inked, inkText, rgba, FONT_STACK } from './inkDraw';
+import {
+  FONT_STACK,
+  PLATE_SKEW,
+  cutPath,
+  diamondPath,
+  hatch,
+  inkText,
+  inked,
+  plate,
+  rgba,
+} from './inkDraw';
 import type { GameContext, TrackAPI } from '../core/types';
 
 export class Minimap {
@@ -106,17 +116,18 @@ export class Minimap {
     g.save();
     g.translate(this.x, this.y);
 
-    const cut = size * 0.16;
+    // Chamfer matched to the plate skew ratio so the map window belongs to the
+    // same corner language as every slanted plate in the overlay.
+    const cut = size * PLATE_SKEW;
     const frame = cutPath(0, 0, size, size, cut, 0b1010); // TL + BR chamfer
-    halo(g, frame, rgba(HEX.ink, 0.42), 11 * s);
-    inked(g, frame, rgba(HEX.hudInk, 0.68), rgba(HEX.hudPaper, 0.9), 3 * s);
-
-    // Sea wash + a couple of drawn swell dashes so the plate is not dead flat.
+    // Opaque sea, then the drawn swell hatch on top of it. The old frame filled
+    // at 0.68 and washed the sea in at 0.55, so the ocean shader and the racing
+    // line showed through the map — a map you can see the world through is not a
+    // map, and it was the same transparency bug as the standings rows.
+    plate(g, frame, s, { fill: rgba(HEX.waterDeep, 1) });
     g.save();
     g.clip(frame);
-    g.fillStyle = rgba(HEX.waterDeep, 0.55);
-    g.fillRect(0, 0, size, size);
-    hatch(g, frame, 0, 0, size, size, rgba(HEX.waterMid, 0.16), 11 * s, 1.4 * s);
+    hatch(g, frame, 0, 0, size, size, rgba(HEX.waterMid, 0.5), 11 * s, 1.4 * s);
     g.restore();
 
     // Inner rule — a double line is the cheapest way to make a panel look made.
@@ -238,7 +249,7 @@ export class Minimap {
     const bw = this.size;
     g.save();
     const rail = cutPath(bx, by, bw, 6 * s, 3 * s, 0b1010);
-    inked(g, rail, rgba(HEX.hudInk, 0.85), rgba(HEX.hudDim, 0.6), 1.4 * s);
+    inked(g, rail, rgba(HEX.hudInk, 1), rgba(HEX.hudPaper, 0.7), 1.6 * s);
     g.clip(rail);
     g.fillStyle = rgba(HEX.raceLine, 0.95);
     g.fillRect(bx, by, bw * u, 6 * s);

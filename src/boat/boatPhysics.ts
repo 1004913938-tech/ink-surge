@@ -59,6 +59,27 @@ const PROBES: readonly Vector3[] = [
   new Vector3(0.0, PROBE_Y, -2.0), // transom
 ];
 
+/**
+ * **Contact points** — the genuinely lowest geometry on the hull, boat-local.
+ *
+ * These are NOT the buoyancy probes and they exist for one reason: deciding
+ * whether the boat has left the water. The probe plane sits at y = -0.26 for the
+ * torque reasons above, but the skeg's tip is at y = -0.60 and the keel is at
+ * -0.33, so "every probe is 45 cm above the surface" was still true with a third
+ * of a metre of skeg dragging through it. That is what put an AIR badge on a
+ * planing boat in three of the review frames.
+ *
+ * Sampled with `ocean.height()` — the same field the water shader displaces with
+ * `GERSTNER_GLSL` — so the flag and the rendered surface cannot disagree.
+ */
+const CONTACTS: readonly Vector3[] = [
+  new Vector3(0.0, 0.06, 2.06), // forefoot: matters only when the bow is down
+  new Vector3(0.0, -0.33, 0.1), // keel, amidships — deepest point of the shell
+  new Vector3(-0.86, -0.05, -1.4), // chine, port — the low point when heeled over
+  new Vector3(0.86, -0.05, -1.4), // chine, starboard
+  new Vector3(0.0, -0.6, -2.24), // skeg and its cavitation plate: the true low point
+];
+
 /** Σz² / n and Σx² / n — the restoring-torque coefficients of the layout above. */
 const PITCH_INERTIA = PROBES.reduce((s, p) => s + p.z * p.z, 0) / PROBES.length;
 const ROLL_INERTIA = PROBES.reduce((s, p) => s + p.x * p.x, 0) / PROBES.length;
@@ -91,6 +112,16 @@ interface Internal {
   rollVel: number;
   /** Last frame's mean surface height under the hull, for water vertical speed. */
   prevSurfaceY: number;
+  /**
+   * Raw, per-frame "no part of the hull is touching water". The *physics*
+   * branches key off this; `state.airborne` is the deglitched version of it that
+   * the HUD, rider, foam and audio see. Keeping them separate is what lets the
+   * badge have a minimum duration without the boat keeping its water drag and
+   * lateral grip for the first quarter-second of a jump.
+   */
+  inAir: boolean;
+  /** Seconds since `inAir` last went false — the coyote timer. */
+  airGap: number;
   /** Low-passed drift-charge gate, so a twitchy slip angle can't ratchet tiers. */
   slip: number;
   /** Seconds since the last collision, throttles the impact audio. */
@@ -112,6 +143,8 @@ function makeInternal(): Internal {
     pitchVel: 0,
     rollVel: 0,
     prevSurfaceY: 0,
+    inAir: false,
+    airGap: 0,
     slip: 0,
     hitCooldown: 0,
     trimPitch: 0,
@@ -185,6 +218,8 @@ export class BoatPhysics implements Subsystem {
       pos.y = g.prevSurfaceY - PROBE_Y - cfg.restDraft;
       s.airborne = false;
       s.airTime = 0;
+      g.inAir = false;
+      g.airGap = 0;
       g.initialised = true;
     }
     g.hitCooldown = Math.max(0, g.hitCooldown - dt);
@@ -209,7 +244,6 @@ export class BoatPhysics implements Subsystem {
     let pitchTorque = 0;
     let rollTorque = 0;
     let submerged = 0;
-    let minClearance = Infinity;
 
     for (let i = 0; i < PROBES.length; i++) {
       const p = PROBES[i];
@@ -217,7 +251,6 @@ export class BoatPhysics implements Subsystem {
       const surf = ctx.ocean.sample(_probe.x, _probe.z, ctx.time, _sample);
       sumSurface += surf.height;
       const clearance = _probe.y - surf.height;
-      if (clearance < minClearance) minClearance = clearance;
       if (clearance < 0) {
         const depth = Math.min(-clearance, cfg.maxDraft);
         submerged++;
@@ -237,10 +270,54 @@ export class BoatPhysics implements Subsystem {
     const waterVy = clamp((surfaceY - g.prevSurfaceY) / dt, -18, 18);
     g.prevSurfaceY = surfaceY;
 
-    // ── Airborne ────────────────────────────────────────────────────────────
-    const wasAirborne = s.airborne;
-    s.airborne = submerged === 0 && minClearance > cfg.airborneThreshold;
-    if (s.airborne) s.airTime += dt;
+    // ── Contact state ───────────────────────────────────────────────────────
+    // Measured on the hull's lowest geometry, not on the probe plane, and then
+    // deglitched before it is published.
+    //
+    // In this sea the hull genuinely breaks contact for two or three frames on
+    // most crests. Publishing that raw gives a flag that flickers several times
+    // a second — an AIR badge that strobes, a rider that twitches into a tuck,
+    // and a wake ribbon with a hole punched in it every crest. So there are two
+    // states: `g.inAir` (raw, this frame, drives the physics) and
+    // `s.airborne` (latches after `airMinDuration`, and only lets go when
+    // something actually touches water or the clearance has been gone for
+    // `airCoyote`).
+    let hullClearance = Infinity;
+    for (let i = 0; i < CONTACTS.length; i++) {
+      _probe.copy(CONTACTS[i]).applyQuaternion(_quat).add(pos);
+      const c = _probe.y - ctx.ocean.height(_probe.x, _probe.z, ctx.time);
+      if (c < hullClearance) hullClearance = c;
+    }
+
+    const wasInAir = g.inAir;
+    const inAir = submerged === 0 && hullClearance > cfg.airborneClearance;
+    g.inAir = inAir;
+
+    if (inAir) {
+      g.airGap = 0;
+      s.airTime += dt;
+      if (!s.airborne && s.airTime >= cfg.airMinDuration) {
+        // A duration gate alone is not enough. A 0.30 s hop crosses a 0.25 s
+        // gate and shows the badge for 50 ms — the very flicker the gate exists
+        // to remove. So also require the flight to have time *left* in it:
+        // ballistic time to splash from the current clearance and vertical
+        // speed, one sqrt, no allocation.
+        const h = Math.max(0, hullClearance - cfg.airborneClearance);
+        const vy = s.velocity.y;
+        const toSplash = (vy + Math.sqrt(vy * vy + 2 * GRAVITY * h)) / GRAVITY;
+        if (toSplash >= cfg.airMinDuration) s.airborne = true;
+      }
+    } else {
+      g.airGap += dt;
+      if (submerged > 0 || g.airGap >= cfg.airCoyote) {
+        // A landing. Crisp — no grace period once water is involved.
+        s.airborne = false;
+        s.airTime = 0;
+      } else {
+        // Skimming a crest. Still the same flight.
+        s.airTime += dt;
+      }
+    }
 
     // ── Longitudinal ────────────────────────────────────────────────────────
     // Engine spool: slower up than down, so stabbing the throttle out of a
@@ -256,16 +333,16 @@ export class BoatPhysics implements Subsystem {
 
     const boosting = s.boostTime > 0;
     // A propeller in air does nothing; a propeller in a trough does everything.
-    const bite = s.airborne ? cfg.airThrust : 0.45 + 0.55 * clamp01(submergedFrac * 1.6);
+    const bite = inAir ? cfg.airThrust : 0.45 + 0.55 * clamp01(submergedFrac * 1.6);
     let accel = g.engine * (cfg.thrust / cfg.mass) * bite;
-    if (boosting) accel += (cfg.boostForce / cfg.mass) * (s.airborne ? cfg.airThrust : 1);
-    accel -= clamp01(c.brake) * (cfg.reverseThrust / cfg.mass) * (s.airborne ? 0 : 1);
+    if (boosting) accel += (cfg.boostForce / cfg.mass) * (inAir ? cfg.airThrust : 1);
+    accel -= clamp01(c.brake) * (cfg.reverseThrust / cfg.mass) * (inAir ? 0 : 1);
 
     // Drag: linear + quadratic, tuned so full throttle settles exactly on
     // `topSpeed` and full throttle plus boost settles on `boostTopSpeed`.
     // In the air only the linear term survives, so a good jump is genuinely
     // faster than the water line — which is the whole reward for finding one.
-    const dragScale = s.airborne ? 0.14 : 0.55 + 0.45 * submergedFrac;
+    const dragScale = inAir ? 0.14 : 0.55 + 0.45 * submergedFrac;
     accel -= (cfg.dragLinear * surge + cfg.dragQuadratic * surge * Math.abs(surge)) * dragScale;
     // Plough drag: burying the bow costs you speed. Also the only thing that
     // stops the boat submarining through a wave face at boost speed.
@@ -293,12 +370,12 @@ export class BoatPhysics implements Subsystem {
     // A slide also survives a short hop. In this sea the hull is airborne a
     // seventh of the time, so cancelling on every crest would make drifting
     // unusable exactly where the player most wants it.
-    const airOk = !s.airborne || (s.drifting && s.airTime < 0.6);
+    const airOk = !inAir || (s.drifting && s.airTime < 0.6);
     const wantDrift =
       c.drift && Math.abs(surge) > speedFloor && Math.abs(c.steer) > 0.2 && airOk;
     if (wantDrift) turnRate *= cfg.driftYawGain;
 
-    const authority = s.airborne ? cfg.airControl : 1;
+    const authority = inAir ? cfg.airControl : 1;
     const desiredYawVel = -c.steer * turnRate * rudder * authority;
     g.yawVel = damp(g.yawVel, desiredYawVel, cfg.yawResponse, dt);
     s.heading += g.yawVel * dt;
@@ -307,7 +384,7 @@ export class BoatPhysics implements Subsystem {
     // Grip is an exponential decay rate on sway, not a force. That makes the
     // difference between gripping and drifting a single, very legible number.
     s.drifting = wantDrift;
-    const grip = s.airborne ? cfg.airGrip : s.drifting ? cfg.driftGrip : cfg.lateralGrip;
+    const grip = inAir ? cfg.airGrip : s.drifting ? cfg.driftGrip : cfg.lateralGrip;
     // Sway is *not* generated here. Yawing the hull without rotating the world
     // velocity already means next frame's decomposition finds a lateral
     // component of −surge·Δheading; adding an explicit term on top cancels it
@@ -346,7 +423,7 @@ export class BoatPhysics implements Subsystem {
       for (let i = 0; i < cfg.driftTiers.length; i++) if (s.driftCharge >= cfg.driftTiers[i]) tier = i + 1;
       s.driftTier = tier;
       s.boostMeter = clamp01(s.driftCharge / cfg.driftTiers[cfg.driftTiers.length - 1]);
-    } else if (c.drift && Math.abs(c.steer) > 0.2 && s.airborne) {
+    } else if (c.drift && Math.abs(c.steer) > 0.2 && inAir) {
       // Drift interrupted by a long flight rather than by the player. Freeze the
       // charge instead of firing or dumping it: losing a tier-3 charge because a
       // crest threw you into the air mid-corner reads as the game cheating.
@@ -386,7 +463,7 @@ export class BoatPhysics implements Subsystem {
     }
     // Planing lift: at speed the hull climbs onto its own bow wave and rides
     // visibly higher. It is a small number that does a lot of the "fast" read.
-    if (!s.airborne) s.velocity.y += cfg.planingLift * surge * surge * submergedFrac * dt;
+    if (!inAir) s.velocity.y += cfg.planingLift * surge * surge * submergedFrac * dt;
 
     // ── Integrate position ──────────────────────────────────────────────────
     pos.addScaledVector(s.velocity, dt);
@@ -404,8 +481,10 @@ export class BoatPhysics implements Subsystem {
     }
 
     // ── Landing ─────────────────────────────────────────────────────────────
+    // Fired on the *raw* transition, not the published one: the pitch recoil and
+    // the splash belong to the moment the water is actually hit.
     s.landingImpact = 0;
-    if (wasAirborne && !s.airborne) {
+    if (wasInAir && !inAir) {
       const impact = Math.max(0, waterVy - s.velocity.y);
       s.landingImpact = impact;
       // The bow is usually down on re-entry, so the water kicks the nose back
@@ -427,14 +506,13 @@ export class BoatPhysics implements Subsystem {
         ctx.audio.impact(strength);
         ctx.audio.splash(clamp01(0.3 + strength * 0.7));
       }
-      s.airTime = 0;
     }
 
     // ── Pitch and roll ──────────────────────────────────────────────────────
     // Second-order about the hull axes. The restoring coefficient is the probe
     // layout's own inertia, so tuning `pitchStiffness` reads directly as a
     // natural frequency: ω = √(pitchStiffness · PITCH_INERTIA).
-    if (s.airborne) {
+    if (inAir) {
       // Ballistic: the hull follows its velocity vector, nose dropping as it
       // falls. Reduced authority, so a launch reads as a launch.
       const horiz = Math.hypot(s.velocity.x, s.velocity.z);

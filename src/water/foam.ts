@@ -65,10 +65,18 @@ const POINTS = 96;
  * never got far enough into its life to visibly break up.
  */
 const EMIT_STEP = 1.15;
-/** Seconds a sample lives before it is fully dissipated. */
-const LIFE = 4.6;
+/**
+ * Seconds a sample lives before it is fully dissipated.
+ *
+ * 4.6 s was too long to *read* as dissipation: with coverage still at a third of
+ * its birth value at the end of life the tail simply stopped, and the r13 capture
+ * showed the ribbon ending in a straight cut edge mid-water. At 2.8 s, coverage
+ * is visibly breaking into patches for the last second of the trail, which is the
+ * behaviour the brief names.
+ */
+const LIFE = 2.8;
 /** Metres per second the ribbon half-width grows — the Kelvin divergence. */
-const SPREAD = 1.35;
+const SPREAD = 1.9;
 /**
  * Vertices across the ribbon.
  *
@@ -212,7 +220,8 @@ export class WakeRibbons {
         uLife: { value: LIFE },
         /** Noise tile in metres — large, so the wake never reads as tiled. */
         uTile: { value: 5.6 },
-        uOpacity: { value: 0.85 },
+        /** Cutout, so this is 1. Kept as a uniform for the critic loop only. */
+        uOpacity: { value: 1.0 },
       },
       vertexShader: /* glsl */ `
         ${GERSTNER_GLSL}
@@ -267,10 +276,19 @@ export class WakeRibbons {
           // Dissipation noise. Sampled first because the ribbon's cross-section
           // is warped by it as well as being masked with it. Three scales so the
           // holes are lacy and the rail edges are chewed rather than ruled.
+          //
+          // The finest channel is dropped once it stops being a drawable shape.
+          // Keeping it produced the 1 px white fringe along every stripe edge in
+          // the r13 capture — a threshold against a sub-pixel field is a dither,
+          // not an edge.
+          float fp = max(max(fwidth(vWorldPos.x), fwidth(vWorldPos.z)), 1e-5);
+          float wFine = smoothstep(fp * 2.4, fp * 5.0, uTile / 26.0);
           vec2 uv = vWorldPos.xz / uTile;
           vec4 nA = texture2D(uNoise, uv + vec2(uTime * 0.01, uTime * -0.006));
           vec4 nB = texture2D(uNoise, uv * 3.7 - vec2(uTime * 0.03, 0.0));
-          float grain = nA.r * 0.44 + nA.g * 0.2 + nB.b * 0.22 + nB.g * 0.14;
+          float wSum = 0.64 + 0.36 * wFine;
+          float grain = (nA.r * 0.44 + nA.g * 0.2 + (nB.b * 0.22 + nB.g * 0.14) * wFine) / wSum;
+          grain = clamp(0.5 + (grain - 0.5) * 1.35, 0.0, 1.0);
 
           // Across-ribbon profile, three parts:
           //   • two narrow divergent crest lines — a *ridge* at |v| ≈ 0.86, not a
@@ -285,36 +303,42 @@ export class WakeRibbons {
           // chewed foam ridge rather than a ruled lane marking — which is what the
           // r8 capture showed when both were constants.
           float railPos = 0.86 + (grain - 0.5) * 0.13;
-          float railW = 0.14 + grain * 0.07;
+          float railW = 0.13 + grain * 0.07;
           float rail = 1.0 - smoothstep(0.0, railW, abs(v - railPos));
           float centre = 1.0 - smoothstep(0.0, 0.5, v);
           float head = 1.0 - smoothstep(1.5, 9.0, vRun);
-          float fill = (1.0 - smoothstep(0.5, 1.0, v)) * 0.24;
+          float fill = (1.0 - smoothstep(0.5, 1.0, v)) * 0.22;
           float edge = rail;
           float shape = max(max(rail * 0.9, centre * head), fill * (0.35 + 0.65 * life));
 
-          // Coverage falls with age; the noise threshold turns that into holes.
-          // Capped below 1 so the noise always has range left to bite holes with.
-          float coverage = clamp(shape * (0.30 + 0.70 * life) * (0.45 + 0.75 * vPower), 0.0, 0.9);
-          float thr = 1.0 - coverage;
-          float w = max(fwidth(grain) * 0.7, 0.015);
-          float mask = smoothstep(thr - w, thr + w, grain);
-          if (mask < 0.02) discard;
+          // ── Dissipation ──────────────────────────────────────────────────
+          // Coverage must reach *zero* before the sample expires, otherwise the
+          // ribbon ends in a straight cut edge — and a stationary boat keeps a
+          // full-strength wake, which the r13 results shot showed. The
+          // smoothstep(0, 0.34, life) term below was missing: it takes coverage to zero
+          // over the last ~0.95 s, so the tail breaks into islands and goes.
+          float fadeOut = smoothstep(0.0, 0.34, life);
+          float coverage = clamp(
+            shape * fadeOut * (0.34 + 0.66 * life) * (0.42 + 0.72 * vPower), 0.0, 0.8);
 
-          // Alpha in three hard steps. A smooth ramp is what makes foam read as
-          // a semi-transparent sprite rather than as ink.
-          float a = mask * (step(0.62, life) * 0.40 + step(0.28, life) * 0.32 + 0.28);
+          // ── Hard cutout, no soft alpha ───────────────────────────────────
+          // The whole foam layer is an alpha *cutout*: the mask is 0 or 1 and the
+          // fragment is opaque. Alpha-blending an already-quantised foam tone over
+          // already-quantised water is what generated the intermediate "mush"
+          // tones and made the foam layer look like a different render from the
+          // water. Fading is expressed as *less coverage* and as a *lower tone*,
+          // never as transparency.
+          float mask = step(1.0 - coverage, grain);
+          if (mask < 0.5) discard;
 
-          // Mostly uFoamShade. Full uFoam is above the flare pass's threshold, so
-          // a wake painted in it blooms into a glowing tube — which is exactly
-          // what the r4 capture showed. Only the freshest, most powerful churn on
-          // the crest lines is allowed to clear that threshold.
-          float hot = smoothstep(0.4, 0.9, life) * max(edge, centre * head) * (0.4 + 0.6 * vPower);
-          vec3 col = mix(uFoamShade, uFoam, hot);
-          // Old foam settles toward the crest tone so it dissolves into the water.
-          col = mix(mix(uCrest, uFoamShade, 0.62), col, smoothstep(0.0, 0.40, life));
+          // Three committed values, chosen by step(). Only the freshest, most
+          // powerful churn on the crest lines clears the flare pass's threshold,
+          // so the wake never blooms into a glowing tube.
+          float hot = step(0.5, life) * step(0.45, max(edge, centre * head)) * step(0.35, vPower);
+          vec3 col = mix(uCrest, uFoamShade, step(0.30, life));
+          col = mix(col, uFoam, hot);
 
-          gl_FragColor = vec4(col, a * uOpacity);
+          gl_FragColor = vec4(col, uOpacity);
         }
       `,
     });
@@ -391,16 +415,16 @@ export class WakeRibbons {
       // and erased the trail; the foam_wake capture came back with a boat in
       // mid-air and no wake at all behind it.
       const laying = speed > 1.6 && !s.airborne;
+      // Lateral is the travel perpendicular; from the hull axis it is (fz, -fx).
+      const w0 = beam * 0.42 + speed * 0.028 + (s.drifting ? 0.55 : 0.0);
+      const power = Math.min(
+        1,
+        speed / CONFIG.boat.topSpeed +
+          Math.abs(s.lateralSpeed) * 0.12 +
+          (s.boostTime > 0 ? 0.35 : 0),
+      );
       if (laying && (t.head < 0 || t.carry >= EMIT_STEP)) {
         t.carry = 0;
-        // Lateral is the travel perpendicular; from the hull axis it is (fz, -fx).
-        const w0 = beam * 0.42 + speed * 0.028 + (s.drifting ? 0.55 : 0.0);
-        const power = Math.min(
-          1,
-          speed / CONFIG.boat.topSpeed +
-            Math.abs(s.lateralSpeed) * 0.12 +
-            (s.boostTime > 0 ? 0.35 : 0),
-        );
         this.emit(t, sx, sz, fz, -fx, w0, power, 1);
       }
 
@@ -437,6 +461,26 @@ export class WakeRibbons {
           runs[row + c] = run;
         }
       }
+      // ── Live head: weld the newest row to the transom, this frame ─────────
+      // Samples are only pushed every EMIT_STEP metres, so the newest one sits up
+      // to 1.15 m astern of the boat. The r13 pack shot caught exactly that as a
+      // gap between the green boat's transom and the start of its wake. Rewriting
+      // the newest row from the live stern transform every frame closes the gap
+      // without spending a ring-buffer slot per frame, and it costs nothing: the
+      // row is one segment long and lies on the path the boat has just travelled.
+      if (laying && t.count > 1) {
+        const row = base + (POINTS - 1) * CROSS;
+        for (let c = 0; c < CROSS; c++) {
+          const side = (c / (CROSS - 1)) * 2 - 1;
+          const i0 = (row + c) * 3;
+          pos[i0 + 0] = sx + fz * w0 * side;
+          pos[i0 + 1] = 0;
+          pos[i0 + 2] = sz - fx * w0 * side;
+          ages[row + c] = 0;
+          powers[row + c] = power;
+        }
+      }
+
       // `run` accumulates from the tail; the shader wants distance from the
       // stern, so flip it in a second pass over the same slice.
       for (let k = 0; k < POINTS * CROSS; k++) runs[base + k] = run - runs[base + k];
@@ -546,12 +590,13 @@ export class HullCollars {
         uFoam: { value: PAL.foam.clone() },
         uFoamShade: { value: PAL.foamShade.clone() },
         uCrest: { value: PAL.waterCrest.clone() },
-        uLift: { value: 0.11 },
+        uLift: { value: 0.13 },
         uTile: { value: 3.3 },
         /** Inner radius of the annulus, in normalised hull-footprint units. */
-        uInner: { value: 0.82 },
-        uOuter: { value: 1.42 },
-        uOpacity: { value: 0.8 },
+        uInner: { value: 0.7 },
+        uOuter: { value: 1.66 },
+        /** Cutout, so this is 1. Kept as a uniform for the critic loop only. */
+        uOpacity: { value: 1.0 },
       },
       vertexShader: /* glsl */ `
         ${GERSTNER_GLSL}
@@ -584,7 +629,13 @@ export class HullCollars {
           vec2 uv = vWorldPos.xz / uTile;
           vec4 nA = texture2D(uNoise, uv + vec2(uTime * 0.05, uTime * -0.03));
           vec4 nB = texture2D(uNoise, uv * 2.9 - vec2(uTime * 0.11, 0.0));
-          float grain = nA.r * 0.42 + nA.g * 0.24 + nB.b * 0.34;
+          // Finest channel dropped once it is sub-pixel; a threshold against a
+          // sub-pixel field is a dither fringe, not a hard silhouette.
+          float fp = max(max(fwidth(vWorldPos.x), fwidth(vWorldPos.z)), 1e-5);
+          float wFine = smoothstep(fp * 2.4, fp * 5.0, uTile / 26.0);
+          float grain = (nA.r * 0.42 + nA.g * 0.24 + nB.b * 0.34 * wFine)
+                      / (0.66 + 0.34 * wFine);
+          grain = clamp(0.5 + (grain - 0.5) * 1.3, 0.0, 1.0);
 
           // Elliptical distance in hull-footprint units: 1.0 is the hull's own
           // outline, so the annulus starts just inside it and spills outward.
@@ -596,24 +647,33 @@ export class HullCollars {
           float e = length(vec2(vUv.x / 0.42, vUv.y / 0.56));
           e *= 1.0 + (grain - 0.5) * 0.5 + (nB.g - 0.5) * 0.28;
 
-          float annulus = smoothstep(uInner, uInner + 0.26, e)
-                        * (1.0 - smoothstep(uOuter * 0.5, uOuter, e));
+          // The collar must be a *thick* band, not a hairline: the r13 capture
+          // showed the hull meeting the water as a hard straight intersection
+          // with visible dark water under the keel, and a two-pixel ring would
+          // not have fixed that. It starts inside the hull's own footprint (the
+          // hull covers that part) and spills well outside it.
+          float annulus = smoothstep(uInner, uInner + 0.2, e)
+                        * (1.0 - smoothstep(uOuter * 0.62, uOuter, e));
           // Bow push and stern churn: the water piles up ahead of the hull and
           // boils behind it, so the collar is not a uniform ring.
           float bow = smoothstep(0.15, 0.85, vUv.y) * 0.5;
           float stern = smoothstep(-0.1, -0.85, vUv.y) * 0.8;
-          float shape = annulus * (0.42 + bow + stern);
+          float shape = annulus * (0.55 + bow + stern);
 
-          float coverage = clamp(shape * (0.35 + 0.85 * vPower), 0.0, 0.88);
-          float thr = 1.0 - coverage;
-          float w = max(fwidth(grain) * 0.7, 0.02);
-          float mask = smoothstep(thr - w, thr + w, grain);
-          if (mask < 0.02) discard;
+          // ── Hard cutout, three committed values ──────────────────────────
+          // Same rule as the ribbon: the mask is 0 or 1 and the fragment is
+          // opaque. Alpha-blending a quantised foam tone over quantised water is
+          // what produced the soft pastel amoebas in the near field.
+          // Capped below 1 so the noise always has range left to bite holes with:
+          // four grid-start collars merging at full coverage is the "spilled paint
+          // puddle" the countdown capture showed.
+          float coverage = clamp(shape * (0.45 + 0.8 * vPower), 0.0, 0.85);
+          float mask = step(1.0 - coverage, grain);
+          if (mask < 0.5) discard;
 
-          float a = mask * (0.34 + 0.34 * step(0.35, coverage) + 0.28 * step(0.62, coverage));
-          vec3 col = mix(mix(uCrest, uFoamShade, 0.7), uFoamShade, smoothstep(0.2, 0.7, coverage));
-          col = mix(col, uFoam, step(0.78, coverage) * vPower * 0.8);
-          gl_FragColor = vec4(col, a * uOpacity);
+          vec3 col = mix(uCrest, uFoamShade, step(0.34, coverage));
+          col = mix(col, uFoam, step(0.7, coverage) * step(0.4, vPower));
+          gl_FragColor = vec4(col, uOpacity);
         }
       `,
     });
@@ -648,9 +708,12 @@ export class HullCollars {
       const speed = Math.abs(s.forwardSpeed);
       // Airborne hulls have no waterline, so the collar fades out rather than
       // sliding along the water underneath a boat that is not touching it.
+      // A hull sitting still still displaces water, so the floor is well above
+      // zero: the results screen has speed 0 and the boats must not go back to
+      // being pasted onto a plane.
       const power = s.airborne
         ? 0
-        : Math.min(1, 0.32 + speed / CONFIG.boat.topSpeed + Math.abs(s.lateralSpeed) * 0.1);
+        : Math.min(1, 0.38 + speed / CONFIG.boat.topSpeed + Math.abs(s.lateralSpeed) * 0.1);
 
       const base = r * per;
       for (let k = 0; k < per; k++) {

@@ -57,17 +57,32 @@ const dir = (deg: number) => {
  *   2–3  mid chop     — gives the surface its readable, animated silhouette
  *   4–5  fine detail  — high-frequency ripple, mostly a normal-map contributor
  *
- * Directions are deliberately spread but not evenly: two dominant swell
- * directions ~35° apart read as a real sea state, whereas evenly-spaced
- * directions produce a visibly regular cross-hatch.
+ * ── Decorrelation, and why it is not cosmetic ───────────────────────────────
+ * A captured aerial frame proved the first version of this table was legible as
+ * a *pattern*: the whole ocean read as parallel dashes at one dominant angle
+ * and a fixed pitch, like a fingerprint or camo fabric. Two causes, both here:
+ *
+ *   1. **Near-harmonic wavelengths.** The old ratios ran 1.51, 2.10, 1.54,
+ *      2.02, 1.62. The two ratios sitting on ~2.0 mean those trains share
+ *      crest positions every other crest, and a sum of octave-related waves
+ *      reinforces into a visibly regular beat rather than a sea. Ratios are now
+ *      all irrational-ish and clustered near φ (1.6–1.86), so no two trains
+ *      come back into phase over any distance the player can see.
+ *   2. **Insufficient direction spread.** The old set spanned 14°…122° with two
+ *      pairs inside 30° of each other, which produced a dominant axis. The set
+ *      below spans 219° with a minimum separation of 37°, so no single angle
+ *      survives at altitude.
+ *
+ * Total amplitude is deliberately held at ~2.98 m (was 2.987) so the boat
+ * handling and buoyancy tuning built against the old table still holds.
  */
 export const WAVES: GerstnerWave[] = [
-  { dir: dir(14), wavelength: 62.0, amplitude: 1.34, steepness: 0.92, speed: 1.0, phase: 0.0 },
-  { dir: dir(49), wavelength: 41.0, amplitude: 0.86, steepness: 0.85, speed: 1.0, phase: 1.7 },
-  { dir: dir(-22), wavelength: 19.5, amplitude: 0.40, steepness: 0.78, speed: 1.06, phase: 3.1 },
-  { dir: dir(78), wavelength: 12.7, amplitude: 0.235, steepness: 0.7, speed: 1.1, phase: 0.6 },
-  { dir: dir(-58), wavelength: 6.3, amplitude: 0.10, steepness: 0.6, speed: 1.18, phase: 4.4 },
-  { dir: dir(122), wavelength: 3.9, amplitude: 0.052, steepness: 0.5, speed: 1.25, phase: 2.2 },
+  { dir: dir(8), wavelength: 71.3, amplitude: 1.30, steepness: 0.92, speed: 1.0, phase: 0.0 },
+  { dir: dir(63), wavelength: 44.1, amplitude: 0.82, steepness: 0.85, speed: 0.97, phase: 1.7 },
+  { dir: dir(-34), wavelength: 23.7, amplitude: 0.44, steepness: 0.78, speed: 1.04, phase: 3.1 },
+  { dir: dir(101), wavelength: 13.9, amplitude: 0.255, steepness: 0.7, speed: 1.11, phase: 0.6 },
+  { dir: dir(-71), wavelength: 7.63, amplitude: 0.108, steepness: 0.6, speed: 1.19, phase: 4.4 },
+  { dir: dir(148), wavelength: 4.31, amplitude: 0.056, steepness: 0.5, speed: 1.27, phase: 2.2 },
 ];
 
 /** Precomputed per-wave scalars, rebuilt whenever the table or sea state changes. */

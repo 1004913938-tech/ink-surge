@@ -99,6 +99,15 @@ export interface RiderBuild {
   tempo: number;
   /** Phase offset so the four riders never bob in lockstep. */
   phase: number;
+  /**
+   * Constant posture asymmetry, -1…1. Signed, and *not* animated: it drops one
+   * shoulder, cocks the head and cants the spine by a couple of degrees for the
+   * whole race. Phase offsets alone are not enough — four riders running the
+   * same cycle out of phase still read as one puppet at pack distance, because
+   * every frame they all pass through the same neutral shape. A standing bias
+   * means they never share a silhouette at all.
+   */
+  bias: number;
 }
 
 export const RIDER_BUILDS: RiderBuild[] = [
@@ -106,25 +115,25 @@ export const RIDER_BUILDS: RiderBuild[] = [
   {
     height: 1.12, girth: 1.02, armLen: 1.0, legLen: 1.0, headSize: 1.08,
     hunch: 0.0, shrug: 0.0, shoulderPad: 'left', crest: 'fin',
-    scarf: 1.0, tempo: 1.0, phase: 0.0,
+    scarf: 1.0, tempo: 1.0, phase: 0.0, bias: 0.25,
   },
   // 1 — KAIRA. Tall, long-limbed, upright and loose.
   {
     height: 1.2, girth: 0.92, armLen: 1.1, legLen: 1.06, headSize: 1.02,
-    hunch: -0.1, shrug: -0.05, shoulderPad: 'none', crest: 'mohawk',
-    scarf: 1.35, tempo: 0.88, phase: 1.9,
+    hunch: -0.12, shrug: -0.06, shoulderPad: 'none', crest: 'mohawk',
+    scarf: 1.35, tempo: 0.88, phase: 1.9, bias: -1.0,
   },
   // 2 — NOX. Heavy, hunched over the bars, shoulders up.
   {
     height: 1.07, girth: 1.22, armLen: 0.94, legLen: 0.94, headSize: 1.14,
-    hunch: 0.18, shrug: 0.12, shoulderPad: 'both', crest: 'none',
-    scarf: 0.0, tempo: 1.12, phase: 3.6,
+    hunch: 0.26, shrug: 0.14, shoulderPad: 'both', crest: 'none',
+    scarf: 0.0, tempo: 1.12, phase: 3.6, bias: 0.7,
   },
   // 3 — PIP. Small, springy, very fast timing.
   {
     height: 1.01, girth: 0.96, armLen: 0.96, legLen: 0.9, headSize: 1.24,
     hunch: 0.07, shrug: 0.04, shoulderPad: 'left', crest: 'fin',
-    scarf: 1.15, tempo: 1.3, phase: 5.1,
+    scarf: 1.15, tempo: 1.3, phase: 5.1, bias: -0.55,
   },
 ];
 
@@ -577,6 +586,32 @@ function limbProfile(
   return p;
 }
 
+/**
+ * Four-knuckle finger roll: a lathe whose radius scallops in and out `n` times
+ * along its length, so revolving it produces a run of four fused sausages.
+ *
+ * This is how the hands get fingers without four separate limbs. The roll is
+ * laid *across* the handlebar (its axis parallel to the bar), so the scallops
+ * fall where the finger gaps belong, and — the point — each groove is a real
+ * concavity, so the Sobel interior pass inks a line between every finger. A
+ * flat-tinted stripe would have read as paint; this reads as drawing.
+ */
+function knuckleProfile(r: number, len: number, n = 4): Profile {
+  const p: Profile = [];
+  const step = len / n;
+  p.push([r * 0.42, 0]);
+  for (let i = 0; i < n; i++) {
+    // Fingers get slightly shorter toward the little finger, so the roll tapers
+    // instead of reading as a machined cylinder.
+    const k = 1 - i * 0.075;
+    p.push([r * 0.9 * k, i * step + step * 0.14]);
+    p.push([r * k, i * step + step * 0.5]);
+    p.push([r * 0.88 * k, (i + 1) * step - step * 0.1]);
+  }
+  p.push([r * 0.4 * (1 - (n - 1) * 0.075), len]);
+  return p;
+}
+
 /** Sphere/ellipsoid centred at `cy`, poles on Y. */
 function sphereProfile(r: number, cy: number, rings = 8, yScale = 1): Profile {
   return sphereBand(r, cy, 0, 1, rings, yScale);
@@ -609,9 +644,30 @@ export interface RiderMesh {
   /** Handlebar grip targets in rider space, one per hand. */
   gripL: Vector3;
   gripR: Vector3;
+  /**
+   * Wrist-to-palm correction, rider space.
+   *
+   * The IK solves the **wrist**, but what has to touch the bar is the *palm*,
+   * which sits `PALM_ALONG_HAND` further down the hand bone. Solving the wrist
+   * straight onto the grip is what put the fists a hand's length past the bar in
+   * every earlier capture — the arms looked as if they were reaching *through*
+   * it, and because the reach was then within a centimetre of full extension
+   * the elbows straightened into sticks. Adding this vector to the grip pulls
+   * the wrist back along the hand's own axis, so the fingers close on the bar
+   * and the elbow gets a real bend to draw.
+   */
+  palmOffset: Vector3;
   triangles: number;
   sets: CelMaterialSet[];
 }
+
+/**
+ * Distance from the wrist joint to the centre of the finger roll, in metres —
+ * i.e. how far down the hand bone the grip actually happens. Shared by the
+ * geometry that places the roll and by the IK offset that aims for it, so the
+ * two cannot drift apart.
+ */
+export const PALM_ALONG_HAND = 0.058;
 
 /**
  * Shading ramp for the riders.
@@ -702,12 +758,20 @@ export function createRiderMesh(racerId: number, build: RiderBuild): RiderMesh {
   // Lifted toward `skyHorizon` for value, then pulled a little way toward the
   // racer's own hull colour for hue — otherwise all four riders end up wearing
   // the same cyan and only the helmet tells them apart.
-  const fabric = suit.clone().lerp(PAL.skyHorizon, 0.4).lerp(hull, 0.18);
-  const fabricDark = suit.clone().lerp(PAL.skyHorizon, 0.26).lerp(hull, 0.12);
+  //
+  // The pull toward the hull colour used to be 0.18, which was not enough to
+  // survive the ramp: a capture of KAIRA from behind showed a rider who was
+  // uniformly grey, with no trace of her yellow anywhere below the helmet. At
+  // 0.34 the fabric still reads as fabric rather than as painted hull, but each
+  // racer's suit is now recognisably *their* colour at pack distance.
+  const fabric = suit.clone().lerp(PAL.skyHorizon, 0.38).lerp(hull, 0.34);
+  const fabricDark = suit.clone().lerp(PAL.skyHorizon, 0.22).lerp(hull, 0.2);
   const light = PAL.foamShade;
   const litePanel = PAL.foam;
   const skin = PAL.skin;
   const skinDark = PAL.skinShade;
+  /** Underside of the scarf, and any cloth face turned away from the sun. */
+  const accentShade = hull.clone().lerp(suit, 0.55);
   // Gloves and boots keep the *committed* suit tone, undiluted. They are the
   // one place its near-black value is an asset: dark extremities terminate the
   // limbs and give the figure weight, the way ink does in a cel drawing.
@@ -747,12 +811,12 @@ export function createRiderMesh(racerId: number, build: RiderBuild): RiderMesh {
   soft.at(B.spine, undefined, B.chest, (y) => 1 - Math.min(1, Math.max(0, (y / torsoLen - 0.15) / 0.7)));
   soft.lathe(
     [
-      [0.115 * g, -0.02],
-      [0.135 * g, torsoLen * 0.2],
-      [0.155 * g, torsoLen * 0.52],
-      [0.16 * g, torsoLen * 0.8],
-      [0.135 * g, torsoLen * 1.02],
-      [0.1 * g, torsoLen * 1.12],
+      [0.112 * g, -0.02],
+      [0.13 * g, torsoLen * 0.2],
+      [0.144 * g, torsoLen * 0.52],
+      [0.148 * g, torsoLen * 0.8],
+      [0.126 * g, torsoLen * 1.02],
+      [0.095 * g, torsoLen * 1.12],
     ],
     14,
     (u, v) => {
@@ -761,11 +825,15 @@ export function createRiderMesh(racerId: number, build: RiderBuild): RiderMesh {
       // a patchwork of large blocks — cel art wants few, big shapes. So: dark
       // waist and dark front, pale upper back, and let the yoke and the sleeve
       // stripes carry the accent. u = 0 faces +X, 0.25 is the chest, 0.75 the back.
-      if (v < 0.38) return fabric;
+      if (v < 0.38) return fabricDark;
       return u > 0.5 ? light : fabric;
     },
-    1.2,
-    0.82,
+    // Was 1.2 wide. At that beam the torso was wider than the shoulders, so from
+    // directly behind it *ate both arms* — a capture of KAIRA showed a grey sack
+    // with one arm and no left arm at all. The chest now sits inside the
+    // shoulder line, which is what lets the limbs draw their own silhouettes.
+    1.06,
+    0.86,
   );
 
   // Shoulder yoke — a wide cap in the racer's own colour over the top of the
@@ -797,24 +865,82 @@ export function createRiderMesh(racerId: number, build: RiderBuild): RiderMesh {
     const lo = side < 0 ? B.loArmL : B.loArmR;
     const hand = side < 0 ? B.handL : B.handR;
 
-    // Deltoid — a light shoulder cap. It hides the arm/torso join and keeps the
-    // high value at the top of the figure where the eye lands first.
+    // Deltoid — the shoulder cap that hides the arm/torso join. It used to be
+    // painted `light` at 0.068, which at this scale is a pale sphere wider than
+    // the arm it caps: the captures came back with a white marshmallow stuck on
+    // each shoulder. Smaller, and in the racer's own colour, it reads as a
+    // shoulder seam and puts the identity hue on the highest lit surface.
     soft.at(up);
-    soft.lathe(sphereProfile(0.068 * g, 0.008, 8, 1), 10, light);
+    soft.lathe(sphereProfile(0.059 * g, 0.006, 8, 0.92), 10, fabric);
     // Sleeve: mid-value, with an accent stripe down the *outer* face. u = 0.5
     // faces -X and u = 0/1 faces +X, so the stripe has to flip with the side —
     // painted at a fixed u it runs down the inside of one arm.
     soft.lathe(
-      limbProfile(0.056 * g, 0.045 * g, skel.bones[up].len, 0, 0.4, 3),
+      limbProfile(0.062 * g, 0.05 * g, skel.bones[up].len, 0, 0.4, 3),
       10,
       (u) => (outerStripe(side, u) ? hull : fabric),
     );
     soft.at(lo);
-    soft.lathe(sphereProfile(0.047 * g, 0.0, 6, 1), 8, fabricDark);
-    soft.lathe(limbProfile(0.045 * g, 0.038 * g, skel.bones[lo].len, 0, 0.3, 2), 10, fabricDark);
-    // Glove: a rounded fist, deeper than it is wide so the knuckles read.
+    soft.lathe(sphereProfile(0.051 * g, 0.0, 6, 1), 8, fabricDark);
+    soft.lathe(limbProfile(0.05 * g, 0.042 * g, skel.bones[lo].len, 0, 0.3, 2), 10, fabricDark);
+
+    // ── Hand ──────────────────────────────────────────────────────────────
+    // Not a fist-shaped lump. A rider who is not visibly *gripping* reads as a
+    // prop being carried by the boat, so the hand is built as four parts that
+    // each do one silhouette job:
+    //
+    //   cuff    a hard accent ring where the sleeve ends — the limb terminates
+    //           in a drawn line instead of fading into a dark blob
+    //   back    a flat slab, wide across the bar and thin vertically
+    //   roll    the four fingers, laid ALONG the bar so they wrap it
+    //   thumb   crossing inboard over the bar, the read that says "grip"
+    //
+    // In this bone's space +Y runs wrist→fingertips and local X is the world
+    // side axis (see the `hint` note on `BoneDef`). The bar also runs along the
+    // world side axis, so the finger roll is the bone's own lathe rotated a
+    // quarter turn about Z, which maps its +Y axis onto ∓X.
     soft.at(hand);
-    soft.lathe(limbProfile(0.046 * g, 0.04 * g, skel.bones[hand].len * 0.95, 0.85, 0.9, 3), 8, dark, 1, 1.2);
+    soft.lathe(limbProfile(0.05 * g, 0.047 * g, 0.019, 0.4, 0, 2), 10, hull, 1.0, 1.06);
+    // Back of the hand.
+    soft.lathe(
+      [
+        [0.026 * g, 0.016],
+        [0.037 * g, 0.028],
+        [0.042 * g, 0.052],
+        [0.036 * g, 0.07],
+      ],
+      10,
+      dark,
+      1.32,
+      0.74,
+    );
+    // Fingers. Centred on PALM_ALONG_HAND, which is exactly where the IK aims
+    // the palm — so the roll lands on the bar rather than beside it.
+    //
+    // `rz = -side · π/2` sends the lathe's +Y onto bone-space `side · X̂`, so the
+    // roll grows from its origin in that direction. It therefore has to *start*
+    // half a length the other way to end up centred on the wrist — starting at
+    // `+side · half` (the first attempt) pushed the whole fist a full roll
+    // length outboard, which is why the captured hand sat beside its own arm.
+    const rollLen = 0.098 * g;
+    soft.at(
+      hand,
+      setLocal(-side * rollLen * 0.5, PALM_ALONG_HAND, 0.008 * g, 0, 0, -side * Math.PI * 0.5),
+    );
+    // Fingers get the *mid* tone, not the near-black one. A fist painted in the
+    // committed suit colour is the same value as its own ink outline: the crit
+    // called the celebration hand "a stump" because at 40 px the whole hand was
+    // one black silhouette. Mid-value fingers against a dark palm and a hull
+    // cuff give the hand three values, so it draws as a hand.
+    soft.lathe(knuckleProfile(0.036 * g, rollLen), 8, fabricDark, 1.0, 1.14);
+    // Thumb, laid inboard across the top of the bar and angled forward. `side`
+    // twice over: once to pick the inboard direction in bone space, once to
+    // send the lathe axis the same way.
+    soft.at(
+      hand,
+      setLocal(side * 0.012 * g, PALM_ALONG_HAND - 0.02, -0.016 * g, 0, -0.55, -side * Math.PI * 0.5),
+    );
+    soft.lathe(limbProfile(0.021 * g, 0.017 * g, 0.055 * g, 0.9, 0.9, 2), 8, fabricDark, 1.0, 1.1);
   }
 
   // ── Legs ──────────────────────────────────────────────────────────────────
@@ -878,18 +1004,27 @@ export function createRiderMesh(racerId: number, build: RiderBuild): RiderMesh {
     // from the profile tangent, so a descending profile silently produces
     // inward-facing normals — the pad renders as a black hole where you can see
     // the inside of the shell. (It did exactly that for two capture rounds.)
-    hard.at(up, setLocal(0, 0.012, 0));
+    hard.at(up, setLocal(0, 0.01, 0));
     hard.lathe(
       [
-        [0.03 * g, -0.085],
-        [0.088 * g, -0.072],
-        [0.112 * g, -0.03],
-        [0.1 * g, 0.022],
-        [0.045 * g, 0.058],
+        [0.028 * g, -0.076],
+        [0.078 * g, -0.064],
+        [0.097 * g, -0.026],
+        [0.088 * g, 0.018],
+        [0.042 * g, 0.05],
       ],
       10,
-      (_u, v) => (v < 0.3 ? hull : litePanel),
-      1.15,
+      // Pale only on the first two rings. Painted pale over 70% of the shell (the
+      // previous split) the pad was the brightest, largest, smoothest object on
+      // the rider — the "white marshmallow with no outline" in the crit. Now the
+      // racer's colour owns the pad and the pale tone is a lit top edge.
+      //
+      // v = 0 is the *shoulder* end: `up` runs shoulder→elbow, so +Y goes down
+      // the arm. Putting the highlight at v > 0.66 (the first fix) hung it off
+      // the bottom lip of the pad, lit from below, which is worse than no
+      // highlight at all.
+      (_u, v) => (v < 0.3 ? litePanel : hull),
+      1.12,
       0.95,
     );
   }
@@ -900,20 +1035,28 @@ export function createRiderMesh(racerId: number, build: RiderBuild): RiderMesh {
     soft.at(B.neck, setLocal(0, 0.02, 0));
     soft.lathe(limbProfile(0.082 * g, 0.075 * g, 0.045, 0.5, 0.4, 2), 10, hull, 1.05, 1.1);
     // A ribbon, not a sausage: wide across the rider's back (local X, which is
-    // the world side axis for these bones) and thin vertically, so from the
+    // the world side axis for these bones) and thinner vertically, so from the
     // chase camera — where it is actually seen — it presents its broad face.
-    // The twist in the animator keeps it from reading as a plank.
+    //
+    // The vertical squash was 0.14, i.e. a 2 cm-thick, 27 cm-wide sheet of
+    // paper. Captured from behind at deck height that is *edge on*: it came out
+    // as a scatter of orange hairlines on KAIRA and as a flat red shard with a
+    // blunt point on the player. Cloth has to have a cross-section. 0.42 gives a
+    // ribbon ~5 cm deep — still clearly a ribbon in profile, but it now has a
+    // silhouette to ink from every angle, and a lit top face against a shaded
+    // underside instead of one flat tint.
     const seg = [B.scarfA, B.scarfB, B.scarfC];
     for (let i = 0; i < seg.length; i++) {
       const b = seg[i];
-      const w = (0.135 - i * 0.032) * g;
+      const w = (0.112 - i * 0.026) * g;
       soft.at(b);
       soft.lathe(
-        limbProfile(w, w * 0.74, skel.bones[b].len * 1.06, 0, i === 2 ? 0.8 : 0, 2),
+        limbProfile(w, w * 0.7, skel.bones[b].len * 1.06, 0, i === 2 ? 0.9 : 0, 2),
         8,
-        hull,
+        // u = 0.25 faces local +Z, which is up for these bones.
+        (u) => (u > 0.02 && u < 0.5 ? hull : accentShade),
         1,
-        0.14,
+        0.42,
       );
     }
   }
@@ -982,6 +1125,13 @@ export function createRiderMesh(racerId: number, build: RiderBuild): RiderMesh {
   const gripL = new Vector3(-GRIP_HALF_WIDTH, 0, 0).add(GRIP_LOCAL).sub(SEAT_LOCAL);
   const gripR = new Vector3(GRIP_HALF_WIDTH, 0, 0).add(GRIP_LOCAL).sub(SEAT_LOCAL);
 
+  // Column 1 of the hand bone's bind matrix is its +Y axis in rider space — the
+  // wrist→fingertip direction. Walking *back* along it by PALM_ALONG_HAND is
+  // the vector that turns a grip point into a wrist target. Taken from the bind
+  // matrix rather than hard-coded so a re-proportioned hand stays in register.
+  const he = skel.bones[B.handL].bindWorld.elements;
+  const palmOffset = new Vector3(he[4], he[5], he[6]).normalize().multiplyScalar(-PALM_ALONG_HAND);
+
   return {
     root,
     skel,
@@ -989,6 +1139,7 @@ export function createRiderMesh(racerId: number, build: RiderBuild): RiderMesh {
     hard: hardMesh,
     gripL,
     gripR,
+    palmOffset,
     triangles: soft.triCount + hard.triCount,
     sets: [softSet, hardSet],
   };

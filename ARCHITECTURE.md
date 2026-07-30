@@ -115,12 +115,40 @@ Register with `game.add(subsystem)`. Never call another subsystem's `update()`.
 | `ready: boolean` | Set true once the first frame has rendered |
 | `reset()` | Restart the race deterministically |
 | `setPhase(phase)` | Force `'countdown' \| 'racing' \| 'results'` |
-| `setControls({steer, throttle, brake, drift})` | Script the player |
+| `setControls({steer, throttle, brake, drift, autopilot})` | Script the player |
 | `simulate(seconds, dt)` | Advance with a **fixed** step — reproducible |
+| `simulateUntil(predSrc, maxT, dt)` | Advance until a predicate over `stats()` holds |
 | `settle(frames)` | Render N frames so springs/particles land |
+| `release()` | Hand the clock back to real time |
 | `setCameraPreset(name)` | See presets below |
 | `stats()` | fps, frameMs, triangles, drawCalls, boat state |
+| `probe()` | Per-racer numeric dump: heading vs track tangent, lateral error, lap, checkpoint, place |
 | `rendererInfo()` | GL vendor/renderer string |
+
+Three properties of the harness are load-bearing and were each learned the hard
+way:
+
+1. **The script owns the clock.** `simulate()` sets a `scripted` flag that
+   suppresses the rAF step. Without it, the `await`s inside `simulate()` let
+   real-dt frames slip in and the "deterministic" harness produced different
+   boat state on every run.
+2. **The scripted player drives on autopilot.** `steer: 0` at full throttle
+   drives the player 1.2 km off the circuit inside a minute, which put a WRONG
+   WAY banner in nearly every frame and pushed the AI pack out of shot. Shots
+   pass `autopilot: true` so they frame a real racing situation.
+3. **Transient states are hunted, not timestamped.** `air`, `land`, `foam_wake`
+   and `hud` use `until:` predicates. A fixed timestamp silently stops proving
+   anything the moment physics is retuned — which already happened once here.
+   The run prints `⚠ STATE NEVER REACHED` when a hunt fails; trust it.
+
+For numeric diagnosis rather than pixels:
+
+```bash
+node harness/probe.mjs --port=5310 --at=0,5,20,60
+```
+
+This is how "the boats are driving the wrong way" was disproved — all four had
+`heading · tangent = 1.00`; the fault was in the harness, not the game.
 
 Camera presets the harness may request: `chase`, `far`, `bow`, `wake`, `rider`,
 `orbit_near`, `far_boat`, `broadcast`, `aerial`, `sky`, `auto`.

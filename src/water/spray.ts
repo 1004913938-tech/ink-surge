@@ -26,12 +26,12 @@
  */
 
 import {
-  AdditiveBlending,
   BufferAttribute,
   DynamicDrawUsage,
   InstancedBufferAttribute,
   InstancedBufferGeometry,
   Mesh,
+  NormalBlending,
   ShaderMaterial,
   Texture,
 } from 'three';
@@ -47,6 +47,18 @@ const CAPACITY = 1500;
 const GRAVITY = 17.5;
 /** Air drag as an exponential rate, per second. */
 const DRAG = 1.35;
+/**
+ * Global droplet scale.
+ *
+ * The emitters ask for 0.2–0.95 m droplets, and at chase-camera range a 0.5 m
+ * world-sized quad is ~75 device pixels across. Seventy-five pixels of soft
+ * additive white is a cotton ball, which is exactly what the r13 capture found
+ * behind the boats. Now that a droplet is an opaque hard-edged shape it has to
+ * be droplet-sized to read as spray, so every emitted size passes through this
+ * and the emission *rates* are raised to compensate: many small hard chips, not
+ * a few big soft ones.
+ */
+const SIZE_SCALE = 0.40;
 
 export class SprayField {
   /** One draw call for every droplet in the game. */
@@ -131,12 +143,23 @@ export class SprayField {
       name: 'spray',
       transparent: true,
       depthWrite: false,
-      blending: AdditiveBlending,
+      /**
+       * NOT additive.
+       *
+       * Additive was the magenta streak. A white sprite added over bright cyan
+       * water saturates the red channel first — measured in the r13 hero shot as
+       * R pinned at 255 while G sat at 152-211 — so every dense burst turned hot
+       * pink, including where it landed on top of a hull. There is no exposure
+       * setting that fixes that; the layer has to composite rather than sum.
+       * With a 0/1 cutout mask the sprite simply replaces, so no channel can
+       * clip and every droplet lands on a committed palette value.
+       */
+      blending: NormalBlending,
       uniforms: {
         uFoam: { value: PAL.foam.clone() },
         uFoamShade: { value: PAL.foamShade.clone() },
         uCrest: { value: PAL.waterCrest.clone() },
-        uStrength: { value: 0.8 },
+        uStrength: { value: 1.0 },
       },
       vertexShader: /* glsl */ `
         attribute vec3 iPos;
@@ -160,12 +183,19 @@ export class SprayField {
           // Dead instances collapse the quad to a point, which rasterises nothing.
           float s = iSize * grow * step(vT, 1.0);
 
-          // Rotate the quad, not the texture lookup: the silhouette is generated
-          // from the *unrotated* local coordinate, so spinning the geometry spins
-          // the shape and every droplet in a burst reads differently.
+          // Rotate AND stretch the quad, not the texture lookup: the silhouette is
+          // generated from the *unrotated, unstretched* local coordinate, so the
+          // geometry transform spins and elongates the shape. Combined with the
+          // four authored silhouettes in the fragment stage that gives every
+          // droplet in a burst its own outline, which is what stops a burst from
+          // reading as one sprite stamped repeatedly — the r13 capture found the
+          // same 4-lobed clover at (1285,1073) and again three times in hud.png.
+          float hAsp = fract(iSeed * 17.13);
+          vec2 asp = vec2(0.68 + 0.74 * hAsp, 0.68 + 0.74 * (1.0 - hAsp));
+          vec2 qp = position.xy * asp;
           float a = iSeed * 6.2831853;
           float c = cos(a), sn = sin(a);
-          vec2 q = vec2(position.x * c - position.y * sn, position.x * sn + position.y * c) * s;
+          vec2 q = vec2(qp.x * c - qp.y * sn, qp.x * sn + qp.y * c) * s;
 
           // Camera basis straight out of the view matrix — a screen-facing quad
           // without needing the camera's world matrix as a uniform.
@@ -187,31 +217,54 @@ export class SprayField {
         varying float vSeed;
 
         void main() {
-          // The droplet silhouette is generated here rather than sampled from the
-          // shared lacy foam stamp. At the 20-60 px a droplet actually occupies,
-          // that stamp's holes read as a cartoon cloud or a snowflake - clearly
-          // visible in shots/water_r4. A three-lobe polar radius gives a lumpy,
-          // hard-edged blob whose shape is different for every seed, which is
-          // what a spray droplet caught mid-flight looks like in cel art.
+          // ── Four authored silhouettes, one per droplet ────────────────────
+          // The previous single three-lobe polar radius had lobe amplitudes of
+          // 0.085 and 0.05 against a base radius of 0.40 — a 12% wobble on a
+          // circle. That is why every droplet in the r13 capture was the same
+          // 4-lobed clover: the shapes were not actually different. These four
+          // are different *outlines*, not different phases of one outline, and
+          // the vertex stage rotates and stretches each instance on top.
           float r = length(vQuad);
           float ang = atan(vQuad.y, vQuad.x);
-          float lobes = 0.40
-                      + 0.085 * sin(ang * 3.0 + vSeed * 11.0)
-                      + 0.05  * sin(ang * 5.0 - vSeed * 7.0);
+          float shp = floor(fract(vSeed * 5.71) * 4.0);
+          float radius;
+
+          if (shp < 1.0) {
+            // Shard: a teardrop with one sharp point — a droplet torn off a crest.
+            radius = 0.15 + 0.30 * pow(max(cos(ang * 0.5), 0.0), 2.2);
+          } else if (shp < 2.0) {
+            // Splat: five sharp spikes off a small core.
+            radius = 0.17 + 0.27 * pow(abs(cos(ang * 2.5 + vSeed * 9.0)), 3.0);
+          } else if (shp < 3.0) {
+            // Chip: a hard-edged flake. A straight-sided polygon among the
+            // curved shapes is what keeps the set from reading as one family.
+            radius = 0.42 / (abs(cos(ang)) + 1.45 * abs(sin(ang)));
+          } else {
+            // Comma: a blob with a bite out of it, drawn as a crescent.
+            radius = 0.34 + 0.11 * sin(ang * 3.0 + vSeed * 13.0);
+            // The bite has to reach *past* the silhouette edge, otherwise it
+            // punches a hole in the middle and the droplet reads as a bubble
+            // ring rather than as a crescent of torn water.
+            if (length(vQuad - vec2(0.24, 0.13)) < 0.24) discard;
+          }
+
           // Droplets tear apart rather than fading: the radius shrinks with age
           // and a bite is taken out of one side.
-          float radius = lobes * (1.0 - vT * 0.3);
-          float bite = 0.5 + 0.5 * sin(ang * 2.0 + vSeed * 19.0);
-          radius -= bite * vT * 0.15;
+          radius *= 1.0 - vT * 0.28;
+          radius -= (0.5 + 0.5 * sin(ang * 2.0 + vSeed * 19.0)) * vT * 0.13;
           if (r > radius) discard;
 
-          // Three hard alpha steps, plus a bright core so the droplet has an
-          // internal edge instead of reading as one flat chip.
+          // ── Hard cutout: alpha is 1, never a ramp ────────────────────────
+          // Soft alpha is what made the spray read as photographic cotton wool
+          // and as a different render from the water. Ageing is expressed by the
+          // shrinking silhouette and by dropping down the tone ladder — never by
+          // transparency, and never additively (see the blending note above).
           float fade = 1.0 - vT;
-          float alpha = step(0.55, fade) * 0.40 + step(0.22, fade) * 0.32 + 0.28;
-          float core = step(r, radius * 0.55);
-          vec3 col = mix(mix(uCrest, uFoamShade, 0.85), uFoam, max(core, 0.35) * smoothstep(0.05, 0.5, fade));
-          gl_FragColor = vec4(col, alpha * uStrength);
+          float core = step(r, radius * 0.5);
+          vec3 col = uCrest;
+          col = mix(col, uFoamShade, step(0.26, fade));
+          col = mix(col, uFoam, step(0.42, fade) * core);
+          gl_FragColor = vec4(col, uStrength);
         }
       `,
     });
@@ -249,7 +302,7 @@ export class SprayField {
     this.vel[p + 2] = vz;
     this.age[i] = 0;
     this.life[i] = life;
-    this.size[i] = size;
+    this.size[i] = size * SIZE_SCALE;
     this.seed[i] = rng.next();
   }
 
@@ -307,7 +360,7 @@ export class SprayField {
       if (s.landingImpact > 1.4) {
         const k = Math.min(1, s.landingImpact / 13);
         const y = ctx.ocean.height(px, pz, ctx.time);
-        const count = Math.round(12 + k * 34);
+        const count = Math.round(34 + k * 84);
         for (let i = 0; i < count; i++) {
           const a = (i / count) * Math.PI * 2 + rng.sym(0.4);
           const out = 3.5 + k * 9 * rng.range(0.6, 1.3);
@@ -318,8 +371,8 @@ export class SprayField {
             Math.cos(a) * out + s.velocity.x * 0.2,
             (5.5 + k * 9) * rng.range(0.6, 1.3),
             Math.sin(a) * out + s.velocity.z * 0.2,
-            rng.range(0.32, 0.95),
-            rng.range(0.65, 1.35),
+            rng.range(0.5, 1.35),
+            rng.range(0.8, 1.7),
           );
         }
       }
@@ -339,7 +392,7 @@ export class SprayField {
       // boat the hull occludes all of it. The transom throw is dead centre of the
       // chase framing.
       if (speed > 4.5) {
-        const rate = (speed - 4.5) * 3.0;
+        const rate = (speed - 4.5) * 6.0;
         this.sternCarry[r] += rate * dt;
         while (this.sternCarry[r] >= 1) {
           this.sternCarry[r] -= 1;
@@ -363,7 +416,7 @@ export class SprayField {
 
       // Bow spray: rate rises with speed, thrown forward-out and up.
       if (speed > 6.5) {
-        const rate = (speed - 6.5) * 3.4;
+        const rate = (speed - 6.5) * 6.4;
         this.bowCarry[r] += rate * dt;
         while (this.bowCarry[r] >= 1) {
           this.bowCarry[r] -= 1;
@@ -389,7 +442,7 @@ export class SprayField {
       const slip = Math.abs(s.lateralSpeed);
       if (slip > 2.6) {
         const dir = s.lateralSpeed > 0 ? -1 : 1;
-        this.driftCarry[r] += (slip - 2.6) * 3.4 * dt;
+        this.driftCarry[r] += (slip - 2.6) * 6.4 * dt;
         while (this.driftCarry[r] >= 1) {
           this.driftCarry[r] -= 1;
           const along = rng.sym(CONFIG.boat.length * 0.4);

@@ -16,6 +16,10 @@
  *     room for the wake to read, and pinning the look-at slightly above the hull
  *     keeps the water plane sweeping through frame, which is where the sense of
  *     speed actually comes from.
+ *  2b. **Vertically the rig is sprung, not bolted.** See `FOLLOW_Y_RATE`: the
+ *     camera lags the hull's height, so airtime, a slam and the swell all read as
+ *     the boat moving inside the frame. A rigid vertical follow makes every one of
+ *     them invisible.
  *  3. **Everything is damped, nothing is snapped.** Position, yaw, look-at, FOV
  *     and roll all use `damp()`, so behaviour is identical at 30 and 144 fps.
  *
@@ -42,8 +46,20 @@ export type CameraPreset =
  * because it is a composition choice owned by this rig; the config numbers are
  * the shared "how far back is a chase camera" default.
  */
-const CHASE_DIST_TRIM = 0.84;
-const CHASE_HEIGHT_TRIM = 0.8;
+const CHASE_DIST_TRIM = 0.58;
+const CHASE_HEIGHT_TRIM = 0.62;
+
+/**
+ * Vertical follow rates, 1/s. The rig tracks the hull's height through a damp,
+ * **not** rigidly, and this is load-bearing rather than a smoothing nicety:
+ * with the camera pinned to `boat.y` the hull cannot move vertically in frame, so
+ * a 0.3 s launch off a crest looked exactly like level cruising — no gap under
+ * the keel, no separation from the water (shots/pres_base/air.png). Airborne the
+ * rate is dropped almost to zero, so the boat visibly climbs out of frame centre
+ * and the horizon stays put.
+ */
+const FOLLOW_Y_RATE = 4.2;
+const FOLLOW_Y_RATE_AIR = 1.0;
 
 const _target = new Vector3();
 const _desired = new Vector3();
@@ -62,7 +78,12 @@ export class ChaseCamera implements CameraRig {
   private lookAt = new Vector3();
   private yaw = 0;
   private shake = 0;
-  private shakeSeed = Math.random() * 100;
+  /**
+   * Fixed, not `Math.random()`. The shake displaces the camera, so a random seed
+   * makes any frame captured during a slam irreproducible — and the harness's
+   * whole value is that the same shot name yields the same pixels.
+   */
+  private shakeSeed = 37.13;
   private orbitAngle = 0;
   private baseFov = CONFIG.render.fov;
   /** Current dutch tilt, radians. Damped, applied after lookAt(). */
@@ -72,6 +93,21 @@ export class ChaseCamera implements CameraRig {
   /** Extra FOV punched in on the frame a boost fires, decayed out. */
   private fovPunch = 0;
   private lastBoostTime = 0;
+  /** Damped height the chase rig hangs off. See FOLLOW_Y_RATE. */
+  private followY = 0;
+  /**
+   * 0…1 while the hull is out of the water. The rig ducks and pulls back on it,
+   * which is what actually puts sky and horizon *under the keel* — a chase camera
+   * that keeps looking down at a launched boat shows the same silhouette it shows
+   * on flat water.
+   */
+  private airLift = 0;
+  /**
+   * Water re-entry recoil, 1 → 0. Drives a camera dip and a tilt spike, both of
+   * which are visible in a *still* frame — a positional shake is not, which is
+   * why a landing capture could contain a slam and show nothing.
+   */
+  private landKick = 0;
   /**
    * Set to `ctx.frame` by `applyCinematicOrbit`. `main.ts` calls the orbit and
    * then `update()` in the same frame; without this latch `update()` would run
@@ -114,6 +150,7 @@ export class ChaseCamera implements CameraRig {
     this.railOffset = 0;
     this.fovPunch = 0;
     this.shake = 0;
+    this.landKick = 0;
   }
 
   update(ctx: GameContext) {
@@ -125,6 +162,17 @@ export class ChaseCamera implements CameraRig {
     // in frame and the horizon stays visible — a low horizon reads as speed.
     _target.copy(boat.root.position);
     _target.y += 0.9;
+
+    // Landing recoil. Latched off `landingImpact`, which is set for exactly one
+    // frame, so it has to be captured here and decayed rather than read live.
+    // Normalised against 3.5 m/s rather than the physics slam threshold: an
+    // everyday re-entry has to produce a *visible* reaction, or a landing capture
+    // contains a landing and shows nothing.
+    if (s.landingImpact > 0.4) {
+      this.landKick = Math.max(this.landKick, clamp01(s.landingImpact / 3.5));
+    }
+    this.landKick = damp(this.landKick, 0, 4.2, dt);
+    this.airLift = damp(this.airLift, s.airborne ? 1 : 0, s.airborne ? 6.5 : 3.4, dt);
 
     this.orbitAngle += dt * 0.32;
 
@@ -149,7 +197,13 @@ export class ChaseCamera implements CameraRig {
 
     const boosting = s.boostTime > 0 ? 1 : 0;
     const targetFov =
-      this.baseFov + CONFIG.render.fovSpeedKick * s.speedFrac + boosting * 6.5 + this.fovPunch;
+      this.baseFov +
+      CONFIG.render.fovSpeedKick * s.speedFrac +
+      boosting * 6.5 +
+      this.fovPunch +
+      // A landing throws the frame open for a beat. Unlike a shake this survives
+      // a screenshot.
+      this.landKick * 5;
     this.camera.fov = damp(this.camera.fov, targetFov, 5.5, dt);
     this.camera.updateProjectionMatrix();
 
@@ -211,8 +265,23 @@ export class ChaseCamera implements CameraRig {
     // as a red dot in the middle of the sea (shots/pres_r0/hero.png). Tighter and
     // lower puts the boat at a readable size and lifts the horizon, which is
     // where the sense of speed comes from.
-    const dist = cfg.distance * CHASE_DIST_TRIM * (1 + s.speedFrac * 0.22);
-    const height = cfg.height * CHASE_HEIGHT_TRIM * (1 + s.speedFrac * 0.1);
+    //
+    // They were tightened again after measuring the hull at 194 of 2880 px across
+    // (6.7 % of frame width) in shots/presentation_fix/hero.png. The lever here is
+    // distance, deliberately *not* FOV: the field of view is shared by every
+    // harness preset, and narrowing it would silently reframe the water, boat and
+    // rider subsystems' capture sets as well as flattening the speed cue.
+    const dist =
+      cfg.distance * CHASE_DIST_TRIM * (1 + s.speedFrac * 0.22) + this.airLift * 1.5;
+    const height =
+      cfg.height * CHASE_HEIGHT_TRIM * (1 + s.speedFrac * 0.1) - this.airLift * 1.5;
+
+    // Damped vertical follow, and the landing dip on top of it. Everything the
+    // rig hangs off vertically comes from `followY`, so the hull's own height is
+    // free to read as height in frame.
+    const yRate = s.airborne ? FOLLOW_Y_RATE_AIR : FOLLOW_Y_RATE;
+    this.followY = this.snapNext ? target.y : damp(this.followY, target.y, yRate, dt);
+    const baseY = this.followY - this.landKick * 0.75;
 
     // Rail offset: slide the rig toward the outside of the slide so the drift is
     // seen across the hull's flank instead of down its centreline.
@@ -223,7 +292,7 @@ export class ChaseCamera implements CameraRig {
 
     _desired.set(
       target.x - Math.sin(this.yaw) * dist + rightX * this.railOffset,
-      target.y + height,
+      baseY + height,
       target.z - Math.cos(this.yaw) * dist + rightZ * this.railOffset,
     );
 
@@ -235,7 +304,9 @@ export class ChaseCamera implements CameraRig {
     // Look ahead of the boat, further at speed.
     _look.set(
       target.x + Math.sin(this.yaw) * cfg.lookAhead * (0.5 + s.speedFrac),
-      target.y + 0.4 - s.speedFrac * 0.5,
+      // Airborne, the look point drops as well as the rig, so the hull climbs
+      // toward the top of frame instead of the whole composition translating.
+      baseY + 0.4 - s.speedFrac * 0.5 - this.airLift * 0.8,
       target.z + Math.cos(this.yaw) * cfg.lookAhead * (0.5 + s.speedFrac),
     );
     if (this.snapNext) this.lookAt.copy(_look);
@@ -245,9 +316,15 @@ export class ChaseCamera implements CameraRig {
     // both of those are "the world is being thrown sideways", which is what the
     // tilt is meant to say. Capped low; past ~3.5° it reads as a bug.
     const yawErr = Math.atan2(Math.sin(desiredYaw - this.yaw), Math.cos(desiredYaw - this.yaw));
-    const rollTarget =
+    let rollTarget =
       clamp(s.lateralSpeed * 0.014 + yawErr * 0.6, -0.075, 0.075) * (0.35 + s.speedFrac * 0.65);
-    this.roll = damp(this.roll, rollTarget, 3.6, dt);
+    // Re-entry tilt spike, signed by which way the hull was already leaning so it
+    // reads as the slam knocking the rig rather than as a random jolt.
+    rollTarget += this.landKick * 0.045 * (s.roll >= 0 ? 1 : -1);
+    // Hard ceiling on the total. Past ~4.3° the horizon reads as a bug rather
+    // than as a camera reacting, and drift roll plus a slam can otherwise stack
+    // to nearly 7°.
+    this.roll = damp(this.roll, clamp(rollTarget, -0.075, 0.075), 3.6, dt);
   }
 
   private smoothFollow(desired: Vector3, stiffness: number, dt: number) {
