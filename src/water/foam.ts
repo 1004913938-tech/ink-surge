@@ -45,8 +45,10 @@ import {
   LinearMipmapLinearFilter,
   Mesh,
   NormalBlending,
+  Quaternion,
   ShaderMaterial,
   Texture,
+  Vector3,
 } from 'three';
 import { GERSTNER_GLSL, waveUniformArrays } from './gerstner';
 import { CONFIG } from '../core/config';
@@ -55,6 +57,56 @@ import { SHARED } from '../render/celMaterial';
 import { makeNoiseTexture } from '../render/textures';
 import { SprayField } from './spray';
 import type { GameContext, Racer } from '../core/types';
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Hull wetness — how much water FX a hull is entitled to, this frame
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Three points down the keel line, boat-local. Not the buoyancy probes and not
+ * the physics contact table — those belong to the boat subsystem. This is the
+ * water's own answer to "is there a waterline to draw?", measured against the
+ * one shared wave field, which is the only way the collar can be guaranteed to
+ * agree with the surface it is drawn on.
+ */
+const KEEL_LINE: readonly Vector3[] = [
+  new Vector3(0, -0.1, 1.9), // forefoot
+  new Vector3(0, -0.32, 0.0), // keel amidships — the deepest part of the shell
+  new Vector3(0, -0.4, -1.9), // run aft to the transom
+];
+
+const _keelQ = new Quaternion();
+const _keelP = new Vector3();
+
+/**
+ * 1 while any part of the keel is in the water, ramping to 0 a third of a metre
+ * clear of it.
+ *
+ * ── Why this is not `state.airborne` ────────────────────────────────────────
+ * It used to be. Every hull water effect — collar, wake, spray — was gated on
+ * that one boolean, so any frame in which the flag was set arrived with the boat
+ * pasted onto the surface: no collar, no bow wave, no wake head, no spray, a
+ * razor-sharp polygon edge at the waterline. The r3 review found exactly that in
+ * hero.png and ocean_low.png (both `airborne = true` at 28 m/s with the hull
+ * visibly in contact) and reported "no foam ring around any hull, in any of the
+ * fifteen shots" as the set's largest single defect.
+ *
+ * A boolean owned by another subsystem is the wrong input for a *continuous*
+ * visual quantity in any case. Wetness is graded, so a hull with five
+ * centimetres of keel in the water still gets a collar, a hull leaving a crest
+ * has its collar fade over ~0.1 s instead of snapping off, and no amount of
+ * retuning the airborne latch can silently delete the water FX again.
+ */
+function hullWetness(ctx: GameContext, racer: Racer): number {
+  _keelQ.setFromEuler(racer.root.rotation);
+  let clearance = Infinity;
+  for (let i = 0; i < KEEL_LINE.length; i++) {
+    _keelP.copy(KEEL_LINE[i]).applyQuaternion(_keelQ).add(racer.root.position);
+    const c = _keelP.y - ctx.ocean.height(_keelP.x, _keelP.z, ctx.time);
+    if (c < clearance) clearance = c;
+  }
+  return 1 - Math.min(1, Math.max(0, clearance / 0.34));
+}
 
 /** Trail samples per boat. 96 × ~1.15 m ≈ 110 m of visible wake. */
 const POINTS = 96;
@@ -210,6 +262,8 @@ export class WakeRibbons {
         uFoam: { value: PAL.foam.clone() },
         uFoamShade: { value: PAL.foamShade.clone() },
         uCrest: { value: PAL.waterCrest.clone() },
+        /** The ribbon draws its own contour; nothing else can ink it. */
+        uInk: { value: PAL.inkSoft.clone() },
         /**
          * Metres above the surface the ribbon sits. The ocean mesh draws the
          * *band-limited* field and the ribbon the raw one, so they differ by a
@@ -222,6 +276,13 @@ export class WakeRibbons {
         uTile: { value: 5.6 },
         /** Cutout, so this is 1. Kept as a uniform for the critic loop only. */
         uOpacity: { value: 1.0 },
+        /**
+         * Width of the ribbon's own ink contour, in device pixels. The wake never
+         * enters the G-buffer (it would scribble Sobel lines across the swell and
+         * the ocean reads that buffer for its contact mask), so if the foam is to
+         * have a drawn edge it has to draw it itself.
+         */
+        uInkPx: { value: 2.6 },
       },
       vertexShader: /* glsl */ `
         ${GERSTNER_GLSL}
@@ -260,8 +321,8 @@ export class WakeRibbons {
         precision highp float;
 
         uniform sampler2D uNoise;
-        uniform vec3 uFoam, uFoamShade, uCrest;
-        uniform float uTime, uLife, uTile, uOpacity;
+        uniform vec3 uFoam, uFoamShade, uCrest, uInk;
+        uniform float uTime, uLife, uTile, uOpacity, uInkPx;
 
         varying float vSide;
         varying float vAge;
@@ -273,53 +334,69 @@ export class WakeRibbons {
           float life = clamp(1.0 - vAge / uLife, 0.0, 1.0);
           float v = abs(vSide);
 
-          // Dissipation noise. Sampled first because the ribbon's cross-section
-          // is warped by it as well as being masked with it. Three scales so the
-          // holes are lacy and the rail edges are chewed rather than ruled.
+          // ── Dissipation noise, with an 8 px floor on feature size ─────────
+          // The r3 review measured the wake's boundary as "a salt-and-pepper
+          // stipple of isolated 2–4 px squares". A hard threshold against a noise
+          // field stops being an edge and becomes a dither the moment the field's
+          // features approach a pixel, so every octave has to be gated on whether
+          // it is drawable — and the gate has to use the octave's REAL feature
+          // size, which is where the previous version went wrong.
           //
-          // The finest channel is dropped once it stops being a drawable shape.
-          // Keeping it produced the 1 px white fringe along every stripe edge in
-          // the r13 capture — a threshold against a sub-pixel field is a dither,
-          // not an edge.
+          // The noise map packs r = fbm (feature ≈ tile/7), g = one octave
+          // (tile/14) and b = one octave (tile/112). The old code gated the b
+          // channel of a fetch taken at 3.7× the base rate against an estimate of
+          // tile/26 — a feature size twelve times too generous. Its true size is
+          // uTile/(3.7·112) = 1.4 cm, which is sub-pixel at *any* camera distance
+          // in this game, so a sub-pixel field was reaching a step() every frame.
+          // That is the stipple, and once the ribbon gained a signed-distance
+          // contour it became salt-and-pepper *ink* as well, because the gradient
+          // of a sub-pixel field is random per pixel.
+          //
+          // The b channel is therefore gone, not gated: it is never drawable. The
+          // two survivors are gated on 8–16 px using their actual scales.
           float fp = max(max(fwidth(vWorldPos.x), fwidth(vWorldPos.z)), 1e-5);
-          float wFine = smoothstep(fp * 2.4, fp * 5.0, uTile / 26.0);
+          float wMid = smoothstep(fp * 8.0, fp * 16.0, uTile / 14.0);
+          float wFine = smoothstep(fp * 8.0, fp * 16.0, uTile / 51.8);
           vec2 uv = vWorldPos.xz / uTile;
           vec4 nA = texture2D(uNoise, uv + vec2(uTime * 0.01, uTime * -0.006));
           vec4 nB = texture2D(uNoise, uv * 3.7 - vec2(uTime * 0.03, 0.0));
-          float wSum = 0.64 + 0.36 * wFine;
-          float grain = (nA.r * 0.44 + nA.g * 0.2 + (nB.b * 0.22 + nB.g * 0.14) * wFine) / wSum;
+          float wSum = 0.60 + 0.26 * wMid + 0.14 * wFine;
+          float grain = (nA.r * 0.60 + nA.g * 0.26 * wMid + nB.g * 0.14 * wFine) / wSum;
           grain = clamp(0.5 + (grain - 0.5) * 1.35, 0.0, 1.0);
 
-          // Across-ribbon profile, three parts:
-          //   • two narrow divergent crest lines — a *ridge* at |v| ≈ 0.86, not a
-          //     ramp from the middle outward. The r7 capture had these as
-          //     smoothstep(0.50, 0.97), which covers half the ribbon on each side;
-          //     with the interior fill on top the whole wake became a solid white
-          //     highway with a few holes in it.
+          // ── Across-ribbon profile ─────────────────────────────────────────
+          //   • two divergent foam rails — a *ridge*, not a ramp from the middle
           //   • solid churn immediately behind the transom
-          //   • a sparse turbulent field between the rails, so the water inside
-          //     the V is disturbed without being painted
-          // The rail's centre line and width are both noise-modulated, so it is a
-          // chewed foam ridge rather than a ruled lane marking — which is what the
-          // r8 capture showed when both were constants.
-          float railPos = 0.86 + (grain - 0.5) * 0.13;
-          float railW = 0.13 + grain * 0.07;
+          //   • a sparse turbulent field between the rails
+          //
+          // The rails sit at |v| ≈ 0.72 rather than 0.86, and coverage is taken to
+          // zero before |v| = 1. That is the fix for the single worst thing in the
+          // r3 wake: at 0.86 with a ±0.2 width the rail ran *past* the strip's own
+          // edge, so its outer boundary was not the foam's silhouette at all — it
+          // was the geometry's, and the geometry is a straight strip. Hence "the
+          // right band's left edge is a perfectly straight line for 400 px". A
+          // foam shape may never be clipped by its own carrier quad.
+          float railPos = 0.72 + (grain - 0.5) * 0.15;
+          float railW = 0.11 + grain * 0.06;
           float rail = 1.0 - smoothstep(0.0, railW, abs(v - railPos));
-          float centre = 1.0 - smoothstep(0.0, 0.5, v);
-          float head = 1.0 - smoothstep(1.5, 9.0, vRun);
-          float fill = (1.0 - smoothstep(0.5, 1.0, v)) * 0.22;
-          float edge = rail;
-          float shape = max(max(rail * 0.9, centre * head), fill * (0.35 + 0.65 * life));
+          float centre = 1.0 - smoothstep(0.0, 0.38, v);
+          // 9 m of solid churn behind the transom was a white slab from a low
+          // camera. 5 m is a churn *head*, which is what it is for.
+          float head = 1.0 - smoothstep(1.2, 5.0, vRun);
+          float fill = (1.0 - smoothstep(0.42, 0.95, v)) * 0.24;
+          float shape = max(max(rail * 0.95, centre * head), fill * (0.3 + 0.7 * life));
+          // Hard taper before the carrier's edge. Nothing reaches |v| = 1.
+          shape *= 1.0 - smoothstep(0.86, 0.99, v);
 
           // ── Dissipation ──────────────────────────────────────────────────
-          // Coverage must reach *zero* before the sample expires, otherwise the
-          // ribbon ends in a straight cut edge — and a stationary boat keeps a
-          // full-strength wake, which the r13 results shot showed. The
-          // smoothstep(0, 0.34, life) term below was missing: it takes coverage to zero
-          // over the last ~0.95 s, so the tail breaks into islands and goes.
-          float fadeOut = smoothstep(0.0, 0.34, life);
+          // Coverage must reach *zero* before the sample expires, and it has to
+          // get there faster than linearly or the tail reads as a painted band
+          // that simply stops. life² spends most of the trail's length visibly
+          // breaking up, which is what "spreads and dissipates" means.
+          float fadeOut = smoothstep(0.0, 0.30, life);
+          float aged = life * life;
           float coverage = clamp(
-            shape * fadeOut * (0.34 + 0.66 * life) * (0.42 + 0.72 * vPower), 0.0, 0.8);
+            shape * fadeOut * (0.16 + 0.84 * aged) * (0.42 + 0.72 * vPower), 0.0, 0.78);
 
           // ── Hard cutout, no soft alpha ───────────────────────────────────
           // The whole foam layer is an alpha *cutout*: the mask is 0 or 1 and the
@@ -328,15 +405,42 @@ export class WakeRibbons {
           // tones and made the foam layer look like a different render from the
           // water. Fading is expressed as *less coverage* and as a *lower tone*,
           // never as transparency.
-          float mask = step(1.0 - coverage, grain);
-          if (mask < 0.5) discard;
+          //
+          // sd is the signed distance to that cutout in coverage units, and it
+          // is what turns a threshold into a drawn shape: dividing by its own
+          // screen gradient converts it to PIXELS, so the ribbon can put a
+          // constant-width ink contour on its outer silhouette and quantise a
+          // shadow tone just inside it. That is the difference between a shape
+          // with an edge and a noise-thresholded quad.
+          float sd = coverage - (1.0 - grain);
+          if (sd < 0.0) discard;
 
-          // Three committed values, chosen by step(). Only the freshest, most
-          // powerful churn on the crest lines clears the flare pass's threshold,
-          // so the wake never blooms into a glowing tube.
-          float hot = step(0.5, life) * step(0.45, max(edge, centre * head)) * step(0.35, vPower);
-          vec3 col = mix(uCrest, uFoamShade, step(0.30, life));
+          // The contour is measured against the COARSE silhouette, not the full
+          // grain. Inking the full grain looked right in principle and was wrong in
+          // practice: a foam island the size of the finest live octave is narrower
+          // than the ink width, so it comes out entirely ink — a scatter of dark
+          // dots through the white, which is the r3 stipple in a new colour. The
+          // coarse channel's features are ~0.8 m (30–60 px at chase range), so its
+          // boundary is a line long enough to draw, and the finer octaves still
+          // chew holes in the fill inside it.
+          float sdLo = coverage - (1.0 - clamp(0.5 + (nA.r - 0.5) * 1.35, 0.0, 1.0));
+          float loPx = sdLo / max(length(vec2(dFdx(sdLo), dFdy(sdLo))), 1e-5);
+
+          // ── Three committed values plus ink ──────────────────────────────
+          // Outermost 2.6 px: the contour. Then a pale-cyan shadow rim. Then the
+          // body, whose tone drops down the ladder as the sample ages. Only fresh,
+          // powerful churn on the rails reaches uFoam, so the wake never blooms.
+          float hot = step(0.55, aged) * step(0.4, max(rail, centre * head))
+                    * step(0.35, vPower);
+          vec3 col = mix(uCrest, uFoamShade, step(0.26, aged));
           col = mix(col, uFoam, hot);
+          // Shadow side: a band of pale cyan just inside the silhouette, so the
+          // foam mass has a lit face and a turned-away face instead of being one
+          // flat value across its whole width.
+          float onEdge = step(0.0, sdLo);
+          col = mix(col, uCrest,
+                    onEdge * step(loPx, uInkPx * 3.4) * (1.0 - step(loPx, uInkPx)));
+          col = mix(col, uInk, onEdge * step(loPx, uInkPx));
 
           gl_FragColor = vec4(col, uOpacity);
         }
@@ -380,7 +484,7 @@ export class WakeRibbons {
     if (t.count < POINTS) t.count++;
   }
 
-  update(ctx: GameContext, racers: Racer[]) {
+  update(ctx: GameContext, racers: Racer[], wetness: Float32Array) {
     const dt = ctx.dt;
     const pos = this.aPos.array as Float32Array;
     const ages = this.aAge.array as Float32Array;
@@ -414,7 +518,11 @@ export class WakeRibbons {
       // samples through the whole flight, which walked the ring buffer forward
       // and erased the trail; the foam_wake capture came back with a boat in
       // mid-air and no wake at all behind it.
-      const laying = speed > 1.6 && !s.airborne;
+      //
+      // The contact test is the water's own graded wetness, not `state.airborne`.
+      // See `hullWetness` — in r3 the flag was set on five of fifteen shots with
+      // the hull visibly planing, and every one of those frames lost its wake head.
+      const laying = speed > 1.6 && wetness[r] > 0.3;
       // Lateral is the travel perpendicular; from the hull axis it is (fz, -fx).
       const w0 = beam * 0.42 + speed * 0.028 + (s.drifting ? 0.55 : 0.0);
       const power = Math.min(
@@ -515,8 +623,18 @@ export class WakeRibbons {
  * water, carrying an elliptical annulus mask in local hull space. One mesh, one
  * draw call, four boats.
  */
-const COLLAR_U = 11;
-const COLLAR_V = 15;
+/**
+ * Collar lattice density.
+ *
+ * 11 × 15 over a 5.9 × 10.6 m patch is a 0.6 × 0.76 m cell, and each vertex is
+ * placed on the raw wave field, so the patch is a piecewise-linear chord across a
+ * curved surface. On a crest the chord passes *below* the ocean mesh by more than
+ * the 13 cm lift, and those cells are depth-rejected — which is what the r6
+ * capture showed as a collar present aft and absent at the bow, with straight
+ * diagonal boundaries between the two. 15 × 21 quarters the sagitta.
+ */
+const COLLAR_U = 15;
+const COLLAR_V = 21;
 
 export class HullCollars {
   readonly mesh: Mesh;
@@ -590,13 +708,33 @@ export class HullCollars {
         uFoam: { value: PAL.foam.clone() },
         uFoamShade: { value: PAL.foamShade.clone() },
         uCrest: { value: PAL.waterCrest.clone() },
-        uLift: { value: 0.13 },
+        uInk: { value: PAL.inkSoft.clone() },
+        /**
+         * 13 cm was not enough to clear the difference between the raw field this
+         * patch rides and the band-limited field the ocean mesh draws, plus the
+         * sagitta of the patch's own tessellation. See COLLAR_V.
+         */
+        uLift: { value: 0.2 },
         uTile: { value: 3.3 },
-        /** Inner radius of the annulus, in normalised hull-footprint units. */
-        uInner: { value: 0.7 },
-        uOuter: { value: 1.66 },
+        /**
+         * Inner and outer radius of the annulus, in units where 1.0 is the hull's
+         * own outline. 0.80 → 1.42 is a collar that starts hidden under the shell
+         * and spills ~40 cm proud of it at the beam.
+         */
+        uInner: { value: 0.8 },
+        uOuter: { value: 1.42 },
         /** Cutout, so this is 1. Kept as a uniform for the critic loop only. */
         uOpacity: { value: 1.0 },
+        /** Width of the collar's own ink contour, in device pixels. */
+        uInkPx: { value: 2.6 },
+        /**
+         * Bow wave. `uVSpread` is how far the arms splay per unit of hull length
+         * at rest; speed opens them further. Written per frame from the boat's
+         * speed by `HullCollars.update` via aPower, so a stationary boat has a
+         * collar and no V, and a boat at 29 m/s has a wide one.
+         */
+        uVSpread: { value: 0.45 },
+        uVWidth: { value: 0.13 },
       },
       vertexShader: /* glsl */ `
         ${GERSTNER_GLSL}
@@ -619,8 +757,9 @@ export class HullCollars {
       fragmentShader: /* glsl */ `
         precision highp float;
         uniform sampler2D uNoise;
-        uniform vec3 uFoam, uFoamShade, uCrest;
-        uniform float uTime, uTile, uInner, uOuter, uOpacity;
+        uniform vec3 uFoam, uFoamShade, uCrest, uInk;
+        uniform float uTime, uTile, uInner, uOuter, uOpacity, uInkPx;
+        uniform float uVSpread, uVWidth;
         varying vec2 vUv;
         varying float vPower;
         varying vec3 vWorldPos;
@@ -629,12 +768,16 @@ export class HullCollars {
           vec2 uv = vWorldPos.xz / uTile;
           vec4 nA = texture2D(uNoise, uv + vec2(uTime * 0.05, uTime * -0.03));
           vec4 nB = texture2D(uNoise, uv * 2.9 - vec2(uTime * 0.11, 0.0));
-          // Finest channel dropped once it is sub-pixel; a threshold against a
-          // sub-pixel field is a dither fringe, not a hard silhouette.
+          // Feature-size floor, 8–16 px, same rule as the ribbon and the ocean,
+          // and gated on each octave's REAL scale. The old third term was nB.b at
+          // 2.9× the base rate — a feature size of uTile/325 ≈ 1 cm, i.e. sub-pixel
+          // everywhere, and thresholding that is what put a salt-and-pepper fringe
+          // right where the collar's silhouette needed to be a drawn shape.
           float fp = max(max(fwidth(vWorldPos.x), fwidth(vWorldPos.z)), 1e-5);
-          float wFine = smoothstep(fp * 2.4, fp * 5.0, uTile / 26.0);
-          float grain = (nA.r * 0.42 + nA.g * 0.24 + nB.b * 0.34 * wFine)
-                      / (0.66 + 0.34 * wFine);
+          float wMid = smoothstep(fp * 8.0, fp * 16.0, uTile / 14.0);
+          float wFine = smoothstep(fp * 8.0, fp * 16.0, uTile / 40.6);
+          float grain = (nA.r * 0.52 + nA.g * 0.28 * wMid + nB.g * 0.20 * wFine)
+                      / (0.52 + 0.28 * wMid + 0.20 * wFine);
           grain = clamp(0.5 + (grain - 0.5) * 1.3, 0.0, 1.0);
 
           // Elliptical distance in hull-footprint units: 1.0 is the hull's own
@@ -644,35 +787,81 @@ export class HullCollars {
           // r7 capture showed why: threshold a clean ellipse and, however lacy the
           // alpha afterwards, the outer boundary is still a visible circular arc
           // sitting on the water. Warping the metric means there is no arc to see.
-          float e = length(vec2(vUv.x / 0.42, vUv.y / 0.56));
-          e *= 1.0 + (grain - 0.5) * 0.5 + (nB.g - 0.5) * 0.28;
+          // The divisors put e = 1 exactly on the hull's own outline (0.32 × the
+          // patch half-width is 0.94 m against a half-beam of 0.95 m; 0.435 × the
+          // patch half-length is 2.30 m against a half-length of 2.30 m). They used
+          // to be 0.42/0.56, i.e. e = 1 sat 30% *outside* the hull, so the whole
+          // annulus was pushed off the waterline and the r5 capture showed the
+          // collar as a floe of foam near the boat rather than a ring welded to it.
+          float e = length(vec2(vUv.x / 0.32, vUv.y / 0.435));
+          // Warp the metric before building the annulus, so there is no clean arc
+          // anywhere. Held to ±0.18 — about a quarter of the annulus width — since
+          // beyond that the ring stops being a ring.
+          e *= 1.0 + (grain - 0.5) * 0.22 + (nB.g - 0.5) * 0.14;
 
-          // The collar must be a *thick* band, not a hairline: the r13 capture
-          // showed the hull meeting the water as a hard straight intersection
-          // with visible dark water under the keel, and a two-pixel ring would
-          // not have fixed that. It starts inside the hull's own footprint (the
-          // hull covers that part) and spills well outside it.
-          float annulus = smoothstep(uInner, uInner + 0.2, e)
-                        * (1.0 - smoothstep(uOuter * 0.62, uOuter, e));
+          // The collar must be a *thick* band, not a hairline: the r3 review found
+          // the waterline was "a razor-sharp geometric polygon edge with the water
+          // band colour changing on the very next pixel", and a two-pixel ring
+          // would not fix that. It starts inside the hull's own footprint (the hull
+          // covers that part) and spills well outside it.
+          float annulus = smoothstep(uInner, uInner + 0.14, e)
+                        * (1.0 - smoothstep(uOuter * 0.72, uOuter, e));
           // Bow push and stern churn: the water piles up ahead of the hull and
           // boils behind it, so the collar is not a uniform ring.
-          float bow = smoothstep(0.15, 0.85, vUv.y) * 0.5;
-          float stern = smoothstep(-0.1, -0.85, vUv.y) * 0.8;
-          float shape = annulus * (0.55 + bow + stern);
+          // ...but it must be *continuous* all the way round first. At a 0.55 base
+          // the amidships collar — the part a chase camera actually sees — sat at
+          // the minimum and the noise ate most of it.
+          float bow = smoothstep(0.1, 0.6, vUv.y) * 0.32;
+          float stern = smoothstep(-0.1, -0.8, vUv.y) * 0.55;
+          float shape = annulus * (0.78 + bow + stern);
 
-          // ── Hard cutout, three committed values ──────────────────────────
-          // Same rule as the ribbon: the mask is 0 or 1 and the fragment is
-          // opaque. Alpha-blending a quantised foam tone over quantised water is
-          // what produced the soft pastel amoebas in the near field.
-          // Capped below 1 so the noise always has range left to bite holes with:
-          // four grid-start collars merging at full coverage is the "spilled paint
-          // puddle" the countdown capture showed.
-          float coverage = clamp(shape * (0.45 + 0.8 * vPower), 0.0, 0.85);
-          float mask = step(1.0 - coverage, grain);
-          if (mask < 0.5) discard;
+          // ── Bow wave: two divergent arms off the forefoot ──────────────────
+          // The r3 review asked for "a bow-wave V that scales with speed" — the
+          // cue that reads as hull speed and hull weight. Its arms leave the bow
+          // and splay aft, so the apex is welded to the stem and the legs are
+          // where the displaced water actually runs. The splay angle opens with
+          // vPower, i.e. with speed, which is what makes it a speed cue rather
+          // than decoration.
+          // apex 0.46 puts it on the stem (0.46 × 5.29 m = 2.43 m forward).
+          float apex = 0.46;
+          float aft = clamp(apex - vUv.y, 0.0, 2.0);
+          float spread = uVSpread * (0.55 + 0.75 * vPower);
+          float arm = abs(abs(vUv.x) - (0.16 + spread * aft));
+          float vwid = uVWidth * (1.0 + 0.9 * aft);
+          float vee = (1.0 - smoothstep(0.0, vwid, arm))
+                    * step(vUv.y, apex)
+                    // ...and it fades out well inside the patch, so the arms end
+                    // in foam breaking up rather than at the carrier's edge.
+                    * (1.0 - smoothstep(0.55, 1.4, aft))
+                    * (1.0 - smoothstep(0.72, 0.96, abs(vUv.x)))
+                    * smoothstep(0.12, 0.45, vPower);
+          shape = max(shape, vee * 1.15);
 
-          vec3 col = mix(uCrest, uFoamShade, step(0.34, coverage));
-          col = mix(col, uFoam, step(0.7, coverage) * step(0.4, vPower));
+          // ── Hard cutout, then a drawn edge ───────────────────────────────
+          // The mask is 0 or 1 and the fragment is opaque; fading is expressed as
+          // less coverage and a lower tone, never as transparency. Capped below 1
+          // so the noise always has range left to bite holes with — four grid-start
+          // collars merging at full coverage is the "spilled paint puddle" the
+          // countdown capture showed.
+          float coverage = clamp(shape * (0.45 + 0.8 * vPower), 0.0, 0.86);
+          float sd = coverage - (1.0 - grain);
+          if (sd < 0.0) discard;
+          // Signed distance converted to PIXELS. This is what makes the collar a
+          // hard two-tone *shape with a contour* rather than an alpha falloff:
+          // outermost 2.6 px is ink, the next band is the pale-cyan shadow side,
+          // and the interior is white churn.
+          //
+          // Measured against the COARSE channel for the same reason as the ribbon:
+          // a foam island narrower than the ink width would otherwise come out
+          // entirely ink, i.e. as dark speckle inside the collar.
+          float sdLo = coverage - (1.0 - clamp(0.5 + (nA.r - 0.5) * 1.3, 0.0, 1.0));
+          float loPx = sdLo / max(length(vec2(dFdx(sdLo), dFdy(sdLo))), 1e-5);
+          float onEdge = step(0.0, sdLo);
+
+          vec3 col = mix(uFoamShade, uFoam, step(0.42, coverage));
+          col = mix(col, uCrest,
+                    onEdge * step(loPx, uInkPx * 3.2) * (1.0 - step(loPx, uInkPx)));
+          col = mix(col, uInk, onEdge * step(loPx, uInkPx));
           gl_FragColor = vec4(col, uOpacity);
         }
       `,
@@ -689,7 +878,7 @@ export class HullCollars {
     return this.material.uniforms;
   }
 
-  update(_ctx: GameContext, racers: Racer[]) {
+  update(_ctx: GameContext, racers: Racer[], wetness: Float32Array) {
     const pos = this.aPos.array as Float32Array;
     const powers = this.aPower.array as Float32Array;
     const per = COLLAR_U * COLLAR_V;
@@ -706,14 +895,18 @@ export class HullCollars {
       const rx = fz;
       const rz = -fx;
       const speed = Math.abs(s.forwardSpeed);
-      // Airborne hulls have no waterline, so the collar fades out rather than
-      // sliding along the water underneath a boat that is not touching it.
+      // A hull with no waterline has no collar, so the collar is scaled by the
+      // water's own graded wetness rather than by `state.airborne`: it fades over
+      // the ~10 cm the keel takes to leave the surface instead of snapping off the
+      // instant another subsystem's boolean latches. That boolean is what removed
+      // the collar from hero.png and ocean_low.png in r3.
+      //
       // A hull sitting still still displaces water, so the floor is well above
       // zero: the results screen has speed 0 and the boats must not go back to
       // being pasted onto a plane.
-      const power = s.airborne
-        ? 0
-        : Math.min(1, 0.38 + speed / CONFIG.boat.topSpeed + Math.abs(s.lateralSpeed) * 0.1);
+      const power =
+        Math.min(1, 0.38 + speed / CONFIG.boat.topSpeed + Math.abs(s.lateralSpeed) * 0.1) *
+        wetness[r];
 
       const base = r * per;
       for (let k = 0; k < per; k++) {
@@ -752,6 +945,12 @@ export class WaterFX {
   readonly collars: HullCollars;
   readonly spray: SprayField;
 
+  /**
+   * Per-racer hull wetness, recomputed once per frame and shared by all three
+   * effects. Preallocated — the frame loop allocates nothing.
+   */
+  private wetness = new Float32Array(4);
+
   constructor(racerCount = CONFIG.race.racerCount) {
     // A private cache key so switching this map to trilinear cannot affect any
     // other subsystem's use of makeNoiseTexture.
@@ -771,9 +970,11 @@ export class WaterFX {
   }
 
   update(ctx: GameContext) {
-    this.wake.update(ctx, ctx.racers);
-    this.collars.update(ctx, ctx.racers);
-    this.spray.update(ctx, ctx.racers);
+    const n = Math.min(ctx.racers.length, this.wetness.length);
+    for (let i = 0; i < n; i++) this.wetness[i] = hullWetness(ctx, ctx.racers[i]);
+    this.wake.update(ctx, ctx.racers, this.wetness);
+    this.collars.update(ctx, ctx.racers, this.wetness);
+    this.spray.update(ctx, ctx.racers, this.wetness);
   }
 
   dispose() {

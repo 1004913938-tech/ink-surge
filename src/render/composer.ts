@@ -77,6 +77,28 @@ const EdgeShader = {
     tFlare: { value: null as any },
     uResolution: { value: new Vector2() },
     uInkColor: { value: paletteTone(PAL.ink) },
+    /**
+     * The *light* ink. See the HALO block in the shader: where a silhouette
+     * falls on a background darker than the ink, a dark line cannot be seen and
+     * the contour is drawn in this tone instead.
+     */
+    uHaloColor: { value: paletteTone(PAL.waterCrest) },
+    /**
+     * Linear luminance below which a background counts as "darker than ink".
+     * The ocean's five bands measure 0.033 (its second-darkest) and 0.136 (its
+     * mid band) in linear luminance, so 0.062 splits them: the two bands that
+     * swallow the ink get a light contour, the three that do not are untouched.
+     */
+    uHaloThreshold: { value: 0.062 },
+    /** Light-contour width, device px. Matched to the ink it replaces. */
+    uHaloWidthPx: { value: 3.2 },
+    /**
+     * Radius, device px, inside which the inverted-hull outline is assumed to
+     * have already inked this pixel's silhouette, so the Sobel stays off it.
+     * Must cover the widest shell in the scene (uOutlineMaxPx = 2.8) plus the
+     * Sobel's own reach, or the two lines abut into one doubled band.
+     */
+    uHullOwnedPx: { value: 4.0 },
     /** Line thickness in pixels. */
     uThickness: { value: 1.15 },
     uDepthThreshold: { value: 0.0060 },
@@ -97,7 +119,8 @@ const EdgeShader = {
     uNormalThreshold: { value: 0.235 },
     uEdgeStrength: { value: 0.95 },
     uFlareStrength: { value: 0.24 },
-    uVignette: { value: 0.09 },
+    /** Dead. See `finish()` — a post-band multiplier cannot be part of this look. */
+    uVignette: { value: 0.0 },
     /**
      * Off. This was ±1 LSB of interleaved-gradient noise applied to *every*
      * pixel of the final image, to hide 8-bit contouring in the sky gradient.
@@ -120,6 +143,10 @@ const EdgeShader = {
     uniform sampler2D tFlare;
     uniform vec2 uResolution;
     uniform vec3 uInkColor;
+    uniform vec3 uHaloColor;
+    uniform float uHaloThreshold;
+    uniform float uHaloWidthPx;
+    uniform float uHullOwnedPx;
     uniform float uThickness;
     uniform float uDepthThreshold;
     uniform float uNormalThreshold;
@@ -138,20 +165,55 @@ const EdgeShader = {
     /**
      * Applied last, in the composite, so nothing downstream re-quantises.
      *
-     * The vignette is *stepped*. A continuous pow(radius, 2.4) multiply is a
-     * smooth gradient laid over the entire image, which by itself is enough to
-     * stop any flat fill from being flat — a deck spanning 600 px picked up 40
-     * distinct values from the vignette alone. Two hard rings at eyeballed radii
-     * keep the corner weight (it does carry the composition) while leaving every
-     * fill inside a ring exactly flat.
+     * ── Why there is no vignette any more ──────────────────────────────────
+     * There were two stepped rings here, on the theory that hard steps keep each
+     * fill flat *within* a ring. They do, but every band in the image still came
+     * out in three near-identical variants — one per ring — and that is exactly
+     * what the ramp contract forbids: the final pixel must land on a band.
+     * Measured on shots/r3/hero.png: (2,35,147)/(2,34,145)/(2,33,141) and
+     * (9,100,206)/(9,98,202)/(8,95,197) for a water field with five bands, and
+     * 624 unique colours in the water region. A ~0.97 multiplier applied after
+     * the band lookup is a multiplier applied after the band lookup no matter
+     * how few discrete values it takes.
+     *
+     * uVignette is kept as a uniform so the number is discoverable and dead,
+     * rather than being silently reintroduced by someone re-deriving it.
      */
     vec3 finish(vec3 col, vec2 uv) {
-      vec2 d = (uv - 0.5) * vec2(1.0, 0.94);
-      float r = length(d) * 1.42;
-      float v = 1.0 - uVignette * (step(0.44, r) * 0.38 + step(0.63, r) * 0.62);
-      col *= v;
       float lsb = 0.0034 * pow(max(max(col.r, col.g), col.b), 0.55) * uDither;
       return col + (ditherNoise(gl_FragCoord.xy) - 0.5) * lsb;
+    }
+
+    /**
+     * Highest and lowest G-buffer coverage flag within radPx of this pixel,
+     * as (max, min).
+     *
+     * tDepthId.a is 1 wherever anything wrote the G-buffer and 0 where nothing
+     * did — the sky, the ocean, foam and spray, and every outline shell. So
+     * max == 1 means "geometry is nearby" and min == 0 means "background is
+     * nearby", and a pixel with both is on a silhouette.
+     *
+     * Two rings of eight, at radPx and 55% of it. Eight directions is enough on a
+     * contour — a silhouette is a *line*, so one of eight evenly spaced taps
+     * lands within 22.5 degrees of its perpendicular — and the inner ring stops a
+     * thin object slipping between the outer taps.
+     */
+    vec2 gbufRing(vec2 uv, float radPx) {
+      vec2 r = radPx / uResolution;
+      float hi = 0.0, lo = 1.0;
+      const float K = 0.7071;
+      vec2 dirs[8];
+      dirs[0] = vec2(1.0, 0.0);      dirs[1] = vec2(-1.0, 0.0);
+      dirs[2] = vec2(0.0, 1.0);      dirs[3] = vec2(0.0, -1.0);
+      dirs[4] = vec2(K, K);          dirs[5] = vec2(-K, K);
+      dirs[6] = vec2(K, -K);         dirs[7] = vec2(-K, -K);
+      for (int i = 0; i < 8; i++) {
+        float a = texture2D(tDepthId, uv + dirs[i] * r).a;
+        float b = texture2D(tDepthId, uv + dirs[i] * r * 0.55).a;
+        hi = max(hi, max(a, b));
+        lo = min(lo, min(a, b));
+      }
+      return vec2(step(0.5, hi), step(0.5, lo));
     }
 
     /**
@@ -183,12 +245,61 @@ const EdgeShader = {
       float centreDepth = dc.r;
       float centreId = dc.g;
 
-      // Sky / anything that never wrote the G-buffer: leave it untouched.
+      // ── Nothing wrote the G-buffer here: sky, ocean, foam, outline shells ──
+      //
+      // HALO. This is where the value-adaptive contour is drawn, and it is the
+      // answer to a measured defect: the ink (10,26,46) is L23, the ocean's
+      // second-darkest band (1,22,101) is L25 and its darkest (1,7,40) is L9, so
+      // roughly a quarter of every hull's silhouette was a dark line on an
+      // equally dark or darker field — no readable contour at all
+      // (shots/cel_r2/hud.png: an ink-detector keyed to PAL.ink returns 49,043
+      // water pixels).
+      //
+      // Thickening the line cannot fix a value collision, and the palette's water
+      // bands are not this subsystem's to lift. What an animator does instead is
+      // switch the contour: dark ink over light ground, *light* ink over dark
+      // ground. So on the outside of a silhouette — which is where the
+      // inverted-hull shell has laid its ink, since the shell is only ever
+      // visible outside the surface it belongs to — the local background tone
+      // decides which of the two inks is drawn. The width is one constant number
+      // of device pixels, exactly as with the dark line.
+      //
+      // The background tone is sampled *further out* than the contour, because
+      // the pixel under the contour has already been painted with ink and no
+      // longer carries the ground's value.
       if (dc.a < 0.5 || edgeBias <= 0.001) {
-        vec3 outc = scene + flareAt(vUv);
+        vec3 outc = scene;
+        if (dc.a < 0.5) {
+          vec2 ring = gbufRing(vUv, uHaloWidthPx);
+          vec2 far = (uHaloWidthPx + 4.0) / uResolution;
+          vec3 g0 = texture2D(tDiffuse, vUv + vec2(far.x, 0.0)).rgb;
+          vec3 g1 = texture2D(tDiffuse, vUv - vec2(far.x, 0.0)).rgb;
+          vec3 g2 = texture2D(tDiffuse, vUv + vec2(0.0, far.y)).rgb;
+          vec3 g3 = texture2D(tDiffuse, vUv - vec2(0.0, far.y)).rgb;
+          // Darkest of the four, so a hull sitting half on a bright crest and
+          // half in a trough still gets the light line along the dark half.
+          vec3 ground = min(min(g0, g1), min(g2, g3));
+          float groundLum = dot(ground, vec3(0.2126, 0.7152, 0.0722));
+          float dark = 1.0 - step(uHaloThreshold, groundLum);
+          outc = mix(outc, uHaloColor, ring.x * dark);
+        }
+        outc += flareAt(vUv);
         gl_FragColor = vec4(finish(outc, vUv), 1.0);
         return;
       }
+
+      // HULL-OWNED SILHOUETTES. The inverted hull draws every exterior contour,
+      // so the screen-space pass must not draw one too — two lines abutting is
+      // the measured 6-7 device-px two-tone band on the course gates, double the
+      // 3 px the boats carry. The old test for this was the *magnitude* of the
+      // depth gradient, which is only a proxy and got it wrong in both
+      // directions: it let a distant gate's silhouette through, and it suppressed
+      // the rider's arm-over-torso boundary, which is not an exterior silhouette
+      // at all and which the shell physically cannot draw (the arm rests on the
+      // chest, so the shell's back face is at the contact depth and loses the
+      // depth test). Ask the question directly instead: is background within
+      // uHullOwnedPx? If so the shell owns this contour; if not, the Sobel does.
+      float hullOwned = 1.0 - gbufRing(vUv, uHullOwnedPx).y;
 
       vec3 centreNormal = nc.rgb * 2.0 - 1.0;
 
@@ -245,19 +356,22 @@ const EdgeShader = {
       float grazeThr = uNormalThreshold * mix(2.4, 1.0, smoothstep(0.10, 0.45, facing));
       normalEdge = smoothstep(grazeThr, grazeThr * 1.75, normalDiff);
 
-      // A very large depth gradient *is* a silhouette, and the inverted hull
-      // already inked it. Rolling *both* screen-space signals off there is what
-      // stops the two systems doubling up into a fat, dirty edge — the normal
-      // signal has to be rolled off too, because at a silhouette the neighbour
-      // sample lands on unrelated geometry and reads as a 90° crease.
-      float silhouette = smoothstep(uDepthThreshold * 5.0, uDepthThreshold * 14.0, depthGrad);
-      depthEdge *= (1.0 - silhouette * 0.92);
-      normalEdge *= (1.0 - silhouette * 0.80);
+      // Object-over-object silhouettes — a boat crossing a gate, a rider's helmet
+      // against the deck — are not adjacent to background, so hullOwned cannot
+      // see them, but the shell does draw them (there is a real depth gap for it
+      // to win). Those are the only case the depth-gradient proxy is still needed
+      // for, so the thresholds are now set where a genuine metres-deep gap lives
+      // and nothing else: the arm-on-chest case measures ~0.05 relative gradient
+      // and stays fully inked, a hull in front of a gate 40 m behind it measures
+      // an order of magnitude more and does not.
+      float silhouette = max(hullOwned, smoothstep(uDepthThreshold * 30.0, uDepthThreshold * 80.0, depthGrad));
+      depthEdge *= (1.0 - silhouette * 0.96);
+      normalEdge *= (1.0 - silhouette * 0.96);
 
       // Interior lines are the whole reason this pass exists, so the normal
       // signal leads and the depth signal only fills in where two parallel
       // surfaces overlap (a wing over a cowl).
-      float edge = clamp(max(max(depthEdge * 0.85, normalEdge), idDiff * (1.0 - silhouette * 0.9) * 0.8), 0.0, 1.0);
+      float edge = clamp(max(max(depthEdge * 0.85, normalEdge), idDiff * (1.0 - silhouette * 0.96) * 0.8), 0.0, 1.0);
       edge *= edgeBias * uEdgeStrength;
 
       // A line is drawn or it is not there — two weights, hard thresholds.
@@ -273,9 +387,15 @@ const EdgeShader = {
       // stroke.
       edge = step(0.34, edge) * (0.60 + 0.40 * step(0.62, edge));
 
-      // Ink is multiplied in rather than mixed to white-point, so lines sit
-      // *in* the artwork instead of on top of it.
-      vec3 col = mix(scene, uInkColor + scene * 0.20, edge);
+      // One ink value for the whole image.
+      //
+      // This was uInkColor + scene * 0.20, so the screen-space pass drew a
+      // *different* ink from the inverted hull's: measured on the course gates in
+      // shots/r3/hud.png as two abutting families, (10,26,46) from the shell and
+      // (17,34,54)/(16,34,53) from here. Two ink constants side by side is what
+      // makes a doubled edge read as muddy rather than merely thick, and the
+      // brief asks for one ink weight and one ink value everywhere.
+      vec3 col = mix(scene, uInkColor, edge);
       col += flareAt(vUv);
 
       gl_FragColor = vec4(finish(col, vUv), 1.0);

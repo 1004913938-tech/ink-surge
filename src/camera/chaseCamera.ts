@@ -47,7 +47,16 @@ export type CameraPreset =
  * the shared "how far back is a chase camera" default.
  */
 const CHASE_DIST_TRIM = 0.58;
-const CHASE_HEIGHT_TRIM = 0.62;
+/**
+ * Height trim. Dropped from 0.62 (2.6 m over the hull, ~3.5 m over the water)
+ * to 0.44 (1.8 m / ~2.7 m) after a skyline measurement: shots/r3/hero.png — the
+ * only shot in the set framed by this rig — had a skyline deviation range of
+ * 48 px / stdev 13.1, against 90–190 px for every other framing of the same
+ * shader (bow 90, hud 131, ocean_wide 188). A camera looking *down* at swell
+ * foreshortens it into painted markings on a plane; the lower the rig, the more
+ * the crests stand up against the sky and break the horizon line.
+ */
+const CHASE_HEIGHT_TRIM = 0.44;
 
 /**
  * Vertical follow rates, 1/s. The rig tracks the hull's height through a damp,
@@ -168,10 +177,19 @@ export class ChaseCamera implements CameraRig {
     // Normalised against 3.5 m/s rather than the physics slam threshold: an
     // everyday re-entry has to produce a *visible* reaction, or a landing capture
     // contains a landing and shows nothing.
+    // Normalised against 2.0 m/s, not 3.5: the harness hunts `landingImpact > 1.2`
+    // and captures two frames later, which at the old normalisation left the rig
+    // reacting at 0.3 of full strength — a 1.6° FOV change and a 24 cm dip, i.e. a
+    // frame captioned "water re-entry, camera shake" that contained no visible
+    // reaction at all (shots/pres2_r3/land.png). A slam also fires the shake
+    // impulse; nothing else in the game calls `addShake`, so if the camera does not
+    // arm it on re-entry, the shake channel is dead code.
     if (s.landingImpact > 0.4) {
-      this.landKick = Math.max(this.landKick, clamp01(s.landingImpact / 3.5));
+      const k = clamp01(s.landingImpact / 2.0);
+      if (k > this.landKick) this.addShake(k * 0.55);
+      this.landKick = Math.max(this.landKick, k);
     }
-    this.landKick = damp(this.landKick, 0, 4.2, dt);
+    this.landKick = damp(this.landKick, 0, 3.6, dt);
     this.airLift = damp(this.airLift, s.airborne ? 1 : 0, s.airborne ? 6.5 : 3.4, dt);
 
     this.orbitAngle += dt * 0.32;
@@ -203,7 +221,7 @@ export class ChaseCamera implements CameraRig {
       this.fovPunch +
       // A landing throws the frame open for a beat. Unlike a shake this survives
       // a screenshot.
-      this.landKick * 5;
+      this.landKick * 9;
     this.camera.fov = damp(this.camera.fov, targetFov, 5.5, dt);
     this.camera.updateProjectionMatrix();
 
@@ -281,7 +299,7 @@ export class ChaseCamera implements CameraRig {
     // free to read as height in frame.
     const yRate = s.airborne ? FOLLOW_Y_RATE_AIR : FOLLOW_Y_RATE;
     this.followY = this.snapNext ? target.y : damp(this.followY, target.y, yRate, dt);
-    const baseY = this.followY - this.landKick * 0.75;
+    const baseY = this.followY - this.landKick * 1.7;
 
     // Rail offset: slide the rig toward the outside of the slide so the drift is
     // seen across the hull's flank instead of down its centreline.
@@ -320,11 +338,13 @@ export class ChaseCamera implements CameraRig {
       clamp(s.lateralSpeed * 0.014 + yawErr * 0.6, -0.075, 0.075) * (0.35 + s.speedFrac * 0.65);
     // Re-entry tilt spike, signed by which way the hull was already leaning so it
     // reads as the slam knocking the rig rather than as a random jolt.
-    rollTarget += this.landKick * 0.045 * (s.roll >= 0 ? 1 : -1);
-    // Hard ceiling on the total. Past ~4.3° the horizon reads as a bug rather
-    // than as a camera reacting, and drift roll plus a slam can otherwise stack
-    // to nearly 7°.
-    this.roll = damp(this.roll, clamp(rollTarget, -0.075, 0.075), 3.6, dt);
+    rollTarget += this.landKick * 0.075 * (s.roll >= 0 ? 1 : -1);
+    // Ceiling on the total. Steady-state drift roll is capped at 4.3° — past that
+    // a *held* tilt reads as a bug — but a slam is allowed to knock the horizon
+    // to ~8° for the fifth of a second the kick lasts, because that spike is the
+    // only part of a landing that survives a screenshot.
+    const cap = 0.075 + this.landKick * 0.065;
+    this.roll = damp(this.roll, clamp(rollTarget, -cap, cap), 4.6, dt);
   }
 
   private smoothFollow(desired: Vector3, stiffness: number, dt: number) {
@@ -433,6 +453,8 @@ export class ChaseCamera implements CameraRig {
      * keeps the celebrating boat out from behind it.
      */
     let lookBias = 0;
+    /** Vertical bob amplitude, metres. Small on a low hero framing. */
+    let bob = 1.2;
     if (phase === 'countdown') {
       // 0 → 1 across the countdown.
       const k = clamp01(1 + ctx.race.raceTime / CONFIG.race.countdownSeconds);
@@ -440,20 +462,31 @@ export class ChaseCamera implements CameraRig {
       hgt = height * (1.28 - 0.62 * k);
       spd = speed * (1.5 - 0.7 * k);
     } else if (phase === 'results' || phase === 'finished') {
-      // Results: closer and higher than the countdown, and looking well above
-      // the hull so the boat rides the bottom third of frame, clear of the board.
-      r = radius * 0.86;
-      hgt = height * 1.05;
+      // Results: a three-quarter, slightly-low hero framing.
+      //
+      // This used to sit at 4.4 m over a 9.6 m radius, i.e. a 25° downward look —
+      // near enough plan view that the winning boat read as a deck plan and the
+      // rider's raised-fist celebration was seen from above (shots/pres2_base/
+      // results.png). 2.3 m over 8.7 m is a 15° look, which is a hero shot: you
+      // see the flank, the bow rise and the rider's silhouette against the sea.
+      // `lookBias` is pushed further right along camera-right, which drives the
+      // subject further *left* of frame and out from under the board panel.
+      r = radius * 0.78;
+      hgt = height * 0.36;
       spd = speed * 0.6;
-      lookLift = 1.7;
-      lookBias = 5.2;
+      // Just below the camera's own height, so the rig looks very slightly *down*
+      // and the horizon lands near mid-frame. Above it the rig looks up, which
+      // filled the top 40 % of the frame with near-zenith sky.
+      lookLift = 0.8;
+      lookBias = 6.2;
+      bob = 0.75;
     }
 
     this.orbitAngle += ctx.dt * spd;
     const a = this.orbitAngle;
     _orbitPos.set(
       target.x + Math.sin(a) * r,
-      target.y + hgt + Math.sin(a * 0.7) * 1.2,
+      target.y + hgt + Math.sin(a * 0.7) * bob,
       target.z + Math.cos(a) * r,
     );
     // Look slightly *past* the boat so it sits off-centre in frame — a subject

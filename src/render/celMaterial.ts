@@ -168,6 +168,23 @@ export interface CelMaterialOptions {
   vertexColors?: boolean;
   /** Flat-shade the fragment normal — good for faceted, low-poly forms. */
   flatShading?: boolean;
+  /**
+   * Drawn glass banding, 0…1. Hard parallel streaks in *object space*, so they
+   * are painted onto the model rather than sliding across it.
+   *
+   * A large near-white plate has nowhere for the diffuse ramp to land: NdotL is
+   * constant across it, so all four bands collapse to one and the surface reads
+   * as a blank card. Measured on the player's windscreen in
+   * shots/cel_r2/ocean_low.png: a 120x70 device-px parallelogram of one tone.
+   * A cel windscreen is drawn as two or three hard diagonal reflection bands, so
+   * that is what this adds.
+   *
+   * Left at the default it is *auto-gated* to exactly that case — a near-white,
+   * near-neutral surface whose object normal is raked (leaning up and fore/aft).
+   * See GLASS_BANDS in the fragment source for why the gate is where it is, and
+   * pass 0 to opt a material out.
+   */
+  glassBands?: number;
   chunks?: CelChunks;
   name?: string;
 }
@@ -191,6 +208,42 @@ const DEFAULT_RAMP_STOPS = [0.0, 0.30, 0.42, 0.86];
 function hueRatio(c: Color): Color {
   const m = Math.max(c.r, c.g, c.b) || 1;
   return c.clone().multiplyScalar(1 / m);
+}
+
+/**
+ * Pipeline-wide minimum separation between adjacent ramp bands.
+ *
+ * The ramp is a *linear* multiplier and the image is viewed in sRGB, so a step
+ * that looks reasonable as a number can be invisible as a value. Measured on
+ * frames rather than argued: the yellow AI's gunwale stepped (234,213,155) L213
+ * → (241,219,160) L219 and the gate crossbar (255,251,136) L241 →
+ * (255,251,166) L243, i.e. a nominally 4-band ladder delivering three readable
+ * tones. Both ladders had their top two entries at ×0.94 and ×1.0.
+ *
+ * 0.78 in linear multiplier space is ≈ 0.895 in sRGB value space, which on a
+ * white material is a 27 L step — small but decisively visible. Bands closer
+ * than that are pushed apart from the top down (the lit band is the anchor; it
+ * is the one the eye reads the material's colour from).
+ */
+const RAMP_MIN_RATIO = 0.80;
+
+/**
+ * Enforce RAMP_MIN_RATIO on a shadow→light ladder, in place of the caller's
+ * spacing, preserving the caller's hues. Bands are treated as values (brightest
+ * channel) and only ever pushed *down*, never up, so no material gets brighter
+ * than it asked for.
+ */
+function separateRamp(colors: Color[]): Color[] {
+  if (colors.length < 2) return colors;
+  const out = colors.map((c) => c.clone());
+  const val = (c: Color) => Math.max(c.r, c.g, c.b);
+  for (let i = out.length - 2; i >= 0; i--) {
+    const above = val(out[i + 1]);
+    const here = val(out[i]);
+    const cap = above * RAMP_MIN_RATIO;
+    if (here > cap && here > 1e-5) out[i].multiplyScalar(cap / here);
+  }
+  return out;
 }
 
 // The ramp is a *multiplier*, so its steps must be near-neutral with a hue
@@ -259,6 +312,13 @@ const VERT_COMMON = /* glsl */ `
   varying vec3 vColor4;
   /** Outline coverage, 0 on objects too small on screen to carry an ink line. */
   varying float vOutlineFade;
+  /**
+   * Object-space position and the object-space glass gate, packed into one
+   * varying to stay well inside the varying budget (chunk-heavy materials —
+   * the rider carries skinning plus a tint — add their own on top of these).
+   * .xyz is the post-displacement object position, .w is 1 on a raked plate.
+   */
+  varying vec4 vObjPosGlass;
 
   CHUNK_VERTEX_HEAD
 
@@ -283,6 +343,14 @@ const VERT_COMMON = /* glsl */ `
     vViewPos = mvPosition.xyz;
     vWorldNormal = normalize(mat3(modelMatrix) * objectNormal);
     vViewNormal = normalize(normalMatrix * objectNormal);
+
+    // The glass gate, in object space so it selects the same faces however the
+    // hull is pitched or heading. See GLASS_BANDS.
+    {
+      vec3 no = normalize(objectNormal);
+      float raked = step(0.34, no.y) * (1.0 - step(0.87, no.y)) * step(0.34, abs(no.z));
+      vObjPosGlass = vec4(transformed, raked);
+    }
 
     CHUNK_VERTEX_OUTLINE
 
@@ -404,6 +472,8 @@ const FRAG_MAIN = /* glsl */ `
   uniform vec3 uSunDir;
   uniform vec3 uCameraPos;
   uniform float uTime;
+  uniform float uGlassBands;
+  uniform vec3 uGlassShade;
 
   varying vec3 vWorldNormal;
   varying vec3 vViewNormal;
@@ -411,6 +481,7 @@ const FRAG_MAIN = /* glsl */ `
   varying vec3 vViewPos;
   varying vec2 vUv;
   varying vec3 vColor4;
+  varying vec4 vObjPosGlass;
 
   CHUNK_FRAGMENT_HEAD
 
@@ -461,6 +532,41 @@ const FRAG_MAIN = /* glsl */ `
     // no step anywhere across it — quantised Lambert plus three airbrushes.
     // Substitution keeps the flat fill flat: a pixel is either the band tone or
     // the highlight tone, and the boundary between them is one pixel wide.
+
+    // ── Drawn glass bands ───────────────────────────────────────────────────
+    // GLASS_BANDS. Three hard parallel streaks along a fixed object-space axis:
+    // a wide cool "sky" band, a gap, and a narrow bright band. Object space, not
+    // view space, because this is a *painted* reflection — an animator draws two
+    // streaks on a windscreen and leaves them there. A view-dependent version
+    // slides across the pane as the boat turns and immediately reads as a
+    // simulated environment probe, which is the look the brief rules out.
+    //
+    // Why it is gated the way it is. The failure this fixes is specific: a large
+    // near-white plate has a constant NdotL, so the four-band ramp has nowhere
+    // to land and the plate is one flat fill (the windscreen in
+    // shots/cel_r2/ocean_low.png). The gate therefore selects exactly that case
+    // and nothing else:
+    //   • .w  — object normal raked (0.34 < n.y < 0.87, |n.z| > 0.34). Selects
+    //           the windscreen's pane and rejects the deck (n.y ≈ 1), the
+    //           waterline stripe and the grips (n.y ≈ 0), and every axis-aligned
+    //           box face on the boat.
+    //   • near-white, near-neutral base — the "paper" surfaces only. The hull's
+    //           vermilion, the graphite trim, the gates and the rider's tinted
+    //           suit all fail it, so none of them pick up streaks.
+    // Materials can force it on or off with glassBands.
+    {
+      float bright = step(0.80, min(min(baseColor.r, baseColor.g), baseColor.b));
+      float g = dot(vObjPosGlass.xyz, normalize(vec3(0.62, 0.55, -0.56))) * 3.1;
+      float f = fract(g);
+      // One wide band and one narrow band per cycle: two marks read as intent.
+      float wide   = step(0.06, f) * (1.0 - step(0.40, f));
+      float narrow = step(0.56, f) * (1.0 - step(0.66, f));
+      float gate = bright * vObjPosGlass.w * uGlassBands;
+      // Substituted into the shaded tone, like every other mask in this shader,
+      // so the result is still two flat fills with a one-pixel boundary.
+      lit = mix(lit, lit * uGlassShade, wide * gate);
+      lit = mix(lit, mix(lit, uSpecColor, 0.85), narrow * gate);
+    }
 
     // ── Banded specular ─────────────────────────────────────────────────────
     // Two hard thresholds on the Blinn term, never a pow() falloff, gated by
@@ -608,7 +714,7 @@ const DEFAULT_AMBIENT = paletteTone(PAL.waterMid)
 export function createCelMaterial(opts: CelMaterialOptions = {}): CelMaterialSet {
   // A palette tone, so it is corrected; ramp colours are ratios and are not.
   const color = paletteTone(opts.color ?? PAL.hull0);
-  const rampColors = opts.rampColors ?? defaultRamp();
+  const rampColors = separateRamp(opts.rampColors ?? defaultRamp());
   const rampStops = opts.rampStops ?? DEFAULT_RAMP_STOPS;
   const rampAmbient = opts.rampAmbient ?? ambientFromRamp(rampColors, 1.0);
   // The ramp lives in an 8-bit texture, so a ladder whose steps exceed 1.0 (the
@@ -643,6 +749,11 @@ export function createCelMaterial(opts: CelMaterialOptions = {}): CelMaterialSet
     uAmbientColor: { value: paletteTone(opts.ambientColor ?? PAL.waterMid).lerp(paletteTone(PAL.skyHorizon), 0.52) },
     uAmbientStrength: { value: opts.ambientStrength ?? 0.62 },
     uOpacity: { value: opts.opacity ?? 1.0 },
+    uGlassBands: { value: opts.glassBands ?? 1.0 },
+    // The cool tone the wide reflection band multiplies toward. 0.58 is a ~35 L
+    // step down from paper white, which is the separation the rest of the image's
+    // ladders now carry (see RAMP_MIN_RATIO).
+    uGlassShade: { value: hueRatio(paletteTone(PAL.skyMid)).lerp(NEUTRAL, 0.45).multiplyScalar(0.58) },
     uObjectId: { value: opts.objectId ?? nextObjectId() },
     uEdgeBias: { value: opts.edgeBias ?? 1.0 },
     uFlareMask: { value: opts.flareMask ?? 1.0 },
@@ -743,6 +854,19 @@ export function createCelMaterial(opts: CelMaterialOptions = {}): CelMaterialSet
       // visible in the ring outside the silhouette it belongs to.
       transparent: true,
       depthWrite: true,
+      // Slope-scaled depth bias, on top of the constant push in OUTLINE_PUSH.
+      //
+      // The constant push is a fixed number of units-per-pixel, which is the
+      // right amount for a surface facing the camera and far too little for one
+      // seen at a grazing angle: shifting the shell w pixels sideways across a
+      // near-edge-on panel moves it many pixels' worth in *depth*, so it
+      // surfaces back through the panel and draws a dense diagonal hatch across
+      // it — the moiré across the hull's aft flank in shots/cel_r2/ocean_low.png
+      // at 3x. polygonOffset's factor term scales with the polygon's own depth
+      // slope, which is exactly the quantity the constant push cannot see.
+      polygonOffset: true,
+      polygonOffsetFactor: 4,
+      polygonOffsetUnits: 8,
     });
   }
 

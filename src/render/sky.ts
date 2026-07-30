@@ -79,11 +79,23 @@ export function createSky(): Mesh {
       uFlare: { value: paletteTone(PAL.sunFlare) },
       uCloudLit: { value: paletteTone(PAL.cloudLit) },
       uCloudShade: { value: paletteTone(PAL.cloudShade) },
-      // The cloud contour is a *drawn blue line*, not a highlight. It was
-      // PAL.foam — a near-white — which is why shots/r2/sky.png shows a pale
-      // perimeter around the main mass reading as a second, offset contour
-      // outside the shadow band rather than as an edge.
-      uCloudRim: { value: paletteTone(PAL.skyMid).lerp(paletteTone(PAL.cloudShade), 0.40) },
+      /**
+       * The cloud contour, and the tone the deep shadow band leans on. This is
+       * now a real *ink*, not a highlight and not a mid-blue.
+       *
+       * Both previous versions were too light to be seen. PAL.foam read as a
+       * second pale perimeter outside the shadow band; skyMid→cloudShade measured
+       * L169 against cloud bands at L191-L211, i.e. a 20 L "line" on a surface
+       * whose own bands were 19 L apart — the clouds were the one element in the
+       * game with no contour and no readable internal shading, five values inside
+       * a 19 L span (shots/r2/sky.png at x=1300).
+       *
+       * inkSoft→skyZenith is L≈64: a deep blue ink that reads as a drawn line
+       * against every cloud tone, without carrying the near-black weight of
+       * PAL.ink, which belongs to the racers. A sky-blue ink on the sky and a
+       * blue-black ink on the boats keeps the depth order of the image intact.
+       */
+      uCloudRim: { value: paletteTone(PAL.inkSoft).lerp(paletteTone(PAL.skyZenith), 0.5) },
       // Higher = *less* cloud (it is a threshold on the noise field). Raised from
       // 0.585 after two layers of two-octave field covered nearly the whole upper
       // frame in shots/cel_fix6/countdown.png and the sky read as flat overcast
@@ -175,23 +187,57 @@ export function createSky(): Mesh {
         vec2 p = uv * scale;
         float d = cloudField(p, drift);
 
+        // The screen-space rate of change of the shape field, evaluated *before*
+        // any early-out: a return inside a quad makes the derivative of anything
+        // computed after it undefined, and a contour whose width goes undefined
+        // is worse than no contour. This is what makes the line below a constant
+        // number of *pixels* wide instead of a constant slice of the field, which
+        // is a line that gets fatter every metre nearer the camera.
+        //
+        // Bounded, and switched off where the field is undersampled. Near the
+        // horizon the flattened-dome projection compresses several field cycles
+        // into a pixel, so fwidth there is a large fraction of the field's whole
+        // range and an "unbounded 3 px line" becomes a 100 px slab of ink. A line
+        // that cannot be drawn at the right width is not drawn.
+        float aa = min(max(fwidth(d), 1.0e-5), 0.014);
+        float lineOk = 1.0 - step(0.016, fwidth(d));
+
         if (step(cover, d) < 0.5) return vec4(0.0);
 
-        // Lit by default. A fair-weather cumulus is bright even in shadow, so
-        // the shadow bands stay pale — dropping them further turned the mid-sky
-        // clouds into smog in shots/cel_r2/sky.png.
+        // Three tones, spaced by *value*, not by taste: L255 / L211 / L167 in the
+        // final frame. The previous ladder ran L255 / L211 / L181-with-a-L169-line
+        // and read as mush — four of five nominal steps were invisible.
+        //
+        // Lit by default. A fair-weather cumulus is bright even in shadow, so the
+        // shadow bands stay pale — dropping them further turned the mid-sky clouds
+        // into smog in shots/cel_r2/sky.png.
         vec3 col = uCloudLit;
 
         // Erode from the anti-sun side: wide band → cloudShade, narrow band
-        // nearer the edge → one step deeper.
-        float shadeWide = 1.0 - step(cover, cloudField(p - sunUv * 0.34, drift));
+        // nearer the edge → one step deeper. The deep band leans on the *ink*
+        // now, which is what buys it 44 L of separation from cloudShade.
+        float shifted = cloudField(p - sunUv * 0.34, drift);
+        float shadeWide = 1.0 - step(cover, shifted);
         float shadeDeep = 1.0 - step(cover, cloudField(p - sunUv * 0.13, drift));
         col = mix(col, uCloudShade, shadeWide);
-        col = mix(col, mix(uCloudShade, uCloudRim, 0.34), shadeDeep);
+        col = mix(col, mix(uCloudShade, uCloudRim, 0.45), shadeDeep);
 
-        // The contour: a single thin band just inside the silhouette.
-        float edge = 1.0 - step(cover + 0.018, d);
-        col = mix(col, uCloudRim, edge * contour);
+        // The interior shadow boundary, drawn as one hard ink line on the *lit*
+        // side of the terminator — the band where the eroded field has just
+        // cleared cover, not the region below it. Multiplying an "inside
+        // cover + 2aa" mask by the "below cover" mask, which is how this read at
+        // first, gives back the second mask unchanged: the whole shadow side came
+        // out solid ink and both pale bands vanished from the frame
+        // (shots/cel_r3/sky.png, 19.6% of the sky region in one flat L58).
+        float shadeLine = step(cover, shifted) * (1.0 - step(cover + aa * 2.5, shifted));
+        col = mix(col, uCloudRim, shadeLine * contour * lineOk);
+
+        // The silhouette contour: constant screen width, three device pixels, the
+        // same weight the boats carry. Every cloud gets one — they were the only
+        // elements in the frame with no ink at all, which is why they read as flat
+        // vector art pasted behind a cel-shaded game.
+        float edge = 1.0 - step(cover + aa * 3.0, d);
+        col = mix(col, uCloudRim, edge * contour * lineOk);
 
         return vec4(col, 1.0);
       }
@@ -256,7 +302,17 @@ export function createSky(): Mesh {
         // Flattened-dome projection: 'dir.xz / (h + k)'. A true plane ('/h')
         // magnifies without bound at the zenith and leaves the upper sky empty.
         if (h > 0.008) {
+          // Not an *alpha* fade. A cloud composited at 40% opacity is a
+          // semi-transparent card over the sky: its edges go soft, overlapping
+          // layers show through each other, and the pixel lands between two
+          // committed tones instead of on one — measured as soft anti-aliased
+          // cloud edges and see-through stacked layers in
+          // shots/r3/countdown.png. So the horizon and bank falloffs below raise
+          // the cloud *cover threshold* instead, which thins the masses by
+          // shrinking their silhouettes. Every cloud pixel that survives is a
+          // flat, fully opaque fill with a hard edge, in every phase.
           float horizonFade = smoothstep(0.008, 0.075, h);
+          float horizonThin = (1.0 - horizonFade) * 0.30;
 
           // High layer: small, many, drifting faster in uv terms.
           vec2 uvHi = dir.xz / (h + 0.42);
@@ -270,11 +326,16 @@ export function createSky(): Mesh {
           // much larger for the same scale, and the low layer turned into one
           // 1000 px mass filling the middle of shots/cel_fix1/sky.png. Several
           // separate masses with sky between them is the composition.
-          vec4 hi = cloudLayer(uvHi, 3.60, uCloudCover + 0.055, sunUv, 0.0);
+          // The small layer draws its contour too. It was skipped because three
+          // layers of line crossed into spaghetti near the horizon — but that was
+          // with a *pale* rim over semi-transparent masses. With one committed ink
+          // and opaque fills the topmost layer's line simply covers the ones
+          // beneath it, which is how stacked cel layers are supposed to read.
+          vec4 hi = cloudLayer(uvHi, 3.60, uCloudCover + 0.055 + horizonThin, sunUv, 1.0);
 
           // Low layer: bigger masses, slower, sits under the high one.
           vec2 uvLo = dir.xz / (h + 0.20);
-          vec4 lo = cloudLayer(uvLo + 31.7, 1.95, uCloudCover + 0.020, sunUv, 1.0);
+          vec4 lo = cloudLayer(uvLo + 31.7, 1.95, uCloudCover + 0.020 + horizonThin, sunUv, 1.0);
 
           // Flat-bottomed bank hugging the horizon — the cumulus shelf that
           // anchors any anime seascape. Masked to a band in h so it cannot
@@ -285,16 +346,19 @@ export function createSky(): Mesh {
           // read as flat overcast grey-blue — a different palette from the racing
           // shots, which is half of the "not committed across screens" defect.
           float bankBand = smoothstep(0.008, 0.030, h) * (1.0 - smoothstep(0.052, 0.115, h));
+          float bankThin = (1.0 - bankBand) * 0.34;
           vec2 uvBank = dir.xz / (h + 0.085);
           // The bank reads as a shelf only if it is *solid*. Dropping its cover
           // below the other layers made it a lace curtain across the whole
           // horizon (shots/cel_probe3/sun_wide.png), so it now sits slightly
           // above them and gets a coarser field.
-          vec4 bank = cloudLayer(uvBank * 0.36 + 77.0, 0.62, uCloudCover + 0.075, sunUv, 1.0);
+          vec4 bank = cloudLayer(uvBank * 0.36 + 77.0, 0.62, uCloudCover + 0.075 + bankThin, sunUv, 1.0);
 
-          sky = mix(sky, lo.rgb, lo.a * horizonFade * 0.96);
-          sky = mix(sky, bank.rgb, bank.a * bankBand * 0.88);
-          sky = mix(sky, hi.rgb, hi.a * horizonFade);
+          // Hard composites. .a is already 0 or 1 out of cloudLayer, so this is
+          // a flat fill replacing a flat fill.
+          sky = mix(sky, lo.rgb, lo.a);
+          sky = mix(sky, bank.rgb, bank.a);
+          sky = mix(sky, hi.rgb, hi.a);
         }
 
         // ── Sun ─────────────────────────────────────────────────────────────

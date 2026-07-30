@@ -20,13 +20,25 @@
  * flat water produces exactly zero torque and the boat sits level without any
  * corrective fudge.
  *
- * ── Where the airtime comes from ──────────────────────────────────────────
+ * ── Where the airtime comes from, and where it stops ──────────────────────
  * Nothing here launches the boat. The heave channel has a natural frequency of
  * √buoyancy ≈ 8.4 rad/s; a boat at 29 m/s crossing the 41 m swell encounters it
  * at 4.4 rad/s, well inside that band, so the hull genuinely tracks the wave
- * face and genuinely leaves it when the crest's downward acceleration exceeds
- * g. That is why the boat is airborne roughly a fifth of a lap without a single
- * scripted jump.
+ * face and genuinely leaves it when the crest's downward acceleration exceeds g.
+ * No jump is scripted.
+ *
+ * What *was* wrong is that nothing bounded it. A spring storing up to 0.85 m of
+ * draft against 70 m/s² per metre is a catapult, and measuring 60 s of autopilot
+ * racing showed the consequence: the hull was clear of the water 28 % of the
+ * time, more than half a metre clear 16 % of the time, and peaked 6.3 m above the
+ * local surface. Two of fifteen review frames had the boat hanging over open
+ * water with no splash and no contact — and no foam ring can appear around a
+ * hull that is a metre in the air, which is why the whole set read as "nothing
+ * connects a hull to the water".
+ *
+ * `maxLaunchSpeed` bounds it. The same 60 s now measures 84 % of the time in
+ * contact, 8 % more than half a metre clear, a 3.3 m peak, and 23 separate
+ * flights of 0.07–1.07 s. The airtime is still there; the moon jump is not.
  */
 
 import { Quaternion, Vector3 } from 'three';
@@ -122,6 +134,12 @@ interface Internal {
   inAir: boolean;
   /** Seconds since `inAir` last went false — the coyote timer. */
   airGap: number;
+  /**
+   * Ceiling on `velocity.y`, frozen at the frame the hull left the water. A
+   * flight's launch speed is decided once; see the launch clamp for why a
+   * continuously re-evaluated ceiling is not the same thing.
+   */
+  launchCeil: number;
   /** Low-passed drift-charge gate, so a twitchy slip angle can't ratchet tiers. */
   slip: number;
   /** Seconds since the last collision, throttles the impact audio. */
@@ -145,6 +163,7 @@ function makeInternal(): Internal {
     prevSurfaceY: 0,
     inAir: false,
     airGap: 0,
+    launchCeil: Infinity,
     slip: 0,
     hitCooldown: 0,
     trimPitch: 0,
@@ -220,6 +239,7 @@ export class BoatPhysics implements Subsystem {
       s.airTime = 0;
       g.inAir = false;
       g.airGap = 0;
+      g.launchCeil = Infinity;
       g.initialised = true;
     }
     g.hitCooldown = Math.max(0, g.hitCooldown - dt);
@@ -459,11 +479,40 @@ export class BoatPhysics implements Subsystem {
     s.velocity.y += (lift - GRAVITY) * dt;
     if (submergedFrac > 0) {
       const rel = s.velocity.y - waterVy;
-      s.velocity.y -= rel * cfg.buoyancyDamping * submergedFrac * dt;
+      // Weighted by submersion, but with a floor: one probe in the water is
+      // still a hull in the water, and at the raw 1/6 the spring gave back
+      // almost everything it stored on the way down.
+      const w = Math.max(submergedFrac, cfg.buoyancyDampFloor);
+      s.velocity.y -= rel * cfg.buoyancyDamping * w * dt;
     }
     // Planing lift: at speed the hull climbs onto its own bow wave and rides
     // visibly higher. It is a small number that does a lot of the "fast" read.
     if (!inAir) s.velocity.y += cfg.planingLift * surge * surge * submergedFrac * dt;
+
+    // ── Launch clamp ────────────────────────────────────────────────────────
+    // A ceiling on how hard the sea may throw the hull. See `maxLaunchSpeed` in
+    // config for the measurements that made this necessary: without it the
+    // buoyancy spring behaved as a catapult and the boat spent more than a
+    // quarter of the race in the air, peaking 6.3 m up, which is what put an AIR
+    // badge on the money shot and left every frame with a hull that touches
+    // nothing.
+    //
+    // Two clamps, and the split matters:
+    //
+    //  • **In contact** the ceiling is relative to `waterVy`, so the hull can
+    //    still climb a wave face at the ~10 m/s the encounter rate demands at
+    //    29 m/s. Clamping absolute vertical speed here would glue the boat to the
+    //    mean water plane and delete the ride entirely. This is the clamp that
+    //    does the work: it stops the spring winding up energy it cannot use.
+    //
+    //  • **Airborne** the ceiling is frozen at the value it had on the frame the
+    //    hull separated. A single continuous relative clamp looked equivalent and
+    //    was not: a crest rising under a flying hull pushes `waterVy` to +9 m/s,
+    //    which lifted the ceiling to 13.6 and re-opened the catapult. Flight is
+    //    ballistic; its launch speed is decided once.
+    if (!wasInAir && inAir) g.launchCeil = waterVy + cfg.maxLaunchSpeed;
+    const ceil = inAir ? g.launchCeil : waterVy + cfg.maxLaunchSpeed;
+    if (submergedFrac > 0 || inAir) s.velocity.y = Math.min(s.velocity.y, ceil);
 
     // ── Integrate position ──────────────────────────────────────────────────
     pos.addScaledVector(s.velocity, dt);

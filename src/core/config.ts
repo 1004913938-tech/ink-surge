@@ -106,8 +106,35 @@ export const CONFIG = {
     buoyancy: 70,
     /** Heave damping against the *water's* vertical velocity, not the world's. */
     buoyancyDamping: 7.2,
+    /**
+     * Floor on the submersion fraction used to weight heave damping while *any*
+     * probe is wetted. With the raw fraction, one probe in the water weighted the
+     * damper at 1/6 and the hull rang almost freely on the way out of a trough.
+     */
+    buoyancyDampFloor: 0.45,
     /** Clamp on buoyant acceleration so a deep trough cannot fire the boat. */
-    maxBuoyantAccel: 46,
+    maxBuoyantAccel: 34,
+    /**
+     * **How hard the sea is allowed to throw the boat**, in m/s, measured against
+     * the water's own vertical velocity rather than the world — so the hull can
+     * still track a wave face at the 9-10 m/s the encounter rate demands at
+     * 29 m/s, and only the *separation* is capped.
+     *
+     * This is the number that decides how much of the race the hull spends in
+     * contact with water, and it was the real fault behind the "false airborne"
+     * report. The flag was reading correctly; the boat was genuinely flying.
+     * Measured over 60 s of autopilot racing before this clamp existed: the hull
+     * was clear of the surface 28 % of the time, more than half a metre clear
+     * 16 % of the time, and peaked 6.3 m above the local surface — the buoyancy
+     * spring, with lift up to 59 m/s² against a 0.85 m maximum draft, was a
+     * catapult. Two of the fifteen review frames (hero, ocean_low) had the hull
+     * hanging 1.2 m and 3.2 m above open water with no splash, no wake origin and
+     * no contact, which is also why no foam ring could ever appear around it.
+     *
+     * 4.6 m/s of relative launch is ~1.1 m of air and ~0.94 s of flight: real,
+     * readable airtime off a crest, and nothing like a moon jump.
+     */
+    maxLaunchSpeed: 4.6,
     /** Draft the hull settles at on flat water, metres. Emergent, listed for clarity. */
     restDraft: 0.14,
     /** Deepest a probe can read, and the hard anti-tunnelling floor. */

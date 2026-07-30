@@ -138,14 +138,20 @@ export function createOceanMaterial(): OceanMaterialHandles {
 
       // ── The tone ladder, dark → light. Seven flat values, no in-betweens.
       /**
-       * The dark anchor. Raw `waterDeep`. v3 lifted it 16% toward mid to stop it
-       * reading as a hole under the composite vignette; the r13 capture showed
-       * the cost of that — the whole lower frame became one mid-blue field with
-       * nothing for a hull to be read against.
+       * The dark anchor. v5: `waterShadow`, not `waterDeep`.
+       *
+       * The r3 capture measured this band arriving on screen at (1,7,40) — L9,
+       * i.e. *darker than the ink* — and in pack.png a single contiguous blob of
+       * it covered 4.4% of the water area with no interior structure. At L9
+       * against L154 cyan with nothing between, that is not a trough, it is a
+       * hole punched in the picture. `waterShadow` exists in the palette for
+       * exactly this ("the shadow side needs its own lifted tone, not a darker
+       * copy of the mid tone") and it also clears the ink, so the darkest water
+       * and the darkest line stop colliding.
        */
-      uTrough: { value: PAL.waterDeep.clone() },
+      uTrough: { value: PAL.waterShadow.clone() },
       /** Shadow *body* — the wave face turned away from the sun. */
-      uDeep: { value: blend(PAL.waterDeep, PAL.waterMid, 0.40) },
+      uDeep: { value: blend(PAL.waterShadow, PAL.waterMid, 0.42) },
       uMid: { value: PAL.waterMid.clone() },
       uShallow: { value: PAL.waterShallow.clone() },
       /** Crest lips only — demands curvature as well as facing. */
@@ -173,7 +179,39 @@ export function createOceanMaterial(): OceanMaterialHandles {
        * v3's dominant term was the horizontal direction to the camera, which is
        * a radial function and produced concentric whorls from an aerial camera.
        */
-      uSunWeight: { value: 2.05 },
+      uSunWeight: { value: 2.15 },
+      /**
+       * ── SWELL HIERARCHY, the v5 fix for "the ocean is a pattern" ───────────
+       *
+       * The r3 aerial measured 211 bright-band blobs in a 900² patch with a
+       * median area of 228 px² and only ~5× of linear scale range: one
+       * characteristic dash size everywhere, which the eye reads as animal print.
+       *
+       * The cause is in the wave table's *slope* spectrum, not its amplitude
+       * spectrum. Slope amplitude is A·k, and for the six waves that is
+       * 0.115, 0.117, 0.117, 0.115, 0.089, 0.082 — dead flat. Cel bands are
+       * chosen by `dot(N, L)`, i.e. purely by slope, so every wave in the table
+       * contributes the *same* tonal range and the shortest resolvable one wins
+       * on feature count. There is no swell for the chop to sit on because as far
+       * as the shading is concerned there is no swell.
+       *
+       * We may not edit the wave table (it is shared with buoyancy), so the fix
+       * is to shade from a *hierarchy* of two filtered samples of it. The vertex
+       * shader now low-passes the shared field a second time with a much wider
+       * box (`uSwellFoot` metres, ≈ the mid-chop wavelength) and hands the
+       * fragment stage both normals:
+       *
+       *   • the SWELL normal sets the bands. Its features are 40–70 m across, so
+       *     a band is a crescent tens of metres long that reads as the flank of a
+       *     rolling swell at any altitude.
+       *   • the DETAIL normal only adds `detailRel = detailFace − swellFace` at a
+       *     fraction of the weight, deliberately less than one band gap, so the
+       *     chop chews the boundary and textures the flank but can never open its
+       *     own independent band region. That is the difference between "chop on
+       *     a swell" and "a lattice of identical dashes".
+       */
+      uSwellFoot: { value: 7.5 },
+      uDetailWeight: { value: 0.52 },
       /**
        * Grazing-angle sky mirror. This is now the ONLY view-dependent term, and
        * it replaces v4's `-dot(N.xz, camDirXZ)`.
@@ -187,7 +225,15 @@ export function createOceanMaterial(): OceanMaterialHandles {
        * and reads light — without any azimuthal structure, because it depends on
        * the *elevation* of the view vector rather than its bearing.
        */
-      uFresWeight: { value: 0.55 },
+      /**
+       * Halved for v5. This is the only view-dependent term and it was the reason
+       * the darkest band's coverage swung from 0.02% (a low, grazing camera —
+       * Fresnel lifts everything) to 7.06% (a high camera — Fresnel lifts
+       * nothing) across the r3 set. A band whose area is a function of camera
+       * pitch pops in motion, so its authority has to be small enough that the
+       * ladder is essentially camera-independent.
+       */
+      uFresWeight: { value: 0.26 },
       uFresPivot: { value: 0.34 },
       /**
        * How much the camera is looking along the water rather than down at it,
@@ -222,7 +268,16 @@ export function createOceanMaterial(): OceanMaterialHandles {
        * strong where bands are tightly packed — which is also exactly where the
        * dash lattice needed breaking.
        */
-      uRagPixels: { value: 16.0 },
+      /**
+       * v5: 16 → 6. At 16, with the gradient clamp topping out at 0.022, the
+       * ragging could move a boundary by 0.10 of shade — half the gap between two
+       * band thresholds. A perturbation that large does not wobble a boundary, it
+       * *replaces* it: the bands stop tracing the water and start tracing the
+       * iso-contours of the noise field, which is the nested-concentric-ellipse
+       * "topographic map" the r3 wake crop showed. Ragging is allowed to chew an
+       * edge; it is not allowed to author one.
+       */
+      uRagPixels: { value: 6.0 },
 
       // ── Noise tiles, in metres, CONSTANT in world space ────────────────────
       // These are the distance over which the whole 512² map repeats, not the
@@ -257,18 +312,40 @@ export function createOceanMaterial(): OceanMaterialHandles {
        * contours into the tone ladder, i.e. the same marbling as over-strong
        * ragging. Its job is to break triangle-aligned band edges, not to shade.
        */
-      uRippleStrength: { value: 0.09 },
+      uRippleStrength: { value: 0.05 },
 
       // Thresholds on the shade scalar. `shade` is built around 0.5 so these are
       // read directly as "how far up the ladder".
-      uBand0: { value: 0.17 },
-      uBand1: { value: 0.38 },
-      uBand2: { value: 0.58 },
-      uBand3: { value: 0.8 },
+      /**
+       * v5: 0.17 → 0.07. The darkest band's job is the deep shadow under a
+       * breaking flank, not the whole lee side of the swell. Dropping the
+       * threshold cuts its area to roughly a fifth, which is what stops it from
+       * ever being the largest contiguous region in frame.
+       */
+      uBand0: { value: 0.07 },
+      uBand1: { value: 0.33 },
+      uBand2: { value: 0.56 },
+      uBand3: { value: 0.79 },
       /** Curvature (crest-lip) bonus folded into the brightest band's selector. */
       uCurvGain: { value: 2.6 },
       /** Thin drawn highlight riding the shallow→crest boundary. */
       uSheen: { value: 0.5 },
+      /**
+       * ── The crest ridge line ───────────────────────────────────────────────
+       * A hard highlight that follows the *ridge polyline* of the swell rather
+       * than an elevation contour. It fires where the swell surface is high AND
+       * nearly level — which is the definition of a crest line, and unlike an
+       * iso-height band it cannot draw a contour ring around a local high, because
+       * its width is inversely proportional to the local curvature: sharp crest,
+       * thin line; broad dome, nothing.
+       */
+      uRidgeSlope: { value: 0.075 },
+      uRidgeHeight: { value: 0.18 },
+      /**
+       * Minimum width, in device pixels, of any band feature the high-frequency
+       * half of the ladder is allowed to draw. See the `shadeHi` block.
+       */
+      uMinFeaturePx: { value: 10.0 },
 
       // ── Foam ───────────────────────────────────────────────────────────────
       /** Compression (1 − jacobian) at which whitecaps start. */
@@ -348,10 +425,12 @@ export function createOceanMaterial(): OceanMaterialHandles {
       ${GERSTNER_GLSL}
 
       uniform vec3 uCameraPos;
-      uniform float uFilterBase, uFilterSlope, uFilterScale;
+      uniform float uFilterBase, uFilterSlope, uFilterScale, uSwellFoot;
 
       varying vec3 vWorldPos;
       varying vec3 vNormal;
+      varying vec3 vSwellNormal;
+      varying float vSwellH;
       varying float vJacobian;
       varying float vHeight;
       varying float vDist;
@@ -394,6 +473,27 @@ export function createOceanMaterial(): OceanMaterialHandles {
         vec3 surfPos = pAcc * 0.25;
         vec3 surfNrm = normalize(nAcc);
 
+        // ── Second, much wider low-pass: the SWELL ────────────────────────────
+        // Same box-filter construction, footprint uSwellFoot metres instead of
+        // the vertex spacing. A box of half-width R attenuates a wave of
+        // wavenumber k by sinc(kR), so at 7.5 m this keeps the 71 m and 44 m
+        // trains almost intact, halves the 24 m one and erases everything below —
+        // i.e. it is the swell with the chop taken off. The fragment stage shades
+        // from THIS and lets the chop only perturb the result; see uDetailWeight.
+        float sfoot = max(uSwellFoot, foot);
+        vec3 snAcc = vec3(0.0);
+        float syAcc = 0.0;
+        gerstnerSurface(world.xz + vec2(sfoot, 0.0), uTime, p, n, j);
+        snAcc += n; syAcc += p.y;
+        gerstnerSurface(world.xz - vec2(sfoot, 0.0), uTime, p, n, j);
+        snAcc += n; syAcc += p.y;
+        gerstnerSurface(world.xz + vec2(0.0, sfoot), uTime, p, n, j);
+        snAcc += n; syAcc += p.y;
+        gerstnerSurface(world.xz - vec2(0.0, sfoot), uTime, p, n, j);
+        snAcc += n; syAcc += p.y;
+        vSwellNormal = normalize(snAcc);
+        vSwellH = syAcc * 0.25;
+
         // Normalised discrete Laplacian: 4·(centre − avg)/foot² = −∇²y.
         // Positive on a crest, negative in a trough, and — unlike height — it
         // picks up the short chop, which is what makes a crest read as a *lip*.
@@ -429,6 +529,7 @@ export function createOceanMaterial(): OceanMaterialHandles {
       uniform vec3 uHorizonTint, uHaze, uSeaFar;
 
       uniform float uSunWeight, uFresWeight, uFresPivot, uGraze;
+      uniform float uDetailWeight, uRidgeSlope, uRidgeHeight, uMinFeaturePx;
       uniform float uHeightWeight, uHeightScale;
       uniform float uRagPixels, uTilePatch, uTileMacro, uTileMeso, uTileMicro, uWarp, uRippleStrength;
       uniform float uBand0, uBand1, uBand2, uBand3, uCurvGain, uSheen;
@@ -442,6 +543,8 @@ export function createOceanMaterial(): OceanMaterialHandles {
 
       varying vec3 vWorldPos;
       varying vec3 vNormal;
+      varying vec3 vSwellNormal;
+      varying float vSwellH;
       varying float vJacobian;
       varying float vHeight;
       varying float vDist;
@@ -487,6 +590,7 @@ export function createOceanMaterial(): OceanMaterialHandles {
 
       void main() {
         vec3 Nv = normalize(vNormal);
+        vec3 Ns = normalize(vSwellNormal);
         vec3 V = normalize(uCameraPos - vWorldPos);
         vec3 L = normalize(uSunDir);
 
@@ -511,7 +615,12 @@ export function createOceanMaterial(): OceanMaterialHandles {
         // the macro one and the sum has a legible dominant axis — the "camo
         // bedsheet" read. Warping by the macro octave means the detail layer has
         // no single direction and no centre at any altitude.
-        vec2 warp = (vec2(nMac.g, nMac.b) - 0.5) * uWarp * wMac;
+        // The warp is taken from the r and g channels (features ≈ tile/7 and
+        // tile/14). It used to use b, whose feature is tile/112 ≈ 0.56 m — a
+        // fourteen-metre displacement driven by a half-metre field, which injects
+        // exactly the high-frequency structure the meso and micro fetches then
+        // quantise into filaments.
+        vec2 warp = (vec2(nMac.r, nMac.g) - 0.5) * uWarp * wMac;
         vec4 nMes = texture2D(uNoise, (wp + warp) / uTileMeso - dr * 1.1);
         vec4 nMic = texture2D(uNoise, (wp + warp * 0.45) / uTileMicro + dr * 2.0);
 
@@ -522,9 +631,12 @@ export function createOceanMaterial(): OceanMaterialHandles {
         // Perturbing the normal per fragment breaks that alignment, and doubles
         // as the fine surface detail the mesh cannot carry. Gated on
         // resolvability, because a ripple you cannot resolve is not detail.
+        // nMes.b is not used: its feature is uTileMeso/112 ≈ 15 cm, gated as if it
+        // were 2.4 m, so it was a sub-pixel field perturbing the normal that
+        // selects the bands.
         vec2 ripple = vec2(
           (nMes.g - 0.5) * wMes + (nMic.g - 0.5) * wMic,
-          (nMes.b - 0.5) * wMes + (nMic.r - 0.5) * wMic);
+          (nMes.r - 0.5) * wMes + (nMic.r - 0.5) * wMic);
         vec3 N = normalize(Nv + vec3(ripple.x, 0.0, ripple.y) * uRippleStrength);
 
         // ── Shade scalar, built around 0.5 ──────────────────────────────────
@@ -537,7 +649,19 @@ export function createOceanMaterial(): OceanMaterialHandles {
         // view-derived contribution at all. Nothing here is a function of the
         // *bearing* from the fragment to the camera, which is the property that
         // was drawing whorls.
-        float sunFace = dot(N, L) - 0.66;
+        // ── Two scales, one ladder ──────────────────────────────────────────
+        // swellFace is the dominant term and it comes from the 7.5 m-filtered
+        // normal, so a band boundary is an iso-line of the SWELL's slope: a
+        // crescent tens of metres long lying on one flank of a rolling wave, which
+        // terminates naturally at the crest (slope → 0) and at the trough.
+        //
+        // detailRel is what the chop adds on top of the swell. It is deliberately
+        // weighted well below one band gap (0.23), so it chews the crescent's edge
+        // and textures its interior but can never open a band region of its own.
+        // In r3 the chop had the *same* weight as the swell, which is why the
+        // aerial was 211 same-sized dashes rather than a sea with a swell in it.
+        float swellFace = dot(Ns, L) - 0.66;
+        float detailRel = dot(N, L) - dot(Ns, L);
         // Fresnel is taken from the UN-rippled normal. On a calmed sea (the
         // countdown and results cameras drop the sea state) the sun term is almost
         // constant, so Fresnel is the whole tonal range — and running it through
@@ -548,8 +672,11 @@ export function createOceanMaterial(): OceanMaterialHandles {
         float fres = 1.0 - max(dot(Nv, V), 0.0);
         float hN = clamp(vHeight / uHeightScale, -1.0, 1.0);
 
-        float shade = 0.5
-          + sunFace * uSunWeight
+        // The LOW-frequency part of the ladder: swell facing, Fresnel, height.
+        // Everything here varies slowly across the screen, so every boundary it
+        // draws is a large shape by construction.
+        float shadeLo = 0.5
+          + swellFace * uSunWeight
           + (fres - uFresPivot) * uFresWeight * uGraze
           + hN * uHeightWeight;
 
@@ -570,8 +697,29 @@ export function createOceanMaterial(): OceanMaterialHandles {
         // the countdown/results cameras the geometric gradient is very small, and
         // any ragging floor above ~0.002 still walks a band boundary far enough to
         // trace the noise's own contours.
-        float bandGrad = clamp(fwidth(dot(Nv, L)) * uSunWeight, 0.0022, 0.022);
-        shade += jitter * uRagPixels * bandGrad;
+        float bandGrad = clamp(fwidth(dot(Ns, L)) * uSunWeight, 0.0022, 0.014);
+
+        // ── The HIGH-frequency part, with its screen feature size clamped ─────
+        // detailRel + ragging is everything in the ladder that varies quickly.
+        // Left alone it is exactly what drew the r3 filigree: thin sinuous veins
+        // and nested contour rings, because a band boundary's width in pixels is
+        // (band gap) / (gradient of shade per pixel), and where this term's
+        // gradient was steep that width fell to two or three pixels.
+        //
+        // Measuring that gradient directly and attenuating the term wherever it
+        // would draw a feature narrower than uMinFeaturePx is a hard guarantee on
+        // the *minimum band feature size in screen space* — the thing the critic
+        // asked for — and it is self-tuning: full strength on a big smooth swell
+        // filling the foreground, backed off in the compressed mid-distance where
+        // filaments used to form. The swell term is untouched, so the large shapes
+        // never lose contrast.
+        float shadeHi = detailRel * uDetailWeight + jitter * uRagPixels * bandGrad;
+        float gradPx = length(vec2(dFdx(shadeHi), dFdy(shadeHi)));
+        // 0.22 ≈ one band gap; a feature is that many shade units wide.
+        float allow = 0.22 / max(uMinFeaturePx, 1.0);
+        shadeHi *= min(1.0, allow / max(gradPx, 1e-6));
+
+        float shade = shadeLo + shadeHi;
 
         // ── Aerial perspective, stage 1: quantised band collapse ────────────
         // Computed here, applied per-tone below, so a distant tone lands on a
@@ -594,6 +742,20 @@ export function createOceanMaterial(): OceanMaterialHandles {
         col = mix(col, uShallow, step(uBand2, shade));
         float crestMask = step(uBand3, crestSel);
         col = mix(col, uCrest, crestMask);
+
+        // ── The crest RIDGE line ────────────────────────────────────────────
+        // A hard highlight that follows the ridge polyline of the swell: high, and
+        // nearly level. Because the region where the slope falls below a threshold
+        // has width (threshold / curvature), this is thin on a sharp crest and
+        // absent on a broad dome — it can only ever draw a *ridge*, never the
+        // concentric contour ring an iso-height test would draw around a local
+        // high. Its shape is the crest's own line, which is the one silhouette the
+        // r3 bands were missing.
+        float swellSlope = length(Ns.xz) / max(Ns.y, 0.2);
+        float hSwell = clamp(vSwellH / uHeightScale, -1.0, 1.0);
+        float ridge = step(swellSlope, uRidgeSlope) * step(uRidgeHeight, hSwell)
+                    * step(0.5, uSheen) * (1.0 - smoothstep(220.0, 700.0, vDist));
+        col = mix(col, uCrest, ridge * (1.0 - crestMask));
 
         // A thin drawn highlight riding the shallow→crest boundary. Because the
         // boundary follows slope and curvature it traces the wave form, not an

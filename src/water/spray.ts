@@ -337,7 +337,7 @@ export class SprayField {
     }
   }
 
-  update(ctx: GameContext, racers: Racer[]) {
+  update(ctx: GameContext, racers: Racer[], wetness: Float32Array) {
     const dt = ctx.dt;
 
     // ── Emitters ────────────────────────────────────────────────────────────
@@ -353,6 +353,20 @@ export class SprayField {
       const rx = fz;
       const rz = -fx;
       const speed = Math.abs(s.forwardSpeed);
+      // ── Emit OUTSIDE the hull, always ──────────────────────────────────────
+      // The r3 review found droplets drawn on top of the red deck and on top of
+      // the yellow AI hull in rider_closeup.png and air.png, and read them as a
+      // depth-test failure. They are not — the particle pass depth-tests against
+      // the opaque scene — but the emitters were spawning *inside the hull's own
+      // footprint*: bow spray at beam·0.42 = 0.80 m and transom wash spread over
+      // ±beam·0.45 = 0.86 m, against a half-beam of 0.95 m. A droplet born inside
+      // the hull volume is genuinely in front of the deck from half the possible
+      // camera angles, so it reads as composited however the depth buffer is
+      // configured. Everything now leaves from clear of the shell:
+      //   • bow spray at 0.86 of the beam, i.e. just outboard of the chine
+      //   • transom wash from behind the transom, not under it
+      //   • drift sheet a full beam out on the sliding side
+      const halfBeam = CONFIG.boat.beam * 0.5;
       const bowX = px + fx * CONFIG.boat.length * 0.46;
       const bowZ = pz + fz * CONFIG.boat.length * 0.46;
 
@@ -377,7 +391,13 @@ export class SprayField {
         }
       }
 
-      if (s.airborne) {
+      // Water cannot be thrown by a hull that is not touching water. Gated on the
+      // water subsystem's own graded wetness rather than on `state.airborne`, for
+      // the reasons in `hullWetness` — in r3 the flag was set on a third of the
+      // shots while the boat was visibly planing, and every one of those lost its
+      // spray as well as its collar.
+      const wet = wetness[r];
+      if (wet < 0.25) {
         this.bowCarry[r] = 0;
         this.driftCarry[r] = 0;
         this.sternCarry[r] = 0;
@@ -396,8 +416,8 @@ export class SprayField {
         this.sternCarry[r] += rate * dt;
         while (this.sternCarry[r] >= 1) {
           this.sternCarry[r] -= 1;
-          const ex = px - fx * CONFIG.boat.length * 0.5 + rx * rng.sym(CONFIG.boat.beam * 0.45);
-          const ez = pz - fz * CONFIG.boat.length * 0.5 + rz * rng.sym(CONFIG.boat.beam * 0.45);
+          const ex = px - fx * CONFIG.boat.length * 0.62 + rx * rng.sym(halfBeam * 0.8);
+          const ez = pz - fz * CONFIG.boat.length * 0.62 + rz * rng.sym(halfBeam * 0.8);
           const y = ctx.ocean.height(ex, ez, ctx.time);
           this.emit(
             ex,
@@ -424,9 +444,9 @@ export class SprayField {
           const y = ctx.ocean.height(bowX, bowZ, ctx.time);
           const out = 1.4 + speed * 0.09;
           this.emit(
-            bowX + rx * side * CONFIG.boat.beam * 0.42,
+            bowX + rx * side * halfBeam * 1.22,
             y + 0.1,
-            bowZ + rz * side * CONFIG.boat.beam * 0.42,
+            bowZ + rz * side * halfBeam * 1.22,
             fx * speed * 0.22 + rx * side * out + rng.sym(0.7),
             rng.range(2.4, 5.2) + speed * 0.045,
             fz * speed * 0.22 + rz * side * out + rng.sym(0.7),
@@ -446,8 +466,8 @@ export class SprayField {
         while (this.driftCarry[r] >= 1) {
           this.driftCarry[r] -= 1;
           const along = rng.sym(CONFIG.boat.length * 0.4);
-          const ex = px + fx * along + rx * dir * CONFIG.boat.beam * 0.5;
-          const ez = pz + fz * along + rz * dir * CONFIG.boat.beam * 0.5;
+          const ex = px + fx * along + rx * dir * halfBeam * 1.18;
+          const ez = pz + fz * along + rz * dir * halfBeam * 1.18;
           const y = ctx.ocean.height(ex, ez, ctx.time);
           const out = 2.2 + slip * 0.5;
           this.emit(

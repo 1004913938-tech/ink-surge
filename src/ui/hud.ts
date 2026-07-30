@@ -158,10 +158,20 @@ export class Hud implements HudAPI {
     // One scale factor for the whole overlay. Tied to height because that is
     // what constrains a bottom-anchored gauge.
     const s = clamp(height / 810, 0.62, 1.55);
-    const map = Math.round(206 * s);
-    const gr = 84 * s;
-    const gx = width - 118 * s;
-    const gy = height - 140 * s;
+    // Minimap + standings stack, sized so the *bottom of the last standings row*
+    // clears the highest horizon the chase camera produces. Measured across the
+    // capture set, the horizon runs y 640–800 device px (0.40–0.49 h); the stack
+    // used to end at y 780 device, so it permanently occupied right-hand racing
+    // space and in shots/pres2_base/ocean_low.png the 2nd-place AI — the most
+    // tactically important object in frame — was a quarter hidden behind it.
+    // 22 + 160 + 12 + 4 × 28 = 306 CSS px = 612 device px, i.e. above the band.
+    const map = Math.round(160 * s);
+    // Speedometer tucked further into the corner (and slightly smaller) for the
+    // same reason: in pack.png the violet AI was behind it. This moves the dial's
+    // top-left corner 26 CSS / 52 device px right and 40 CSS / 80 device px down.
+    const gr = 76 * s;
+    const gx = width - 100 * s;
+    const gy = height - 108 * s;
     const rw = 186 * s;
 
     this.L = {
@@ -184,7 +194,7 @@ export class Hud implements HudAPI {
       bh: 31 * s,
     };
 
-    this.minimap.layout(width - 34 * s - map, 28 * s, map);
+    this.minimap.layout(width - 30 * s - map, 22 * s, map);
     this.computeChromeRects();
     this.bakeChrome();
   }
@@ -679,25 +689,45 @@ export class Hud implements HudAPI {
     }
   }
 
-  /** Thin coloured rails top and bottom while boosting — a frame-wide cue. */
+  /**
+   * Frame-edge boost cue: two rails plus hard manga speed lines up the sides.
+   *
+   * The speed lines replace a pair of 130 × 405 px triangles filled at 0.22 alpha.
+   * A large low-alpha wedge over sky is optically a haze gradient no matter how
+   * hard its own edges are — in shots/pres2_r3/foam_wake.png the two of them read
+   * as pale washes across the top corners, which is the one photographic treatment
+   * this game is not allowed. Twelve opaque tapered bars cover a fraction of the
+   * area, say the same thing louder, and are unambiguously drawn.
+   */
   private drawBoostFrame(s: number) {
     const g = this.ctx2d;
-    const k = 0.55 + 0.45 * Math.sin(this.pulse * 22);
+    // Floor the pulse well above zero: at the old 0.55 ± 0.45 the trough alpha was
+    // 0.06 and the whole cue vanished for half of every 0.29 s beat, so whether a
+    // boost frame showed anything at all was a coin toss per screenshot.
+    const k = 0.78 + 0.22 * Math.sin(this.pulse * 22);
     g.save();
-    g.fillStyle = rgba(HEX.boost, 0.5 * k);
+    g.fillStyle = rgba(HEX.boost, 0.9 * k);
     g.fillRect(0, 0, this.w, 3.5 * s);
     g.fillRect(0, this.h - 3.5 * s, this.w, 3.5 * s);
-    // Corner speed wedges.
-    g.fillStyle = rgba(HEX.boostHot, 0.22 * k);
-    for (const sx of [0, 1]) {
-      const wedge = new Path2D();
-      const X = sx * this.w;
-      const d = sx ? -1 : 1;
-      wedge.moveTo(X, 0);
-      wedge.lineTo(X + d * 130 * s, 0);
-      wedge.lineTo(X, this.h * 0.5);
-      wedge.closePath();
-      g.fill(wedge);
+    for (const side of [0, 1]) {
+      const X = side * this.w;
+      const d = side ? -1 : 1;
+      for (let i = 0; i < 6; i++) {
+        // Deterministic pseudo-random lengths and thicknesses — no allocation, and
+        // the same every frame at a given pulse so nothing crawls.
+        const n = ((i * 7 + side * 3) % 5) / 4;
+        const y = this.h * (0.1 + i * 0.14) + side * this.h * 0.06;
+        const len = (70 * s + n * 150 * s);
+        const th = (5 + ((i + side) % 3) * 3.2) * s;
+        const bar = new Path2D();
+        bar.moveTo(X, y);
+        bar.lineTo(X + d * len, y + th * 0.45);
+        bar.lineTo(X + d * len, y + th * 0.9);
+        bar.lineTo(X, y + th * 1.5);
+        bar.closePath();
+        g.fillStyle = rgba(i % 2 === 0 ? HEX.boostHot : HEX.boost, (0.72 + 0.28 * n) * k);
+        g.fill(bar);
+      }
     }
     g.restore();
   }
@@ -867,11 +897,13 @@ export class Hud implements HudAPI {
   private drawStandings(ctx: GameContext, s: number) {
     const g = this.ctx2d;
     const board = ctx.race.standings();
-    const rowH = 30 * s;
-    const gap = 5 * s;
+    // Compact rows. See `resize()`: the whole stack has to finish above the
+    // horizon band, so the ladder is four 24 px rows rather than four 30 px ones.
+    const rowH = 24 * s;
+    const gap = 4 * s;
     const w = this.minimap.size;
     const x = this.minimap.x;
-    const y0 = this.minimap.y + this.minimap.size + 20 * s;
+    const y0 = this.minimap.y + this.minimap.size + 14 * s;
     const leader = board[0];
 
     for (let i = 0; i < board.length; i++) {
@@ -880,8 +912,8 @@ export class Hud implements HudAPI {
       const hex = [HEX.hull0, HEX.hull1, HEX.hull2, HEX.hull3][r.id];
       const isPlayer = r.isPlayer;
       // Rows stagger right as they go down: the ladder reads as a ranked stack.
-      const rx = x + i * 7 * s;
-      const plateW = w - i * 7 * s;
+      const rx = x + i * 6 * s;
+      const plateW = w - i * 6 * s;
       const row = slantPath(rx, y, plateW, rowH, rowH * PLATE_SKEW);
       // One weight, one outline colour, opaque fill — for every row. The old
       // ladder drew non-player rows at 0.66 alpha with a 1.8 px dim outline, and
@@ -894,31 +926,31 @@ export class Hud implements HudAPI {
       });
 
       // Colour chip.
-      const chip = slantPath(rx + 4 * s, y + 4 * s, 8 * s, rowH - 8 * s, (rowH - 8 * s) * PLATE_SKEW);
+      const chip = slantPath(rx + 4 * s, y + 3.5 * s, 7 * s, rowH - 7 * s, (rowH - 7 * s) * PLATE_SKEW);
       inked(g, chip, rgba(hex, 1), rgba(HEX.ink, 1), 1.6 * s);
 
       // Place number in the type face, not the segment face: a seven-segment
       // "1" is a bare vertical bar and at ladder size it reads as a tally mark
       // rather than as a position.
-      inkText(g, String(i + 1), rx + 26 * s, y + rowH - 9 * s, {
-        font: `900 ${Math.round(19 * s)}px ${FONT_STACK}`,
+      inkText(g, String(i + 1), rx + 23 * s, y + rowH - 7 * s, {
+        font: `900 ${Math.round(17 * s)}px ${FONT_STACK}`,
         fill: rgba(i === 0 ? HEX.boostHot : HEX.hudPaper, 0.98),
         align: 'center',
         skew: 0.16,
       });
 
-      inkText(g, r.name.toUpperCase(), rx + 42 * s, y + rowH - 9 * s, {
-        font: `800 ${Math.round(13 * s)}px ${FONT_STACK}`,
+      inkText(g, r.name.toUpperCase(), rx + 37 * s, y + rowH - 7 * s, {
+        font: `800 ${Math.round(12 * s)}px ${FONT_STACK}`,
         fill: rgba(isPlayer ? HEX.hudPaper : HEX.foamShade, 0.95),
         align: 'left',
         skew: 0.1,
-        tracking: 1.2 * s,
+        tracking: 1.1 * s,
       });
 
       // Gap to the leader, estimated from spline progress and current pace.
       const gapTxt = this.gapText(ctx, r, leader);
-      inkText(g, gapTxt, rx + plateW - 10 * s, y + rowH - 9 * s, {
-        font: `800 ${Math.round(12.5 * s)}px ${FONT_STACK}`,
+      inkText(g, gapTxt, rx + plateW - 9 * s, y + rowH - 7 * s, {
+        font: `800 ${Math.round(11.5 * s)}px ${FONT_STACK}`,
         fill:
           gapTxt === 'LEAD'
             ? rgba(HEX.boostHot, 1)

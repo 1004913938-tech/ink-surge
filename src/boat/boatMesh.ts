@@ -30,13 +30,31 @@
  * Those five (bow spike, windscreen, saddle, engine hump, spoiler) are what
  * make it read as a *racing* boat and not a dinghy at distance.
  *
- * ── Normals ────────────────────────────────────────────────────────────────
+ * ── Normals, and the stipple this file used to produce ─────────────────────
  * Geometry is non-indexed with per-face normals, i.e. genuinely faceted. That
  * matters twice: the main pass gets flat shading without needing the
  * FLAT_SHADING define, and the *prepass* also gets flat normals, so the
  * screen-space edge pass inks every crease. `computeSmoothNormals` (called by
  * `applyCel`) then welds by position for the outline hull, so the outline stays
  * closed across those same creases.
+ *
+ * Per-*triangle* normals were not enough, and the failure was visible: the
+ * foredeck in shots/boat_b0/outline_check.png carried a fine 45° dashed
+ * stipple laid out in nested arcs, and the same pattern crawled over the
+ * cowling and the gunwale insides. It reads as moiré, and it is neither dither
+ * nor hatching — it is the *triangulation itself* showing through the cel ramp.
+ * A crowned deck is 7 columns × 12 stations = 168 slivers, each with its own
+ * constant normal; a ramp stop sweeping across that grid quantises each sliver
+ * independently, so the band boundary becomes a dashed contour along the
+ * triangulation diagonals. The non-planar quads make it worse: the two
+ * triangles of one quad differ by 15–40°, which is a normal break the Sobel
+ * pass can ink on its own.
+ *
+ * The fix is `beginFacet()` / `endFacet()`. Triangles written inside a facet
+ * share ONE area-weighted normal, so a whole deck panel or hull strake is a
+ * single flat tone no matter how many triangles it is built from, and its
+ * *boundaries* are the only creases left to ink. That is what cel art wants
+ * anyway: few, confident planes with drawn edges between them.
  */
 
 import { BufferAttribute, BufferGeometry, Color, Group, Mesh, Object3D, Vector3 } from 'three';
@@ -55,11 +73,39 @@ type Rect = readonly [number, number, number, number];
 
 const mirrorX = (v: V3): V3 => [-v[0], v[1], v[2]];
 
+/**
+ * Facet ids are handed out from one module-level counter rather than per
+ * Surface, so `append()` can merge two builders without two facets colliding
+ * on the same id and being welded into one tone.
+ */
+let facetCounter = 0;
+
 class Surface {
   private p: number[] = [];
+  /**
+   * Per-triangle facet id, parallel to `p` in units of triangles. 0 means "no
+   * facet" — that triangle keeps its own geometric normal.
+   */
+  private f: number[] = [];
+  private facet = 0;
+
+  /**
+   * Open a shading facet. Every triangle written until `endFacet()` is shaded
+   * with one shared, area-weighted normal — one flat cel tone across the whole
+   * form, with creases only at its edges.
+   */
+  beginFacet() {
+    this.facet = ++facetCounter;
+    return this;
+  }
+
+  endFacet() {
+    this.facet = 0;
+  }
 
   tri(a: V3, b: V3, c: V3) {
     this.p.push(a[0], a[1], a[2], b[0], b[1], b[2], c[0], c[1], c[2]);
+    this.f.push(this.facet);
   }
 
   /** Convex quad a→b→c→d. Normal is cross(b-a, c-a). */
@@ -114,7 +160,21 @@ class Surface {
    * the greebles — a frustum has six flat faces and twelve hard creases, which
    * is exactly what the cel pipeline wants to chew on.
    */
-  taperBox(z0: number, z1: number, rect0: Rect, rect1: Rect, capBack = true, capFront = true) {
+  taperBox(
+    z0: number,
+    z1: number,
+    rect0: Rect,
+    rect1: Rect,
+    capBack = true,
+    capFront = true,
+    /**
+     * Omit the +Y face. Used by the windscreen, whose outer surface is split
+     * between two materials: laying a second coplanar plate on top of a
+     * complete box would z-fight, and pushing it proud opens a lit seam all the
+     * way round it.
+     */
+    skipTop = false,
+  ) {
     // Normalise the inputs. Mirrored greebles are written as `sign * 0.8` pairs
     // and half of them come out with x0 > x1; an unsorted rect flips the winding
     // and the box renders inside-out, which is invisible in the code and very
@@ -131,7 +191,7 @@ class Surface {
     const C1: V3 = [r1[1], r1[3], z1], D1: V3 = [r1[0], r1[3], z1];
     this.quad(B0, C0, C1, B1); // +X
     this.quad(A1, D1, D0, A0); // -X
-    this.quad(D0, D1, C1, C0); // +Y
+    if (!skipTop) this.quad(D0, D1, C1, C0); // +Y
     this.quad(A1, A0, B0, B1); // -Y
     if (capFront) this.quad(A1, B1, C1, D1); // +Z
     if (capBack) this.quad(B0, A0, D0, C0); // -Z
@@ -155,6 +215,7 @@ class Surface {
 
   append(other: Surface) {
     for (let i = 0; i < other.p.length; i++) this.p.push(other.p[i]);
+    for (let i = 0; i < other.f.length; i++) this.f.push(other.f[i]);
   }
 
   get triangleCount() {
@@ -168,20 +229,63 @@ class Surface {
    */
   geometry(name: string): BufferGeometry {
     const count = this.p.length / 3;
+    const tris = count / 3;
     const pos = new Float32Array(this.p);
     const nrm = new Float32Array(count * 3);
     const uv = new Float32Array(count * 2);
-    for (let t = 0; t < count; t += 3) {
-      const o = t * 3;
-      const n = triNormal(
-        [pos[o], pos[o + 1], pos[o + 2]],
-        [pos[o + 3], pos[o + 4], pos[o + 5]],
-        [pos[o + 6], pos[o + 7], pos[o + 8]],
-      );
+
+    // Pass 1: geometric normal per triangle, scaled by twice its area, so a
+    // facet's shared normal is area-weighted and a sliver cannot outvote the
+    // panel it belongs to.
+    const fx = new Float64Array(tris);
+    const fy = new Float64Array(tris);
+    const fz = new Float64Array(tris);
+    for (let t = 0; t < tris; t++) {
+      const o = t * 9;
+      const ux = pos[o + 3] - pos[o], uy = pos[o + 4] - pos[o + 1], uz = pos[o + 5] - pos[o + 2];
+      const vx = pos[o + 6] - pos[o], vy = pos[o + 7] - pos[o + 1], vz = pos[o + 8] - pos[o + 2];
+      fx[t] = uy * vz - uz * vy;
+      fy[t] = uz * vx - ux * vz;
+      fz[t] = ux * vy - uy * vx;
+    }
+
+    // Pass 2: sum each facet's weighted normals.
+    const acc = new Map<number, [number, number, number]>();
+    for (let t = 0; t < tris; t++) {
+      const id = this.f[t] ?? 0;
+      if (id === 0) continue;
+      const a = acc.get(id);
+      if (a) {
+        a[0] += fx[t];
+        a[1] += fy[t];
+        a[2] += fz[t];
+      } else acc.set(id, [fx[t], fy[t], fz[t]]);
+    }
+
+    // Pass 3: write. Facet members take the shared normal; loners keep theirs.
+    for (let t = 0; t < tris; t++) {
+      const id = this.f[t] ?? 0;
+      let nx = fx[t], ny = fy[t], nz = fz[t];
+      if (id !== 0) {
+        const a = acc.get(id)!;
+        // A facet folded so far that its members cancel out has no meaningful
+        // shared normal; fall back to the triangle's own rather than emitting a
+        // zero normal, which would shade black.
+        if (Math.hypot(a[0], a[1], a[2]) > 1e-9) {
+          nx = a[0];
+          ny = a[1];
+          nz = a[2];
+        }
+      }
+      const len = Math.hypot(nx, ny, nz) || 1;
+      nx /= len;
+      ny /= len;
+      nz /= len;
+      const o = t * 9;
       for (let k = 0; k < 3; k++) {
-        nrm[o + k * 3 + 0] = n[0];
-        nrm[o + k * 3 + 1] = n[1];
-        nrm[o + k * 3 + 2] = n[2];
+        nrm[o + k * 3 + 0] = nx;
+        nrm[o + k * 3 + 1] = ny;
+        nrm[o + k * 3 + 2] = nz;
       }
     }
     for (let i = 0; i < count; i++) {
@@ -282,6 +386,49 @@ const RAIL_W = 0.055;
 const DECK_COLS = [-1, -0.62, -0.32, -0.11, 0.11, 0.32, 0.62, 1];
 /** Columns inside this fraction get the bright racing stripe. */
 const STRIPE_HALF = 0.115;
+
+/**
+ * Longitudinal shading zones, as inclusive ranges of *segment* index into
+ * `STATION_Z`. Each (strip, zone) pair becomes one flat cel facet. The
+ * boundaries are placed where the hull's form genuinely changes — the aft body,
+ * the midbody, the flare into the bow — so a shared normal is never a lie about
+ * the shape it covers.
+ *
+ * Segment i spans STATION_Z[i] → STATION_Z[i+1]:
+ *   0:-2.32  1:-2.05  2:-1.70  3:-1.32  4:-1.06  5:-0.60
+ *   6:-0.10  7: 0.35  8: 0.90  9: 1.35 10: 1.80 11: 2.10 (→2.34)
+ */
+const FLANK_ZONES: readonly (readonly [number, number])[] = [[0, 5], [6, 8], [9, 11]];
+/** Deck zones. `[4, 6]` is exactly the cockpit, which is where the footwell is cut. */
+const DECK_ZONES: readonly (readonly [number, number])[] = [[0, 3], [4, 6], [7, 8], [9, 11]];
+
+// ── Cockpit footwell ────────────────────────────────────────────────────────
+/**
+ * The footwell is a genuine recess, not a tonal plate. The previous build laid
+ * flat trim rectangles on the deck 8 mm proud of it, and the review frames read
+ * the whole deck — saddle, bars, plates — as "a jumble of undifferentiated
+ * grey-blue boxes". Boxes on a plane cannot read as a cockpit; a hole in the
+ * plane can, because it has walls, and walls catch a different band of the ramp
+ * from the deck they are cut into.
+ *
+ * Span is quoted in deck-column fractions so the well follows the hull's taper
+ * instead of going square amidships and hanging over the sheer forward.
+ */
+const WELL_COLS: readonly [number, number] = [0.32, 0.62];
+const WELL_Z0 = -1.06;
+const WELL_Z1 = 0.35;
+/** Depth of the well floor below the local deck, metres. */
+const WELL_DROP = 0.19;
+
+function isWellColumn(f0: number, f1: number): boolean {
+  const a = Math.min(Math.abs(f0), Math.abs(f1));
+  const b = Math.max(Math.abs(f0), Math.abs(f1));
+  return (
+    Math.sign(f0) === Math.sign(f1) &&
+    Math.abs(a - WELL_COLS[0]) < 1e-4 &&
+    Math.abs(b - WELL_COLS[1]) < 1e-4
+  );
+}
 
 const sheerHalf = (st: Station) => st.w * 0.985;
 
@@ -493,7 +640,31 @@ function makeMaterials(id: number) {
     rimStrength: 0.4,
     outlineWidthPx: 3.4,
   });
-  return { hull, trim, bright };
+  /**
+   * Windscreen glazing. Its own material for two reasons that the previous
+   * build's single pale slab proves: `hudPaper` is the *foam* white, so a screen
+   * painted in it is the same value as the spray around the hull and reads as a
+   * blank card; and glass wants a two-band ladder, not four, because the whole
+   * point of a cel window is that it is two flat values and a streak.
+   *
+   * Two `rampColors` with the stops pushed apart give exactly one hard step
+   * across the pane. The tint is `skyHorizon` — glass in this palette is a piece
+   * of sky, which is also why it never competes with the hull red.
+   */
+  const glass = createCelMaterial({
+    name: `glass${id}`,
+    color: PAL.skyHorizon,
+    rampColors: [COOL.clone().multiplyScalar(0.62), WARM.clone().multiplyScalar(1.06)],
+    rampStops: [0.0, 0.5],
+    specSize: 0.955,
+    specSize2: 0.988,
+    specStrength: 0.4,
+    rimColor: PAL.foam,
+    rimPower: 2.2,
+    rimStrength: 0.85,
+    outlineWidthPx: 3.4,
+  });
+  return { hull, trim, bright, glass };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -504,6 +675,7 @@ export function createBoatMesh(id: number): BoatMesh {
   const HULL = new Surface();
   const TRIM = new Surface();
   const BRIGHT = new Surface();
+  const GLASS = new Surface();
 
   const stations = STATION_Z.map(stationAt);
   const rings = stations.map(hullRing);
@@ -514,45 +686,80 @@ export function createBoatMesh(id: number): BoatMesh {
   // just above the spray rail; they go to the bright material and become a
   // waterline stripe that runs the full length of the boat. That single stripe
   // does more for reading the hull's sheer line than any amount of shading.
-  for (let i = 0; i < nStations - 1; i++) {
-    const A = rings[i];
-    const B = rings[i + 1];
-    for (let j = 0; j < 10; j++) {
-      const target = j === 1 || j === 8 ? BRIGHT : HULL;
-      target.quad(A[j], A[j + 1], B[j + 1], B[j]);
+  //
+  // Each strip is shaded as three long facets (aft body, midbody, bow) rather
+  // than as twelve independent segments. See the facet note at the top of the
+  // file: twelve normals per strake put a dashed 45° contour down the flank the
+  // moment a ramp stop crossed it.
+  for (let j = 0; j < 10; j++) {
+    const target = j === 1 || j === 8 ? BRIGHT : HULL;
+    for (const [z0, z1] of FLANK_ZONES) {
+      target.beginFacet();
+      for (let i = z0; i <= z1; i++) {
+        const A = rings[i];
+        const B = rings[i + 1];
+        target.quad(A[j], A[j + 1], B[j + 1], B[j]);
+      }
+      target.endFacet();
     }
   }
 
-  // Transom: a full polygon from sheer to sheer, closed across the top so the
-  // deck's aft edge and the shell meet with no gap for the outline to leak
-  // through.
+  // Transom: a closed polygon running sheer → keel → sheer and then back across
+  // the top along the *crowned deck edge*.
+  //
+  // It used to close with a straight chord between the two sheer points, which
+  // is 5.5 cm below the deck's own aft edge at the centreline (DECK_CROWN). That
+  // left a 1.74 m × 5.5 cm lens-shaped hole at the stern, and what showed
+  // through it was the *inside* of the hull shell: the stray 1-px bright
+  // orange-red line running across the stern in shots/boat_b0/hero.png, visible
+  // at 8× in the skeg crop. Following the deck edge closes it.
   {
     const st = stations[0];
     const r = rings[0];
-    HULL.cap(r, [0, (st.keel + st.sheer) * 0.5, st.z], [0, 0, -1], true);
+    const top: V3[] = [];
+    for (let k = DECK_COLS.length - 2; k >= 1; k--) {
+      const d = deckPoint(st, DECK_COLS[k]);
+      top.push([d[0], d[1], st.z]);
+    }
+    const loop = [...r, ...top];
+    HULL.beginFacet();
+    HULL.cap(loop, [0, (st.keel + st.sheer) * 0.5, st.z], [0, 0, -1], true);
+    HULL.endFacet();
   }
   // Bow: the last station is nearly a point, so this is a sliver.
   {
     const st = stations[nStations - 1];
     const r = rings[nStations - 1];
+    HULL.beginFacet();
     HULL.cap(r, [0, (st.keel + st.sheer) * 0.5, st.z], [0, 0, 1], true);
+    HULL.endFacet();
   }
 
   // ── Deck ──────────────────────────────────────────────────────────────────
-  // Six columns per segment. The two central columns forward of the cockpit are
-  // bright: that is the racing stripe, and it is the single strongest cue that
-  // tells you which way a boat 60 m away is pointing.
+  // Seven columns, four longitudinal zones — 28 flat deck panels rather than 168
+  // triangle slivers. The two central columns forward of the cockpit are bright:
+  // that is the racing stripe, and it is the single strongest cue that tells you
+  // which way a boat 60 m away is pointing.
+  //
+  // The two outboard-but-not-outermost columns are *omitted* over the cockpit
+  // zone; that span is the footwell, built below.
   const STRIPE_FROM_Z = 0.3;
-  for (let i = 0; i < nStations - 1; i++) {
-    const sa = stations[i];
-    const sb = stations[i + 1];
-    const stripe = sa.z >= STRIPE_FROM_Z;
-    for (let j = 0; j < DECK_COLS.length - 1; j++) {
-      const f0 = DECK_COLS[j];
-      const f1 = DECK_COLS[j + 1];
-      const central = Math.abs(f0) <= STRIPE_HALF && Math.abs(f1) <= STRIPE_HALF;
+  for (let j = 0; j < DECK_COLS.length - 1; j++) {
+    const f0 = DECK_COLS[j];
+    const f1 = DECK_COLS[j + 1];
+    const central = Math.abs(f0) <= STRIPE_HALF && Math.abs(f1) <= STRIPE_HALF;
+    const wellCol = isWellColumn(f0, f1);
+    for (const [z0, z1] of DECK_ZONES) {
+      const stripe = stations[z0].z >= STRIPE_FROM_Z;
       const target = stripe && central ? BRIGHT : HULL;
-      target.quad(deckPoint(sa, f0), deckPoint(sb, f0), deckPoint(sb, f1), deckPoint(sa, f1));
+      target.beginFacet();
+      for (let i = z0; i <= z1; i++) {
+        const sa = stations[i];
+        const sb = stations[i + 1];
+        if (wellCol && sa.z >= WELL_Z0 - 1e-4 && sb.z <= WELL_Z1 + 1e-4) continue;
+        target.quad(deckPoint(sa, f0), deckPoint(sb, f0), deckPoint(sb, f1), deckPoint(sa, f1));
+      }
+      target.endFacet();
     }
   }
 
@@ -561,27 +768,38 @@ export function createBoatMesh(id: number): BoatMesh {
   // reads as a drawn line at any distance and it thickens the silhouette edge,
   // which is what stops the boat looking like folded paper.
   for (const sign of [-1, 1]) {
-    for (let i = 0; i < nStations - 1; i++) {
-      const sa = stations[i];
-      const sb = stations[i + 1];
-      const swa = sheerHalf(sa);
-      const swb = sheerHalf(sb);
-      const ta = sa.sheer + RAIL_H;
-      const tb = sb.sheer + RAIL_H;
-      const wa = Math.min(RAIL_W, swa * 0.5);
-      const wb = Math.min(RAIL_W, swb * 0.5);
-      // outer face
-      TRIM.quadMirrored(sign, [swa, sa.sheer, sa.z], [swa, ta, sa.z], [swb, tb, sb.z], [swb, sb.sheer, sb.z]);
-      // top face
-      TRIM.quadMirrored(sign, [swa, ta, sa.z], [swa - wa, ta, sa.z], [swb - wb, tb, sb.z], [swb, tb, sb.z]);
-      // inner face, down onto the deck
-      TRIM.quadMirrored(
-        sign,
-        [swa - wa, ta, sa.z],
-        [swa - wa, deckPoint(sa, (swa - wa) / swa)[1], sa.z],
-        [swb - wb, deckPoint(sb, (swb - wb) / swb)[1], sb.z],
-        [swb - wb, tb, sb.z],
-      );
+    // One facet per (side, zone, face). The rail's inner face is the worst
+    // offender in the file for the stipple — it is defined against `deckPoint`,
+    // so every one of its quads is non-planar, and the review frames caught the
+    // hatch on "the gunwale insides" specifically.
+    for (const [z0, z1] of FLANK_ZONES) {
+      for (let face = 0; face < 3; face++) {
+        TRIM.beginFacet();
+        for (let i = z0; i <= z1; i++) {
+          const sa = stations[i];
+          const sb = stations[i + 1];
+          const swa = sheerHalf(sa);
+          const swb = sheerHalf(sb);
+          const ta = sa.sheer + RAIL_H;
+          const tb = sb.sheer + RAIL_H;
+          const wa = Math.min(RAIL_W, swa * 0.5);
+          const wb = Math.min(RAIL_W, swb * 0.5);
+          if (face === 0) {
+            TRIM.quadMirrored(sign, [swa, sa.sheer, sa.z], [swa, ta, sa.z], [swb, tb, sb.z], [swb, sb.sheer, sb.z]);
+          } else if (face === 1) {
+            TRIM.quadMirrored(sign, [swa, ta, sa.z], [swa - wa, ta, sa.z], [swb - wb, tb, sb.z], [swb, tb, sb.z]);
+          } else {
+            TRIM.quadMirrored(
+              sign,
+              [swa - wa, ta, sa.z],
+              [swa - wa, deckPoint(sa, (swa - wa) / swa)[1], sa.z],
+              [swb - wb, deckPoint(sb, (swb - wb) / swb)[1], sb.z],
+              [swb - wb, tb, sb.z],
+            );
+          }
+        }
+        TRIM.endFacet();
+      }
     }
     // Close the rail's ends so the inverted hull has no aperture.
     for (const idx of [0, nStations - 1]) {
@@ -604,10 +822,14 @@ export function createBoatMesh(id: number): BoatMesh {
   // ── Engine cowling ────────────────────────────────────────────────────────
   {
     const cowlRings = COWL.map((c) => humpRing(c.hw, c.top, c.z));
-    for (let i = 0; i < cowlRings.length - 1; i++) {
-      const A = cowlRings[i];
-      const B = cowlRings[i + 1];
-      for (let j = 0; j < A.length - 1; j++) {
+    // One facet per longitudinal panel: the cowling is eight flat planes with
+    // eight hard creases, which is what a cel image can actually draw.
+    for (let j = 0; j < cowlRings[0].length - 1; j++) {
+      const target = CROWN_SEGMENTS.includes(j) ? BRIGHT : HULL;
+      target.beginFacet();
+      for (let i = 0; i < cowlRings.length - 1; i++) {
+        const A = cowlRings[i];
+        const B = cowlRings[i + 1];
         // Segments 2 and 3 are the crown. Running the racing stripe over them
         // gives the boat a readable graphic from directly behind, which is the
         // angle the player spends most of the race looking at a rival from.
@@ -619,19 +841,23 @@ export function createBoatMesh(id: number): BoatMesh {
         // culling and the *outline* hull shows through instead, so the cowling
         // renders as a solid ink blob — which is exactly how it looked in the
         // first capture of this file.
-        const target = CROWN_SEGMENTS.includes(j) ? BRIGHT : HULL;
         target.quad(A[j], A[j + 1], B[j + 1], B[j]);
       }
+      target.endFacet();
     }
     const front = COWL[0];
     const back = COWL[COWL.length - 1];
+    HULL.beginFacet();
     HULL.cap(cowlRings[0], [0, (HUMP_BASE + front.top) * 0.5, front.z], [0, 0, 1], true);
+    HULL.endFacet();
+    HULL.beginFacet();
     HULL.cap(
       cowlRings[cowlRings.length - 1],
       [0, (HUMP_BASE + back.top) * 0.5, back.z],
       [0, 0, -1],
       true,
     );
+    HULL.endFacet();
     // Floor, so the shell is closed where it meets the deck.
     HULL.quad(
       [-front.hw, HUMP_BASE, front.z],
@@ -656,18 +882,28 @@ export function createBoatMesh(id: number): BoatMesh {
   // ── Saddle ────────────────────────────────────────────────────────────────
   {
     const saddleRings = SADDLE.map((c) => humpRing(c.hw, c.top, c.z));
-    for (let i = 0; i < saddleRings.length - 1; i++) {
-      TRIM.loft(saddleRings[i], saddleRings[i + 1], true);
+    for (let j = 0; j < saddleRings[0].length - 1; j++) {
+      TRIM.beginFacet();
+      for (let i = 0; i < saddleRings.length - 1; i++) {
+        const A = saddleRings[i];
+        const B = saddleRings[i + 1];
+        TRIM.quad(A[j], B[j], B[j + 1], A[j + 1]);
+      }
+      TRIM.endFacet();
     }
     const back = SADDLE[0];
     const front = SADDLE[SADDLE.length - 1];
+    TRIM.beginFacet();
     TRIM.cap(saddleRings[0], [0, (HUMP_BASE + back.top) * 0.5, back.z], [0, 0, -1], true);
+    TRIM.endFacet();
+    TRIM.beginFacet();
     TRIM.cap(
       saddleRings[saddleRings.length - 1],
       [0, (HUMP_BASE + front.top) * 0.5, front.z],
       [0, 0, 1],
       true,
     );
+    TRIM.endFacet();
     TRIM.quad(
       [-back.hw, HUMP_BASE, back.z],
       [back.hw, HUMP_BASE, back.z],
@@ -678,26 +914,93 @@ export function createBoatMesh(id: number): BoatMesh {
     BRIGHT.taperBox(-1.0, -0.2, [-0.245, 0.245, 0.575, 0.605], [-0.205, 0.205, 0.52, 0.55]);
   }
 
-  // ── Footboards ────────────────────────────────────────────────────────────
-  // Flat trim plates either side of the saddle. Not a modelled recess — at the
-  // distances this game is played at, the tonal break does the work and the
-  // Sobel pass inks the material boundary for free.
-  for (const sign of [-1, 1]) {
-    const zs = [-0.85, -0.5, -0.1, 0.3];
-    for (let i = 0; i < zs.length - 1; i++) {
-      const sa = stationAt(zs[i]);
-      const sb = stationAt(zs[i + 1]);
-      const lift = 0.008;
-      const inner = 0.34, outer = 0.78;
-      const p = (st: Station, f: number): V3 => {
-        const d = deckPoint(st, f);
-        return [d[0], d[1] + lift, d[2]];
+  // ── Cockpit footwell ──────────────────────────────────────────────────────
+  // A genuine recess: floor, two long walls, two end walls. It replaces two flat
+  // trim plates lifted 8 mm off the deck, which read as neither a footwell nor
+  // anything else — and whose 8 mm lip caught the sun as a 1-px bright line
+  // along the deck in the review frames.
+  //
+  // Each wall is one facet, so from any angle the cockpit resolves into four
+  // large flat tones stepping down from the deck. That step *is* the drawing.
+  {
+    const wellStations: Station[] = [];
+    for (const st of stations) if (st.z >= WELL_Z0 - 1e-4 && st.z <= WELL_Z1 + 1e-4) wellStations.push(st);
+    const [fIn, fOut] = WELL_COLS;
+    const floorOf = (st: Station, f: number): V3 => {
+      const d = deckPoint(st, f);
+      return [d[0], d[1] - WELL_DROP, d[2]];
+    };
+    for (const sign of [-1, 1]) {
+      // Floor.
+      TRIM.beginFacet();
+      for (let i = 0; i < wellStations.length - 1; i++) {
+        const sa = wellStations[i];
+        const sb = wellStations[i + 1];
+        TRIM.quadMirrored(sign, floorOf(sa, fIn), floorOf(sb, fIn), floorOf(sb, fOut), floorOf(sa, fOut));
+      }
+      TRIM.endFacet();
+      // Outboard wall, rising to the deck. Wound so it faces inboard.
+      TRIM.beginFacet();
+      for (let i = 0; i < wellStations.length - 1; i++) {
+        const sa = wellStations[i];
+        const sb = wellStations[i + 1];
+        TRIM.quadMirrored(
+          sign,
+          floorOf(sa, fOut),
+          floorOf(sb, fOut),
+          deckPoint(sb, fOut),
+          deckPoint(sa, fOut),
+        );
+      }
+      TRIM.endFacet();
+      // Inboard wall — buried in the saddle's flank along most of its length, so
+      // it never shows daylight under the hump.
+      TRIM.beginFacet();
+      for (let i = 0; i < wellStations.length - 1; i++) {
+        const sa = wellStations[i];
+        const sb = wellStations[i + 1];
+        TRIM.quadMirrored(
+          sign,
+          deckPoint(sa, fIn),
+          deckPoint(sb, fIn),
+          floorOf(sb, fIn),
+          floorOf(sa, fIn),
+        );
+      }
+      TRIM.endFacet();
+      // End walls, aft then forward.
+      const aft = wellStations[0];
+      const fwd = wellStations[wellStations.length - 1];
+      TRIM.quadMirrored(sign, floorOf(aft, fIn), deckPoint(aft, fIn), deckPoint(aft, fOut), floorOf(aft, fOut));
+      TRIM.quadMirrored(sign, floorOf(fwd, fOut), deckPoint(fwd, fOut), deckPoint(fwd, fIn), floorOf(fwd, fIn));
+      // Non-slip pad on the floor — the one bright value inside the well, which
+      // is what makes the recess read as depth rather than as a dark decal.
+      const padIn = fIn + (fOut - fIn) * 0.18;
+      const padOut = fIn + (fOut - fIn) * 0.82;
+      const lift = 0.012;
+      const pad = (st: Station, f: number): V3 => {
+        const p = floorOf(st, f);
+        return [p[0], p[1] + lift, p[2]];
       };
-      TRIM.quadMirrored(sign, p(sa, inner), p(sb, inner), p(sb, outer), p(sa, outer));
+      BRIGHT.beginFacet();
+      for (let i = 0; i < wellStations.length - 1; i++) {
+        const sa = wellStations[i];
+        const sb = wellStations[i + 1];
+        BRIGHT.quadMirrored(sign, pad(sa, padIn), pad(sb, padIn), pad(sb, padOut), pad(sa, padOut));
+      }
+      BRIGHT.endFacet();
     }
   }
 
-  // ── Handlebar column, bar, windscreen ─────────────────────────────────────
+  // ── Seat back ─────────────────────────────────────────────────────────────
+  // A backrest bridging the saddle's aft end and the cowling's forward face. It
+  // costs 12 triangles and it is what turns "a hump with a pad on it" into a
+  // seat when the boat is viewed from astern — which is the angle the player
+  // looks at their own boat from for the entire race.
+  TRIM.taperBox(-1.14, -1.0, [-0.28, 0.28, 0.5, 0.88], [-0.25, 0.25, 0.5, 0.84]);
+  BRIGHT.taperBox(-1.0, -0.965, [-0.215, 0.215, 0.6, 0.83], [-0.205, 0.205, 0.6, 0.8]);
+
+  // ── Handlebar column and bar ──────────────────────────────────────────────
   // The column leans back off the foredeck to meet the bar, which sits where
   // GRIP_LOCAL says the rider's hands are. A vertical post at the wrong z looks
   // like a bollard and gives the rider nothing to hold.
@@ -706,11 +1009,76 @@ export function createBoatMesh(id: number): BoatMesh {
   for (const sign of [-1, 1]) {
     BRIGHT.box(sign * 0.235, sign * 0.352, 0.748, 0.802, -0.058, 0.022);
   }
-  // Raked windscreen: a pale wedge leaning back over the handlebar, tall enough
-  // that the rider's helmet sits *behind* something. It is the second-strongest
-  // silhouette event after the engine hump, and it tells you instantly which end
-  // of the boat is the front.
-  BRIGHT.taperBox(0.16, 0.6, [-0.255, 0.255, 0.775, 0.845], [-0.33, 0.33, 0.29, 0.355]);
+
+  // ── Console and windscreen ────────────────────────────────────────────────
+  // The screen used to be a single pale slab 0.66 m wide and 0.66 m along its
+  // slope, laid on the red foredeck at a 48° rake: measured against the review
+  // frames it was the largest untextured area on the boat, it read as a blank
+  // card, and from the bow camera it covered the rider's chest.
+  //
+  // It is now a quarter of that area, stood on a dark console instead of lying
+  // on the deck, framed on all four edges in the trim tone, and glazed in its
+  // own pale-cyan material with a hard highlight wedge across it. The frame is
+  // what gives it an ink contour on every edge — the inverted hull can only ink
+  // a silhouette, so an unframed plate seen face-on has no line at all.
+  {
+    // Console body: a wedge rising out of the foredeck, tallest at its aft face
+    // where the screen stands. Its aft face is 0.44 m tall, which is what gives
+    // the deck a hard horizon line between "cockpit" and "foredeck".
+    TRIM.taperBox(0.30, 0.70, [-0.40, 0.40, 0.18, 0.62], [-0.32, 0.32, 0.24, 0.40]);
+    // Instrument bezel let into the console's top — a second value so the
+    // console is not one flat block.
+    BRIGHT.taperBox(0.37, 0.62, [-0.21, 0.21, 0.60, 0.618], [-0.175, 0.175, 0.44, 0.458]);
+
+    // Screen. Base sits on the console's aft-top edge, leaning back over the
+    // bars: 0.24 m of run for 0.27 m of rise, i.e. 48° from horizontal — the
+    // same rake as the slab it replaces, at a third of the area.
+    const bz = 0.34, by = 0.585; // base, on the console
+    const tz = 0.10, ty = 0.855; // top, over the handlebar
+    const bw = 0.285, tw = 0.225;
+    const T = 0.034; // glass thickness, measured vertically
+
+    // Body: everything but the outer face, which is split between two materials
+    // below.
+    GLASS.taperBox(tz, bz, [-tw, tw, ty, ty + T], [-bw, bw, by, by + T], true, true, true);
+
+    // The outer face is a genuine plane (its two end edges are parallel lines
+    // along X), so any polygon drawn on it is planar and shades as one flat
+    // value. Split it on a diagonal: the port side is the glare, the rest is
+    // glass. Two flat fills and one hard diagonal — no gradient, and the
+    // material change gives the Sobel pass an interior line for free.
+    const P = (u: number, v: number): V3 => {
+      const w = bw + (tw - bw) * u;
+      return [v * w, by + T + (ty - by) * u, bz + (tz - bz) * u];
+    };
+    const vBase = 0.34;
+    const vTop = -0.62;
+    BRIGHT.beginFacet();
+    BRIGHT.quad(P(0, -1), P(0, vBase), P(1, vTop), P(1, -1));
+    BRIGHT.endFacet();
+    GLASS.beginFacet();
+    GLASS.quad(P(0, vBase), P(0, 1), P(1, 1), P(1, vTop));
+    GLASS.endFacet();
+
+    // Frame. Two raked stanchions outboard of the glass plus a cap rail along
+    // the top edge: three dark bars that close the screen into a loop, so it has
+    // an ink contour on every edge instead of on the two the silhouette happens
+    // to give it.
+    for (const sign of [-1, 1]) {
+      TRIM.taperBox(
+        tz,
+        bz,
+        [sign * tw, sign * (tw + 0.036), ty - 0.008, ty + T + 0.014],
+        [sign * bw, sign * (bw + 0.036), by - 0.008, by + T + 0.014],
+      );
+    }
+    TRIM.taperBox(
+      tz - 0.042,
+      tz + 0.02,
+      [-tw - 0.036, tw + 0.036, ty - 0.01, ty + T + 0.016],
+      [-tw - 0.036, tw + 0.036, ty - 0.01, ty + T + 0.016],
+    );
+  }
 
   // ── Wing and tail fin ─────────────────────────────────────────────────────
   // Two attempts got binned here. A wing as wide as the beam read as a swim
@@ -745,19 +1113,50 @@ export function createBoatMesh(id: number): BoatMesh {
   // sits *inside* the hull and contributes nothing to the silhouette.
   TRIM.taperBox(2.2, 2.54, [-0.085, 0.085, 0.3, 0.66], [-0.02, 0.02, 0.47, 0.51]);
 
-  // ── Boarding step, skeg, exhausts ─────────────────────────────────────────
-  // The step used to start at z = -2.33, one centimetre clear of the transom
-  // (z = -2.32); it now overlaps it, because a 1 cm gap is still a gap and the
-  // step carries its own outline in the bright material.
-  BRIGHT.box(-0.62, 0.62, -0.06, 0.065, -2.42, -2.3);
-  // Skeg: a blade on the centreline, deepest at the transom (y = -0.62) and
-  // fairing back up into the keel by z = -1.66.
-  TRIM.taperBox(-2.34, -1.66, [-0.048, 0.048, -0.62, -0.18], [-0.04, 0.04, -0.3, -0.2]);
-  // Cavitation plate, straddling the skeg. Its previous span (z -2.28 → -2.0 at
-  // y = -0.63) ran forward past the skeg's rising underside and hung in open
-  // water under the hull; kept short and 3 cm higher it stays inside the blade
-  // along its whole length.
-  TRIM.box(-0.24, 0.24, -0.6, -0.53, -2.34, -2.18);
+  // ── Transom ───────────────────────────────────────────────────────────────
+  // The stern wall used to be, from astern: a thin strip of red, a full-beam
+  // bright bar, another thin strip of red. The bright bar was the boarding step,
+  // 1.24 m wide and standing 10 cm proud of the transom, and it swallowed the
+  // whole stern face. That is why the review frames reported "the transom is
+  // absent — you look straight through into the interior floor".
+  //
+  // It is now a composed stern: a dark plate over the lower two-thirds, a
+  // narrower bright step let into it, and a bright accent band under the deck
+  // line. Four values plus ink, in a stack, in the one place the player looks at
+  // for the whole race.
+  {
+    const st = stations[0];
+    const sw = sheerHalf(st);
+    // Dark plate covering the lower transom. Proud by 2 cm so its edge silhouette
+    // separates from the red shell.
+    TRIM.taperBox(-2.345, -2.28, [-sw * 0.9, sw * 0.9, -0.2, 0.055], [-sw * 0.94, sw * 0.94, -0.21, 0.06]);
+    // Boarding step: narrower than the transom, so red shell reads either side.
+    BRIGHT.box(-0.4, 0.4, -0.055, 0.06, -2.4, -2.3);
+    // Accent band immediately under the deck edge, full beam. This is the line
+    // that says "stern" at 60 m.
+    BRIGHT.taperBox(-2.35, -2.3, [-sw * 0.86, sw * 0.86, 0.12, 0.175], [-sw * 0.9, sw * 0.9, 0.115, 0.18]);
+  }
+
+  // ── Drive leg ─────────────────────────────────────────────────────────────
+  // Previously a 9.6 cm blade and a flat plate: the review frames called it "a
+  // plain grey cross". It is now a real outboard leg — strut, gearcase pod, prop
+  // boss — so the one part of the boat that touches water has enough mass to
+  // carry an outline and enough value change to read as a mechanism.
+  //
+  // The cel outline is an inverted hull pushed a constant number of *screen*
+  // pixels along the smoothed normal. On a 9.6 cm blade seen edge-on there is
+  // barely any silhouette for it to sit outside of, which is why the line came
+  // and went along its length. 16 cm fixes that without changing the profile the
+  // buoyancy contact table quotes (skeg tip stays at y = -0.60, z = -2.24).
+  TRIM.taperBox(-2.36, -1.66, [-0.08, 0.08, -0.6, -0.18], [-0.055, 0.055, -0.3, -0.2]);
+  // Gearcase pod: a horizontal torpedo at the foot of the strut.
+  TRIM.taperBox(-2.5, -2.02, [-0.075, 0.075, -0.52, -0.35], [-0.105, 0.105, -0.56, -0.3]);
+  // Prop boss, in the racer's own hull colour — a small warm accent at the very
+  // stern that tells you where the thrust comes from.
+  HULL.taperBox(-2.58, -2.48, [-0.035, 0.035, -0.47, -0.4], [-0.075, 0.075, -0.51, -0.36]);
+  // Cavitation plate, straddling the leg above the pod. Bright, so the leg has a
+  // horizontal value break across it instead of being one grey mass.
+  BRIGHT.box(-0.26, 0.26, -0.295, -0.25, -2.44, -2.08);
   for (const sign of [-1, 1]) {
     TRIM.box(sign * 0.2, sign * 0.34, 0.115, 0.235, -2.44, -2.3);
   }
@@ -771,6 +1170,7 @@ export function createBoatMesh(id: number): BoatMesh {
     [HULL, mats.hull, 'hullShell'],
     [TRIM, mats.trim, 'hullTrim'],
     [BRIGHT, mats.bright, 'hullBright'],
+    [GLASS, mats.glass, 'hullGlass'],
   ];
   let triangles = 0;
   for (const [surf, set, name] of parts) {
@@ -795,7 +1195,7 @@ export function createBoatMesh(id: number): BoatMesh {
     group,
     seat,
     grip,
-    materials: [mats.hull, mats.trim, mats.bright],
+    materials: [mats.hull, mats.trim, mats.bright, mats.glass],
     triangles,
   };
 }

@@ -132,6 +132,58 @@ const BRAKE_ACCEL = 7.5;
 
 const GATE_COUNT = 12;
 
+/**
+ * Ribbon half-width ceiling in DEVICE pixels.
+ *
+ * The ribbon used to be 2.3 m wide in world space, which is a hint line in the
+ * aerial and a green carpet from the chase camera: at 12 m from the lens 2.3 m
+ * projects to ~160 device px, so the "hint" became the most saturated object in
+ * the money shot and passed visibly down both sides of the hull
+ * (shots/r3/hero.png, shots/r3/land.png). Width is now clamped the same way the
+ * ink is — a constant number of screen pixels — so it can never grow into a
+ * surface no matter how close the camera gets.
+ */
+const RIBBON_MAX_HALF_PX = 4.0;
+/** Metres from the hull inside which the ribbon is fully transparent. */
+const RIBBON_HULL_CLEAR = 6.5;
+/** Metres from the hull at which the ribbon reaches full strength again. */
+const RIBBON_HULL_FADE = 19.0;
+
+/**
+ * Corner-warning boards: below this severity a corner gets no board. A 45 m
+ * sweeper is flat out, and a warning that fires on a corner you do not brake for
+ * is a warning the driver learns to ignore.
+ */
+const BOARD_MIN_SEVERITY = 0.22;
+/** Severity at and above which the board goes red rather than yellow. */
+const BOARD_HOT_SEVERITY = 0.58;
+/** Metres before the mouth of the corner the board is planted. */
+const BOARD_LEAD = 38;
+/** Metres outboard of the centreline — always outside the turn, never in the line. */
+const BOARD_OUTSET = 16;
+
+/**
+ * Projected radius, in device pixels, that a coloured marker is held at.
+ *
+ * Course furniture has to be legible from any distance a legal camera can put it
+ * at, and world-space geometry cannot do that: shots/r3/course.png (aerial) and
+ * shots/r3/outline_far.png (horizon) both reduced the gates' identity colours to
+ * two- or three-pixel specks while their grey structure stayed readable, so the
+ * gates became grey scaffolds with no left/right cue. Marker elements are
+ * therefore grown about their own centre until they project to at least this
+ * many pixels, capped at `MARKER_MAX_GROWTH` so the near field keeps the designed
+ * proportions.
+ */
+const GATE_MIN_MARKER_PX = 16;
+const BOARD_MIN_MARKER_PX = 22;
+/**
+ * Ceiling on the growth. The first pass ran at 4.2× and it was too much: measured
+ * in shots/race_r2/hero.png, the mast-head daymarks on the 250–450 m gates became
+ * slabs the size of armchairs and the gates read as floating furniture. 2.2× is
+ * the largest factor at which a grown marker still reads as part of its gate.
+ */
+const MARKER_MAX_GROWTH = 2.2;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Scratch — module scope, never allocated per frame
 // ─────────────────────────────────────────────────────────────────────────────
@@ -246,6 +298,8 @@ export class Track implements TrackAPI, Subsystem {
     gateMinPlanDepth: number;
     /** Clear height under the gate arch above the water, metres. */
     gateArchClearance: number;
+    /** How many corners got a warning board. 5 on the shipped layout. */
+    cornerBoards: number;
   };
 
   /** Live corner preview for the player, refreshed every frame. */
@@ -258,6 +312,12 @@ export class Track implements TrackAPI, Subsystem {
   };
 
   private ribbon!: Mesh;
+  /**
+   * Player hull position, republished every frame. The ribbon reads it to punch
+   * a hole around the boat; nothing is ever drawn behind or beside the hull.
+   * Preallocated, written in place — no allocation in the frame loop.
+   */
+  private readonly hullUniform = { value: new Vector3(0, 0, 1e6) };
   /** Which gate each lamp vertex belongs to, and the state written for it. */
   private lampGate!: Float32Array;
   private lampState!: Float32Array;
@@ -273,7 +333,13 @@ export class Track implements TrackAPI, Subsystem {
     this.tx = built.tx;
     this.tz = built.tz;
     this.pk = built.pk;
-    this.design = { ...built.design, ribbonSagitta: 0, gateMinPlanDepth: 0, gateArchClearance: 0 };
+    this.design = {
+      ...built.design,
+      ribbonSagitta: 0,
+      gateMinPlanDepth: 0,
+      gateArchClearance: 0,
+      cornerBoards: 0,
+    };
 
     this.buildPreview();
     this.buildSpeedProfile();
@@ -712,37 +778,44 @@ export class Track implements TrackAPI, Subsystem {
   // ── The racing-line ribbon ────────────────────────────────────────────────
 
   /**
-   * A HINT LINE, not a lane.
+   * A HINT LINE, not a lane. Width in PIXELS, not in metres.
    *
-   * Two earlier versions were wrong in opposite directions. The first was 3 m
+   * Three earlier versions were wrong in three different ways. The first was 3 m
    * wide, two vertices across, and foreshortened to a green hair. The reaction
-   * to that — a 7.2 m lane with 0.62 m glow rails, animated chevrons, a dashed
-   * centre spine and a brightness gain that multiplied its alpha by up to 4.6 at
-   * grazing angles — went far past the brief. Measured in shots/race_fix0 it was
-   * the brightest thing in the frame, covered roughly a third of the screen, and
-   * its vertical rails drew a razor-straight silhouette across a wave
-   * (shots/race_fix0/rider_closeup.png, the green edge under the hull). It was
-   * hiding the water it was supposed to sit on, and its additive brightness
-   * cleared the composite's flare threshold, so a *graphic* element was
-   * generating photographic bloom.
+   * to that — a 7.2 m lane with glow rails, chevrons and a 4.6× grazing gain —
+   * covered a third of the screen. The third narrowed it to 2.3 m of *world*
+   * width, which measured correctly as a thin line from the aerial
+   * (shots/r3/course.png) and completely wrongly from every chase framing: 2.3 m
+   * at 12 m from the lens is ~160 device px, so shots/r3/hero.png and
+   * shots/r3/land.png show a broad, saturated green carpet running under and
+   * down both sides of the hull. World width cannot be tuned to be right at both
+   * 12 m and 500 m. So:
    *
-   * So this one is a hint and nothing more:
-   *
-   *   • 2.3 m across — one boat width (beam is 1.9 m), so it reads as a line the
-   *     hull covers rather than a road the hull sits inside;
-   *   • flat on the water. No rails, no vertical geometry at all, which is what
-   *     removes the straight-edge-across-a-wave artefact;
-   *   • alpha 0.26, one hard step up to 0.36 at the outer 22 % so it has a drawn
-   *     edge. No dashes, no chevrons, no distance gain, no grazing gain. Peak
-   *     composited luminance is ~0.37, far below the flare threshold of 0.985,
-   *     so it cannot bloom;
-   *   • tinted in three hard steps by the *upcoming* corner — green clear, pink
-   *     for a corner, red for the hairpin. This is the only marking left on it,
-   *     and it is the in-world corner-preview indicator the brief asked for;
-   *   • sampled every metre along and every 0.38 m across, and every vertex is
-   *     lifted onto the shared Gerstner surface. `design.ribbonSagitta` reports
-   *     the measured worst-case deviation between the drawn strip and the water
-   *     (see `measureRibbonError`) — the budget is 10 cm.
+   *   • **the strip is built degenerate** — all seven vertices of a station sit
+   *     on the centreline — and the vertex shader spreads it laterally by a
+   *     measured number of *screen pixels*, exactly the way `createCelMaterial`
+   *     sizes the ink. `RIBBON_MAX_HALF_PX` is the ceiling; the world width
+   *     (1.15 m half) is the floor, so the line is at most 8 device px wide near
+   *     the camera and simply thins out with distance like any drawn mark;
+   *   • **value, not hue.** `PAL.raceLineGlow` (a pale mint) at 0.30/0.14 alpha
+   *     reads as a tint lifted off the water. `PAL.raceLine` at 0.26 was the
+   *     most saturated colour in the frame;
+   *   • **it clears the hull.** Alpha is zeroed inside `RIBBON_HULL_CLEAR` of the
+   *     player and ramps in by `RIBBON_HULL_FADE`, so nothing is ever drawn
+   *     behind, beside or under the boat. This is a distance to the *hull*, not
+   *     to the camera: a camera fade cannot do it, because the chase camera sits
+   *     behind the boat and the water beside the hull is further from the lens
+   *     than the water behind it;
+   *   • **no severity colour at all.** The old three-step tint
+   *     (raceLine → PAL.boost → PAL.warn) read as chromatic aberration trailing
+   *     the stern over cyan water (shots/r3/ocean_low.png right of the stern,
+   *     shots/r3/course.png bottom corners), stepped in hard blocks along its
+   *     length, and stole the boost meter's magenta. Corner severity moved to a
+   *     channel that can carry it: the in-world warning boards in
+   *     `buildCornerBoards`;
+   *   • every vertex is lifted onto the shared Gerstner surface;
+   *     `design.ribbonSagitta` reports the measured worst-case gap between the
+   *     drawn strip and the water — the budget is 10 cm.
    */
   private buildRibbon() {
     // 1 m stations. Σ(aᵢ·kᵢ²) over the wave table is 0.41 1/m, which bounds the
@@ -750,16 +823,16 @@ export class Track implements TrackAPI, Subsystem {
     // 5 cm. Measured for real below rather than trusted.
     const STEP = 1.0;
     const SEGS = Math.max(600, Math.round(this.length / STEP));
-    /** Half-width, metres. Hull beam is 1.9 m. */
+    /** World half-width, metres — the *floor* on the screen-space clamp. */
     const W = 1.15;
-    /** Spans across the line. 6 → 0.38 m per span. */
-    const LAT = 6;
+    /** Spans across the line. 4 is enough for an 8 px mark with a core. */
+    const LAT = 4;
     const P = LAT + 1;
 
     const vcount = (SEGS + 1) * P;
     const positions = new Float32Array(vcount * 3);
     const lat = new Float32Array(vcount); // signed lateral fraction, −1…1
-    const sev = new Float32Array(vcount); // severity of the corner ahead, 0…1
+    const right = new Float32Array(vcount * 2); // world XZ of "track right"
     const indices = new Uint32Array(SEGS * LAT * 6);
 
     let ii = 0;
@@ -776,18 +849,19 @@ export class Track implements TrackAPI, Subsystem {
       const tl = Math.hypot(tanx, tanz) || 1;
       tanx /= tl;
       tanz /= tl;
-      const rx = -tanz;
-      const rz = tanx;
-      const sv = Math.abs(this.sev[si]);
 
       for (let p = 0; p < P; p++) {
         const l = -1 + (2 * p) / LAT;
-        const o = (i * P + p) * 3;
-        positions[o + 0] = cx + rx * l * W;
+        const v = i * P + p;
+        const o = v * 3;
+        // Every vertex of the station sits ON the centreline. The lateral spread
+        // is applied in the vertex shader, in pixels.
+        positions[o + 0] = cx;
         positions[o + 1] = 0;
-        positions[o + 2] = cz + rz * l * W;
-        lat[i * P + p] = l;
-        sev[i * P + p] = sv;
+        positions[o + 2] = cz;
+        lat[v] = l;
+        right[v * 2 + 0] = -tanz;
+        right[v * 2 + 1] = tanx;
       }
 
       if (i < SEGS) {
@@ -809,7 +883,7 @@ export class Track implements TrackAPI, Subsystem {
     const geo = new BufferGeometry();
     geo.setAttribute('position', new BufferAttribute(positions, 3));
     geo.setAttribute('aLat', new BufferAttribute(lat, 1));
-    geo.setAttribute('aSev', new BufferAttribute(sev, 1));
+    geo.setAttribute('aRight', new BufferAttribute(right, 2));
     geo.setIndex(new BufferAttribute(indices, 1));
     geo.boundingSphere = null;
 
@@ -823,68 +897,91 @@ export class Track implements TrackAPI, Subsystem {
       blending: NormalBlending,
       // FrontSide, and the winding is checked: with DoubleSide and depthWrite
       // off, both faces of every coplanar triangle blend, so a nominal alpha of
-      // 0.26 composites at 0.45 and the "30 % hint" is a 45 % wash.
+      // 0.30 composites at 0.51 and the "30 % hint" is a 51 % wash.
       side: FrontSide,
       uniforms: {
         uWaveA: { value: waveUniformArrays.uWaveA },
         uWaveB: { value: waveUniformArrays.uWaveB },
         uTime: SHARED.uTime,
         uCameraPos: SHARED.uCameraPos,
-        uColor: { value: PAL.raceLine.clone() },
-        uWarm: { value: PAL.boost.clone() },
-        uHot: { value: PAL.warn.clone() },
+        uResolution: SHARED.uResolution,
+        uColor: { value: PAL.raceLineGlow.clone() },
+        uHull: this.hullUniform,
+        uHalfWidth: { value: W },
+        uMaxHalfPx: { value: RIBBON_MAX_HALF_PX },
       },
       vertexShader: /* glsl */ `
         ${GERSTNER_GLSL}
         uniform vec3 uCameraPos;
+        uniform vec3 uHull;
+        uniform vec2 uResolution;
+        uniform float uHalfWidth;
+        uniform float uMaxHalfPx;
         attribute float aLat;
-        attribute float aSev;
+        attribute vec2 aRight;
         varying float vLat;
-        varying float vSev;
         varying float vDist;
+        varying float vHullDist;
         void main() {
           vLat = aLat;
-          vSev = aSev;
           vec3 world = (modelMatrix * vec4(position, 1.0)).xyz;
           vec3 pos; vec3 nrm; float jac;
           gerstnerSurface(world.xz, uTime, pos, nrm, jac);
           vDist = length(uCameraPos - pos);
+          vHullDist = length(pos.xz - uHull.xz);
           // The lift grows with distance because the ocean mesh does not: its
           // outer LOD rings evaluate the same field on a coarser grid, so far
           // water sits *above* the exactly-evaluated line and chops it into
           // dashes (visible on the far side of the circuit in
-          // shots/race_fix1/course.png). 9 cm near, 70 cm at half a kilometre —
-          // at which range 70 cm is a fraction of a pixel of parallax.
-          pos += nrm * (0.09 + 0.61 * smoothstep(90.0, 620.0, vDist));
-          gl_Position = projectionMatrix * viewMatrix * vec4(pos, 1.0);
+          // shots/race_fix1/course.png, and still as scattered flecks at 200–400 m
+          // in shots/race_r2/pack.png). 9 cm near, 1.4 m at 420 m — at which
+          // range 1.4 m is under four pixels of parallax, and a continuous line
+          // reads as a line where a dashed one reads as litter on the water.
+          pos += nrm * (0.09 + 1.31 * smoothstep(70.0, 420.0, vDist));
+
+          // ── Screen-space width clamp ──────────────────────────────────────
+          // Project the centreline point and a point one world half-width to its
+          // right, measure the gap in device pixels, and shrink the offset until
+          // it is at most uMaxHalfPx. min(1.0, …) means the line never grows
+          // *beyond* its world width, so far away it thins away naturally
+          // instead of being pinned open across the horizon.
+          mat4 vp = projectionMatrix * viewMatrix;
+          vec3 off = vec3(aRight.x, 0.0, aRight.y) * uHalfWidth;
+          vec4 c0 = vp * vec4(pos, 1.0);
+          vec4 c1 = vp * vec4(pos + off, 1.0);
+          vec2 s0 = c0.xy / max(c0.w, 0.05) * 0.5 * uResolution;
+          vec2 s1 = c1.xy / max(c1.w, 0.05) * 0.5 * uResolution;
+          float scale = min(1.0, uMaxHalfPx / max(length(s1 - s0), 1e-3));
+          gl_Position = vp * vec4(pos + off * (aLat * scale), 1.0);
         }
       `,
       fragmentShader: /* glsl */ `
         precision highp float;
-        uniform vec3 uColor, uWarm, uHot;
+        uniform vec3 uColor;
         varying float vLat;
-        varying float vSev;
         varying float vDist;
+        varying float vHullDist;
 
         void main() {
           float x = abs(vLat);
-          // Three hard steps, not a gradient: this is a drawn mark.
-          vec3 col = mix(uColor, uWarm, step(0.34, vSev));
-          col = mix(col, uHot, step(0.72, vSev));
+          // Two hard steps, not a gradient: this is a drawn mark. A brighter
+          // core inside a fainter flank is what makes an 8 px line read as
+          // chalk on water rather than as a hard graphic rule.
           float body = 1.0 - step(1.0, x);
-          float edge = step(0.78, x) * body;
-          float a = body * 0.26 + edge * 0.10;
+          float core = 1.0 - step(0.52, x);
+          float a = body * 0.14 + core * 0.16;
           // Fade out before the horizon so the far side of the circuit does not
-          // draw a green thread across the skyline.
+          // draw a thread across the skyline.
           a *= 1.0 - smoothstep(520.0, 1150.0, vDist);
-          // …and fade *in* over the first 30 m. A line on the water seen from a
-          // camera near the waterline foreshortens hardest right in front of the
-          // lens, so the nearest 20 m paints the largest area of screen and
-          // carries the least information — it is the stretch you are already
-          // driving on. Measured at 7.3 % of the countdown frame before this
-          // clause, 2.9 % after.
-          a *= smoothstep(8.0, 30.0, vDist);
-          gl_FragColor = vec4(col, a);
+          // Never draw within a few metres of the hull. Distance to the BOAT,
+          // not to the camera: the chase camera sits behind the boat, so water
+          // beside the hull is further from the lens than water behind it and a
+          // camera-distance fade leaves the carpet exactly where it hurts.
+          a *= smoothstep(${RIBBON_HULL_CLEAR.toFixed(1)}, ${RIBBON_HULL_FADE.toFixed(1)}, vHullDist);
+          // Cheap insurance for the cinematic cameras, which can fly the lens
+          // through the line without the player being anywhere near it.
+          a *= smoothstep(4.0, 15.0, vDist);
+          gl_FragColor = vec4(uColor, a);
         }
       `,
     });
@@ -937,6 +1034,109 @@ export class Track implements TrackAPI, Subsystem {
   // ── Gates ─────────────────────────────────────────────────────────────────
 
   /**
+   * One merged, cel-shaded, wave-floating mesh of course furniture.
+   *
+   * Two vertex-stage jobs, both shared verbatim by the main / prepass / outline
+   * materials so the ink and the G-buffer stay in register:
+   *
+   *   1. **marker growth**, when `markerMinPx` is set. Each vertex carries
+   *      `aElem`, the centre of the element it belongs to (or its own position,
+   *      which makes the scaling a no-op). The element is scaled about that centre
+   *      until its projected radius reaches `markerMinPx`. Uniform scaling about
+   *      a point does not rotate normals, so nothing else has to be touched.
+   *   2. **rigid-body float** on `aAnchor`, the world XZ of the gate centre.
+   *
+   * Growth runs first: the float term is measured from `aAnchor`, so it has to see
+   * the final local offset.
+   */
+  private floatingMesh(
+    m: Mesher,
+    color: (typeof PAL)['gate'],
+    name: string,
+    widthPx: number,
+    extra?: { chunks?: CelChunks; flareMask?: number; markerMinPx?: number },
+  ): Mesh {
+    const geo = m.build();
+    const mesh = new Mesh(geo);
+    mesh.name = name;
+    const minPx = extra?.markerMinPx ?? 0;
+    const growth = minPx > 0
+      ? /* glsl */ `
+        {
+          // Hold coloured markers at a legible screen size. uResolution.y /
+          // (2·d·tanHalfFov) is device pixels per world metre at depth d.
+          //
+          // aElem.w is the element's NOMINAL radius, authored per element rather
+          // than derived from |transformed − centre|: a per-vertex radius makes
+          // the factor vary across the element, which is not a scale — it
+          // projects every vertex onto a sphere and destroys the form.
+          vec3 elemW = (modelMatrix * vec4(aElem.xyz, 1.0)).xyz;
+          float d = max(length(uCameraPos - elemW), 1.0);
+          float pxPerM = uResolution.y / (2.0 * d * uTanHalfFov);
+          float want = ${minPx.toFixed(1)} / max(pxPerM, 1e-4);
+          float k = clamp(want / max(aElem.w, 1e-3), 1.0, ${MARKER_MAX_GROWTH.toFixed(1)});
+          transformed = aElem.xyz + (transformed - aElem.xyz) * k;
+        }
+      `
+      : '';
+    applyCel(
+      mesh,
+      createCelMaterial({
+        color,
+        name,
+        outlineWidthPx: widthPx,
+        rimStrength: 0.85,
+        rimPower: 2.6,
+        specSize: 0.9,
+        specStrength: 0.4,
+        flatShading: true,
+        flareMask: extra?.flareMask ?? 1,
+        chunks: {
+          uniforms: {
+            uWaveA: { value: waveUniformArrays.uWaveA },
+            uWaveB: { value: waveUniformArrays.uWaveB },
+            ...(extra?.chunks?.uniforms ?? {}),
+          },
+          vertexHead: /* glsl */ `
+            ${GERSTNER_NO_TIME}
+            attribute vec2 aAnchor;
+            ${minPx > 0 ? 'attribute vec4 aElem;' : ''}
+            ${extra?.chunks?.vertexHead ?? ''}
+          `,
+          vertexBody: /* glsl */ `
+            ${growth}
+            {
+              // Rigid-body float: sample the wave field once at the gate's
+              // centre, then move the whole arch with it.
+              vec3 wpos; vec3 wnrm; float wjac;
+              gerstnerSurface(aAnchor, uTime, wpos, wnrm, wjac);
+              vec3 local = transformed - vec3(aAnchor.x, 0.0, aAnchor.y);
+              // First-order rotation toward the surface normal. For a
+              // horizontal offset this evaluates to exactly ∇h·local, i.e. the
+              // linear extrapolation of the surface, which is why the far leg
+              // of a 26 m arch still lands on the water. Undamped for that
+              // reason — the old 0.72 left one foot in the air on a swell.
+              vec3 axis = vec3(wnrm.z, 0.0, -wnrm.x);
+              local += cross(axis, local);
+              objectNormal += cross(axis, objectNormal);
+              smoothNormal += cross(axis, smoothNormal);
+              transformed = vec3(wpos.x, wpos.y, wpos.z) + local;
+            }
+            ${extra?.chunks?.vertexBody ?? ''}
+          `,
+          fragmentHead: extra?.chunks?.fragmentHead ?? '',
+          fragmentBody: extra?.chunks?.fragmentBody ?? '',
+        },
+      }),
+    );
+    // 12 merged gates in one mesh: culling the lot on one bounding sphere
+    // would pop the far side of the course in and out, so keep it resident.
+    mesh.frustumCulled = false;
+    this.group.add(mesh);
+    return mesh;
+  }
+
+  /**
    * Twelve floating ARCHES the boat drives through, for the price of five meshes.
    *
    * ── What was wrong before ──────────────────────────────────────────────────
@@ -978,6 +1178,38 @@ export class Track implements TrackAPI, Subsystem {
    * linear extrapolation of the surface slope — `cross(axis, local).y` works out
    * to ∇h·local — so with the damping factor at 1.0 both feet sit on the water
    * even though only the centre is sampled.
+   *
+   * ── Reading at a glance (round 4) ──────────────────────────────────────────
+   * The truss arch had depth and a pass-state lamp but no *colour identity*: the
+   * pylons, beam and braces were all `foamShade`, and the only coloured parts
+   * were two 2.7 m paddles per side. Measured against shots/r3: from the aerial
+   * (course.png) each gate was a grey barbell with no visible left/right cue; on
+   * the horizon (outline_far.png) seven gates were identical grey scaffolds; and
+   * in the near field (pack.png) a grey diagonal beam bisected the whole frame.
+   * Three changes, all of them about *where the colour is*:
+   *
+   *   1. **the pylons carry the side colour.** The float collar and the leaning
+   *      mast moved out of `structure` and into the port/starboard meshes, so the
+   *      tallest and the widest elements of the gate are aqua on the left and
+   *      pink on the right at every distance. Only the beam and the braces stay
+   *      pale, which also stops the beam from being the heaviest thing in a
+   *      near-field frame — it is now the *lightest* member on a coloured leg.
+   *   2. **a screen-space size floor on the coloured parts.** Every marker vertex
+   *      carries `aElem`, the centre of the element it belongs to, and the vertex
+   *      shader scales the element about that centre until its projected radius
+   *      reaches `GATE_MIN_MARKER_PX`. So a paddle is its designed 2.7 m up close
+   *      and grows to at most 4× at half a kilometre, which is what puts colour
+   *      on the horizon gates instead of a two-pixel speck. Same trick, same
+   *      chunk, on the pass-state lamp.
+   *   3. **a foam collar.** A flared skirt of `PAL.foam` sits at the waterline
+   *      around each pylon, wider than the collar it wraps. It is the element
+   *      that says the gate is floating *in* the water rather than hovering over
+   *      it, and from the aerial it is the gate's whole plan-view signature: two
+   *      white rings joined by a pale bar.
+   *
+   * Left and right also differ in SILHOUETTE, not just hue, for the colour-blind
+   * case and for the horizon where hue collapses: port carries a triangular
+   * pennant at the mast top, starboard a rectangular panel.
    */
   private buildGates() {
     const structure = new Mesher();
@@ -985,6 +1217,10 @@ export class Track implements TrackAPI, Subsystem {
     const wingStbd = new Mesher();
     const accent = new Mesher();
     const lamp = new Mesher();
+    const foam = new Mesher();
+    const boardMid = new Mesher();
+    const boardHot = new Mesher();
+    const boardFace = new Mesher();
 
     const UP: V3 = [0, 1, 0];
     let minPlan = Infinity;
@@ -1020,19 +1256,25 @@ export class Track implements TrackAPI, Subsystem {
           return [px + (tx - px) * fr, pz + (tz - pz) * fr];
         };
 
-        // Float collar: two stacked frustums at the waterline, wide enough to
-        // read as something moored rather than a stick pushed into the sea, and
-        // wide enough to be the gate's plan-view signature from the aerial.
-        structure.prism(px, pz, -1.35, 1.3, px, pz, 0.0, 2.35, 9, true, false, cx, cz);
-        structure.prism(px, pz, 0.0, 2.35, px, pz, 0.9, 1.45, 9, false, false, cx, cz);
-        // The leaning mast.
-        structure.prism(px, pz, 0.78, 0.6, tx, tz, mastTop, 0.36, 7, false, true, cx, cz);
+        // Float collar and leaning mast, both in the SIDE COLOUR. These are the
+        // widest and the tallest members of the gate, so putting the aqua/pink
+        // identity on them is what makes "which way through" survive being 500 m
+        // away — and it takes the grey scaffold read off the near-field frames,
+        // because the only pale members left are the beam and the braces.
+        wing.prism(px, pz, -1.35, 1.3, px, pz, 0.0, 2.35, 9, true, false, cx, cz);
+        wing.prism(px, pz, 0.0, 2.35, px, pz, 0.9, 1.45, 9, false, false, cx, cz);
+        wing.prism(px, pz, 0.78, 0.6, tx, tz, mastTop, 0.36, 7, false, true, cx, cz);
         // Waterline stripe, so the gate has a value break where it meets the sea.
         accent.prism(px, pz, 0.22, 2.44, px, pz, 0.56, 2.44, 9, false, false, cx, cz);
+        // Foam collar. A flared skirt of white water wrapping the float, wider at
+        // the bottom than at the top so some of it is above the surface whatever
+        // the swell is doing. Nothing else in the frame connected a floating
+        // object to the water; from the aerial this is the gate's entire
+        // plan-view signature.
+        foam.prism(px, pz, -0.5, 3.9, px, pz, 0.14, 2.55, 12, false, false, cx, cz);
 
         // Marker paddles: two chamfered blades jutting INBOARD from the mast,
-        // horizontal, carrying the side identity — aqua to port, pink to
-        // starboard.
+        // horizontal, carrying the side identity.
         //
         // The previous shape here was a vertical plate, and a vertical coloured
         // plate on a post is a road sign no matter how thick it is
@@ -1040,15 +1282,53 @@ export class Track implements TrackAPI, Subsystem {
         // horizontal changes what it reads as — a navigation daymark — and it
         // also gives the gate its largest plan-view element, which is the angle
         // the old panels disappeared from.
+        //
+        // `beginElem` is what lets the vertex shader hold these at a legible
+        // screen size: it tags every vertex with the blade's own centre, so the
+        // blade can be scaled about itself without dragging the mast with it.
         for (const py of [3.3, 5.4]) {
           const [mx, mz] = mastAt(py);
+          const bcx = mx - rx * side * 1.25;
+          const bcz = mz - rz * side * 1.25;
+          wing.beginElem(bcx, py, bcz, 1.5);
           wing.chamferBox(
-            [mx - rx * side * 1.25, py, mz - rz * side * 1.25],
+            [bcx, py, bcz],
             [rx, 0, rz], UP, [fx, 0, fz],
             [1.35, 0.24, 0.66], 0.14, cx, cz,
           );
+          wing.endElem();
         }
         minPlan = Math.min(minPlan, 1.32);
+
+        // Mast-head daymark, in the IALA language a sailor already knows: a CONE
+        // to port, a DIAMOND to starboard. The two sides differ in SILHOUETTE as
+        // well as hue, which is what survives the pale horizon haze band and what
+        // a colour-blind player has left to read.
+        {
+          const hy = mastTop + 0.15;
+          if (side < 0) {
+            const apex: V3 = [tx + rx * 1.5, hy + 0.05, tz + rz * 1.5];
+            const b0: V3 = [tx - rx * 0.2, hy + 0.85, tz - rz * 0.2];
+            const b1: V3 = [tx - rx * 0.2, hy - 0.78, tz - rz * 0.2];
+            wing.beginElem(tx, hy, tz, 1.25);
+            wing.pennant(apex, b0, b1, [fx * 0.18, 0, fz * 0.18], cx, cz);
+            wing.endElem();
+          } else {
+            const pcx = tx - rx * 0.62;
+            const pcz = tz - rz * 0.62;
+            // Square on its point. Rotating the box axes 45° in the gate plane is
+            // all a diamond is, and it keeps the chamfered-solid depth.
+            const k = Math.SQRT1_2;
+            const d0: V3 = [rx * k, k, rz * k];
+            const d1: V3 = [-rx * k, k, -rz * k];
+            wing.beginElem(pcx, hy, pcz, 1.25);
+            wing.chamferBox(
+              [pcx, hy, pcz], d0, d1, [fx, 0, fz],
+              [0.78, 0.78, 0.18], 0.1, cx, cz,
+            );
+            wing.endElem();
+          }
+        }
 
         // Two diagonal braces from the mast up to the beam. A truss, not a pole:
         // this is the single change that stops the gate reading as signage.
@@ -1092,75 +1372,23 @@ export class Track implements TrackAPI, Subsystem {
       minClear = Math.min(minClear, lampY - 0.27);
     }
 
-    const mk = (
-      m: Mesher,
-      color: (typeof PAL)['gate'],
-      name: string,
-      widthPx: number,
-      extra?: { chunks?: CelChunks; flareMask?: number },
-    ) => {
-      const geo = m.build();
-      const mesh = new Mesh(geo);
-      mesh.name = name;
-      applyCel(
-        mesh,
-        createCelMaterial({
-          color,
-          name,
-          outlineWidthPx: widthPx,
-          rimStrength: 0.85,
-          rimPower: 2.6,
-          specSize: 0.9,
-          specStrength: 0.4,
-          flatShading: true,
-          flareMask: extra?.flareMask ?? 1,
-          chunks: {
-            uniforms: {
-              uWaveA: { value: waveUniformArrays.uWaveA },
-              uWaveB: { value: waveUniformArrays.uWaveB },
-              ...(extra?.chunks?.uniforms ?? {}),
-            },
-            vertexHead: /* glsl */ `
-              ${GERSTNER_NO_TIME}
-              attribute vec2 aAnchor;
-              ${extra?.chunks?.vertexHead ?? ''}
-            `,
-            vertexBody: /* glsl */ `
-              {
-                // Rigid-body float: sample the wave field once at the gate's
-                // centre, then move the whole arch with it.
-                vec3 wpos; vec3 wnrm; float wjac;
-                gerstnerSurface(aAnchor, uTime, wpos, wnrm, wjac);
-                vec3 local = transformed - vec3(aAnchor.x, 0.0, aAnchor.y);
-                // First-order rotation toward the surface normal. For a
-                // horizontal offset this evaluates to exactly ∇h·local, i.e. the
-                // linear extrapolation of the surface, which is why the far leg
-                // of a 26 m arch still lands on the water. Undamped for that
-                // reason — the old 0.72 left one foot in the air on a swell.
-                vec3 axis = vec3(wnrm.z, 0.0, -wnrm.x);
-                local += cross(axis, local);
-                objectNormal += cross(axis, objectNormal);
-                smoothNormal += cross(axis, smoothNormal);
-                transformed = vec3(wpos.x, wpos.y, wpos.z) + local;
-              }
-              ${extra?.chunks?.vertexBody ?? ''}
-            `,
-            fragmentHead: extra?.chunks?.fragmentHead ?? '',
-            fragmentBody: extra?.chunks?.fragmentBody ?? '',
-          },
-        }),
-      );
-      // 12 merged gates in one mesh: culling the lot on one bounding sphere
-      // would pop the far side of the course in and out, so keep it resident.
-      mesh.frustumCulled = false;
-      this.group.add(mesh);
-      return mesh;
-    };
+    this.buildCornerBoards(structure, boardMid, boardHot, foam, boardFace);
+
+    const mk = this.floatingMesh.bind(this);
+    const boardPx = { markerMinPx: BOARD_MIN_MARKER_PX };
 
     mk(structure, PAL.foamShade, 'gateStructure', 2.4);
-    mk(wingPort, PAL.gate, 'gateWingPort', 2.6);
-    mk(wingStbd, PAL.gateFar, 'gateWingStbd', 2.6);
+    mk(wingPort, PAL.gate, 'gateWingPort', 2.6, { markerMinPx: GATE_MIN_MARKER_PX });
+    mk(wingStbd, PAL.gateFar, 'gateWingStbd', 2.6, { markerMinPx: GATE_MIN_MARKER_PX });
     mk(accent, PAL.buoy, 'gateAccent', 2.2);
+    // The foam collar never blooms: it is white water, and white water that clears
+    // the flare threshold turns every gate into a lamp.
+    mk(foam, PAL.foam, 'gateFoam', 1.5, { flareMask: 0 });
+    mk(boardMid, PAL.buoy, 'cornerBoardWarn', 2.6, boardPx);
+    mk(boardHot, PAL.warn, 'cornerBoardHot', 2.6, boardPx);
+    // Ink chevrons, not white ones: white on PAL.buoy yellow is a value match and
+    // the arrow disappears. Dark-on-saturated is what a real chevron board does.
+    mk(boardFace, PAL.ink, 'cornerBoardFace', 2.2, boardPx);
 
     // ── The pass-state lamp ───────────────────────────────────────────────────
     // One float per vertex says which of three states its gate is in, rewritten
@@ -1210,6 +1438,202 @@ export class Track implements TrackAPI, Subsystem {
     this.design.gateArchClearance = minClear;
   }
 
+  // ── Corner warning boards — the corner-preview indicator ──────────────────
+
+  /**
+   * Where the corners actually are: contiguous runs of stations that cost real
+   * speed, with the apex and the peak severity of each.
+   *
+   * The threshold is on *severity* (required speed drop), not curvature, for the
+   * reason given at `SEVERE_SPEED`: this boat is flat out above R ≈ 25 m, so a
+   * 45 m sweeper has curvature but is not a corner and must not get a warning.
+   * On the shipped layout this yields exactly five: V0 (R 11), V4 (16), V5 (17),
+   * V6 (13) and V10 (17).
+   */
+  private cornerRuns(): { s: number; sign: number; severity: number }[] {
+    const N = this.N;
+    const sv = new Float32Array(N);
+    for (let i = 0; i < N; i++) sv[i] = severityOf(this.pk[i]);
+    // Start the walk outside a corner so no run is split across the seam.
+    let start = 0;
+    while (start < N && sv[start] > BOARD_MIN_SEVERITY) start++;
+    if (start >= N) start = 0;
+
+    const out: { s: number; sign: number; severity: number }[] = [];
+    let i = 0;
+    while (i < N) {
+      const idx = (start + i) % N;
+      if (sv[idx] <= BOARD_MIN_SEVERITY) {
+        i++;
+        continue;
+      }
+      let len = 0;
+      let apex = idx;
+      let peak = 0;
+      while (i + len < N && sv[(start + i + len) % N] > BOARD_MIN_SEVERITY) {
+        const j = (start + i + len) % N;
+        if (sv[j] > peak) {
+          peak = sv[j];
+          apex = j;
+        }
+        len++;
+      }
+      out.push({ s: idx * this.ds, sign: this.pk[apex] >= 0 ? 1 : -1, severity: peak });
+      i += len;
+    }
+    return out;
+  }
+
+  /**
+   * The corner preview, moved off the ribbon and into the world.
+   *
+   * The ribbon used to carry severity as a hue: raceLine → PAL.boost → PAL.warn
+   * in two hard `step()`s. Four things were wrong with that, and they are worth
+   * writing down because "tint the line" is the obvious first idea:
+   *
+   *   • magenta at 26 % alpha over cyan water does not read as a warning, it
+   *     reads as chromatic aberration — a rainbow smear trailing the stern
+   *     (shots/r3/ocean_low.png right of the stern; shots/r3/course.png bottom
+   *     corners). A rendering artefact, not an instrument;
+   *   • the steps were along the line's *length*, so the ribbon changed colour in
+   *     abrupt blocks with nothing at the join to explain them;
+   *   • `PAL.boost` is the boost colour. Two unrelated systems on one hue means
+   *     neither one can be learned;
+   *   • it gave no DIRECTION. Severity without "which way" is half a warning.
+   *
+   * A rally-style chevron board carries all three signals in the channel the
+   * brief actually needs — direction, severity, distance — and it does it in the
+   * world, where the driver is already looking:
+   *
+   *   • **direction**: the chevrons point the way the corner goes;
+   *   • **severity**: yellow with two chevrons for a lift, `PAL.warn` red with
+   *     three for a corner you brake hard for. Two hues the palette already uses
+   *     for exactly this (`buoy` is course furniture, `warn` is danger), neither
+   *     of them boost magenta;
+   *   • **distance**: it is a solid object 38 m before the mouth of the corner, so
+   *     it grows as you approach — the only distance cue that needs no learning.
+   *
+   * It also has a *plan-view* arrow lying flat on top of the float, so the signal
+   * survives the aerial camera, where a vertical board is edge-on.
+   *
+   * Placed `BOARD_OUTSET` m to the OUTSIDE of the turn: outside is the one place
+   * on a circuit that is never on the racing line, so the board can never be
+   * something you have to drive around, and it never lands between the chase
+   * camera and the pack.
+   */
+  private buildCornerBoards(
+    structure: Mesher,
+    mid: Mesher,
+    hot: Mesher,
+    foam: Mesher,
+    face: Mesher,
+  ) {
+    const UP: V3 = [0, 1, 0];
+    let count = 0;
+
+    for (const run of this.cornerRuns()) {
+      const tp = this.sampleDistance(run.s - BOARD_LEAD, _tpScratch);
+      const fx = tp.tangent.x;
+      const fz = tp.tangent.z;
+      const rx = -fz;
+      const rz = fx;
+      // sign +1 = the track turns LEFT here, so the outside of the turn is track
+      // right, which is +lateral.
+      const cx = tp.position.x + rx * run.sign * BOARD_OUTSET;
+      const cz = tp.position.z + rz * run.sign * BOARD_OUTSET;
+      const F: V3 = [fx, 0, fz];
+      const R: V3 = [rx, 0, rz];
+
+      const tier = run.severity >= BOARD_HOT_SEVERITY ? 3 : 2;
+      const paint = tier === 3 ? hot : mid;
+      /** R-axis sign the chevrons point toward: into the turn. */
+      const point = -run.sign;
+
+      const mastTop = tier === 3 ? 5.6 : 5.0;
+      const plateY = tier === 3 ? 4.05 : 3.85;
+      const plateH = tier === 3 ? 1.42 : 1.02;
+
+      // Float, mast, foam collar — the same vocabulary as a gate pylon, so the
+      // board reads as part of the same course furniture set and not as a prop
+      // from another game.
+      structure.prism(cx, cz, -0.95, 1.1, cx, cz, 0.0, 1.85, 9, true, false, cx, cz);
+      structure.prism(cx, cz, 0.0, 1.85, cx, cz, 0.72, 1.15, 9, false, false, cx, cz);
+      structure.prism(cx, cz, 0.6, 0.34, cx, cz, mastTop, 0.24, 7, false, true, cx, cz);
+      foam.prism(cx, cz, -0.34, 3.1, cx, cz, 0.3, 1.95, 12, false, false, cx, cz);
+
+      // The board itself: a chamfered solid, not a plate. Yawed 26° toward the
+      // approaching boat so it still has plan-view depth from the aerial and so
+      // its face is square-on to the driver who is about to need it.
+      const yaw = 0.45 * point;
+      const cs = Math.cos(yaw);
+      const sn = Math.sin(yaw);
+      const bR: V3 = [R[0] * cs + F[0] * sn, 0, R[2] * cs + F[2] * sn];
+      const bF: V3 = [-R[0] * sn + F[0] * cs, 0, -R[2] * sn + F[2] * cs];
+      const PLATE_R = 2.1;
+      paint.beginElem(cx, plateY, cz, PLATE_R);
+      paint.chamferBox([cx, plateY, cz], bR, UP, bF, [1.62, plateH, 0.22], 0.14, cx, cz);
+      paint.endElem();
+
+      // Plan-view arrow: a flat pennant lying on the float, apex pointing the way
+      // the corner goes. This is the element that survives the aerial camera,
+      // where the vertical board is a 0.4 m line. Its own element, because it
+      // grows about its own centre — sharing the board's pivot would fling it
+      // three metres underwater at 4× growth.
+      {
+        const ay = 0.86;
+        const apex: V3 = [cx + rx * point * 2.5, ay, cz + rz * point * 2.5];
+        const b0: V3 = [cx - rx * point * 1.1 + fx * 1.5, ay, cz - rz * point * 1.1 + fz * 1.5];
+        const b1: V3 = [cx - rx * point * 1.1 - fx * 1.5, ay, cz - rz * point * 1.1 - fz * 1.5];
+        paint.beginElem(cx, ay, cz, 1.9);
+        paint.pennant(apex, b0, b1, [0, 0.16, 0], cx, cz);
+        paint.endElem();
+      }
+
+      // Chevrons on the board face, in pale tone. Count IS the tier, so severity
+      // is readable as a shape even before the hue resolves. They share the
+      // board's pivot AND its nominal radius so the two grow in lockstep — a
+      // chevron that stayed 1.8 m on a plate that grew to 6.5 m would read as a
+      // smudge in the middle of a blank sign.
+      const faceOff = 0.22 + 0.13;
+      face.beginElem(cx, plateY, cz, PLATE_R);
+      for (let k = 0; k < tier; k++) {
+        const y = plateY - (tier - 1) * 0.39 + k * 0.78;
+        const apex: V3 = [
+          cx + bR[0] * point * 0.92 - bF[0] * faceOff,
+          y,
+          cz + bR[2] * point * 0.92 - bF[2] * faceOff,
+        ];
+        for (const vs of [-1, 1] as const) {
+          const tail: V3 = [
+            cx - bR[0] * point * 0.92 - bF[0] * faceOff,
+            y + vs * 0.33,
+            cz - bR[2] * point * 0.92 - bF[2] * faceOff,
+          ];
+          const dx = apex[0] - tail[0];
+          const dy = apex[1] - tail[1];
+          const dz = apex[2] - tail[2];
+          const len = Math.hypot(dx, dy, dz) || 1;
+          const e0: V3 = [dx / len, dy / len, dz / len];
+          // In the board plane, perpendicular to the arm.
+          const e1raw: V3 = [
+            bF[1] * e0[2] - bF[2] * e0[1],
+            bF[2] * e0[0] - bF[0] * e0[2],
+            bF[0] * e0[1] - bF[1] * e0[0],
+          ];
+          const e1l = Math.hypot(e1raw[0], e1raw[1], e1raw[2]) || 1;
+          face.chamferBox(
+            [(apex[0] + tail[0]) * 0.5, (apex[1] + tail[1]) * 0.5, (apex[2] + tail[2]) * 0.5],
+            e0, [e1raw[0] / e1l, e1raw[1] / e1l, e1raw[2] / e1l], bF,
+            [len * 0.5, 0.17, 0.11], 0.05, cx, cz,
+          );
+        }
+      }
+      face.endElem();
+      count++;
+    }
+    this.design.cornerBoards = count;
+  }
+
   /**
    * Repaint the lamp states. Called only when the target gate changes.
    *
@@ -1237,6 +1661,7 @@ export class Track implements TrackAPI, Subsystem {
   update(ctx: GameContext) {
     const proj = this.project(ctx.player.root.position);
     this.cornerPreview(proj.u, this.preview);
+    this.hullUniform.value.copy(ctx.player.root.position);
 
     const target = ctx.player.nextCheckpoint;
     if (target !== this.lampTarget) {
@@ -1518,6 +1943,14 @@ class Mesher {
   private pos: number[] = [];
   private nrm: number[] = [];
   private anc: number[] = [];
+  /**
+   * Per-vertex (elementCentre.xyz, nominalRadius) — the pivot and the scale
+   * reference for the screen-space marker growth in `floatingMesh`. Vertices
+   * emitted outside a `beginElem` block get their own position and radius 1,
+   * which makes the growth an exact no-op for them.
+   */
+  private elem: number[] = [];
+  private currentElem: readonly [number, number, number, number] | null = null;
   /** Which gate each vertex belongs to — drives the lamp pass-state attribute. */
   private gate: number[] = [];
   private currentGate = -1;
@@ -1531,6 +1964,18 @@ class Mesher {
   }
   gateIndex(): Float32Array {
     return Float32Array.from(this.gate);
+  }
+
+  /**
+   * Open a screen-space-sized element. `radius` is the element's nominal
+   * half-size in metres — the length the growth factor is measured against, so it
+   * must be one number for the whole element, not per vertex.
+   */
+  beginElem(x: number, y: number, z: number, radius: number) {
+    this.currentElem = [x, y, z, radius];
+  }
+  endElem() {
+    this.currentElem = null;
   }
 
   private tri(
@@ -1551,6 +1996,12 @@ class Mesher {
       this.nrm.push(nx, ny, nz);
       this.anc.push(anchorX, anchorZ);
       this.gate.push(this.currentGate);
+    }
+    const e = this.currentElem;
+    if (e) {
+      for (let i = 0; i < 3; i++) this.elem.push(e[0], e[1], e[2], e[3]);
+    } else {
+      this.elem.push(ax, ay, az, 1, bx, by, bz, 1, cx, cy, cz, 1);
     }
   }
 
@@ -1605,6 +2056,42 @@ class Mesher {
       if (capBottom) {
         this.tri(x0, y0, z0, x0 + s1 * r0, y0, z0 + c1 * r0, x0 + s0 * r0, y0, z0 + c0 * r0, anchorX, anchorZ);
       }
+    }
+  }
+
+  /**
+   * A triangular pennant with thickness — a solid, not a plane.
+   *
+   * This exists because the port and starboard markers have to differ in
+   * SILHOUETTE and not only in hue: on the horizon, and for a colour-blind
+   * player, aqua and pink collapse to the same value and the gate stops saying
+   * which way through. `thick` is the half-offset vector, so the pennant has real
+   * plan-view depth and cannot vanish edge-on the way a plane does.
+   */
+  pennant(apex: V3, base0: V3, base1: V3, thick: V3, anchorX: number, anchorZ: number) {
+    const t = thick;
+    const add = (p: V3, s: number): V3 => [p[0] + t[0] * s, p[1] + t[1] * s, p[2] + t[2] * s];
+    const cen: V3 = [
+      (apex[0] + base0[0] + base1[0]) / 3,
+      (apex[1] + base0[1] + base1[1]) / 3,
+      (apex[2] + base0[2] + base1[2]) / 3,
+    ];
+    const A = add(apex, 1), B = add(base0, 1), C = add(base1, 1);
+    const a = add(apex, -1), b = add(base0, -1), c = add(base1, -1);
+    this.triOut(A, B, C, t, anchorX, anchorZ);
+    this.triOut(a, b, c, [-t[0], -t[1], -t[2]], anchorX, anchorZ);
+    // Three rim quads. Outward is taken from the edge midpoint away from the
+    // centroid, which is exact for a triangle and lets `quadOut` fix the winding.
+    const edges: [V3, V3, V3, V3][] = [
+      [A, B, b, a],
+      [B, C, c, b],
+      [C, A, a, c],
+    ];
+    for (const [p, q, q2, p2] of edges) {
+      const mx = (p[0] + q[0]) * 0.5 - cen[0];
+      const my = (p[1] + q[1]) * 0.5 - cen[1];
+      const mz = (p[2] + q[2]) * 0.5 - cen[2];
+      this.quadOut(p, q, q2, p2, [mx, my, mz], anchorX, anchorZ);
     }
   }
 
@@ -1719,6 +2206,7 @@ class Mesher {
     geo.setAttribute('position', new BufferAttribute(new Float32Array(this.pos), 3));
     geo.setAttribute('normal', new BufferAttribute(new Float32Array(this.nrm), 3));
     geo.setAttribute('aAnchor', new BufferAttribute(new Float32Array(this.anc), 2));
+    geo.setAttribute('aElem', new BufferAttribute(new Float32Array(this.elem), 4));
     // The gate meshes are never culled, but three still wants a bounding volume
     // for raycasting and for the shadow-free sort.
     geo.computeBoundingSphere();

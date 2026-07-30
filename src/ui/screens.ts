@@ -19,6 +19,7 @@ import {
   PLATE_W,
   cutPath,
   diamondPath,
+  hatch,
   inkText,
   inked,
   plate,
@@ -93,18 +94,22 @@ export class Screens {
       this.countPop = 1;
     }
 
-    // Sit the numeral in the upper third: the boats are the subject and the
-    // cinematic orbit puts them low-centre. A dead-centre numeral covers them.
+    // Sit the numeral high, clear of the horizon the cinematic orbit produces
+    // (~y 0.27–0.31 h) and clear of the grid, which the orbit puts low-centre.
     const cx = w * 0.5;
-    const cy = h * 0.3;
+    const cy = h * 0.2;
 
-    // Vignette: pull the sea down so the numeral has something to sit on.
-    const vg = g.createRadialGradient(cx, cy, h * 0.05, cx, cy, h * 0.95);
-    vg.addColorStop(0, rgba(HEX.ink, 0.6));
-    vg.addColorStop(0.55, rgba(HEX.ink, 0.24));
-    vg.addColorStop(1, rgba(HEX.ink, 0));
-    g.fillStyle = vg;
-    g.fillRect(0, 0, w, h);
+    // NO full-frame wash.
+    //
+    // This used to lay a radial ink gradient over the entire render at 0.6 alpha
+    // in the centre. Measured against a racing frame it dropped sky-region mean
+    // saturation from 0.552 to 0.454 and turned the two committed cloud tones
+    // (white and skyHorizon, sat 0.34) into flat greys — (140,147,157) sat 0.11
+    // and (242,251,255) sat 0.05 — i.e. the first frame a player sees was a
+    // desaturated copy of a different, duller game. A soft radial alpha ramp is
+    // also, optically, photographic haze, which is the one thing the art
+    // direction forbids. The badge below is its own opaque scrim; the render is
+    // now left exactly as the racing phase renders it.
 
     if (n > 3) {
       // The lead-in beat of a 4 s countdown: a marshalling tab, no numeral.
@@ -115,37 +120,62 @@ export class Screens {
     const pop = this.countPop;
     const scale = 0.82 + easeOutBack(1 - pop) * 0.18;
 
-    // Impact star behind the numeral — 14 ink spikes, spun slowly, punched out
-    // as the beat lands and shrinking away as it ends.
+    // Impact star behind the numeral.
+    //
+    // Two rings, not one filled blob. The previous version was a single solid
+    // 13-point star at R = 0.3 h with an inner radius of 0.58 R, which at capture
+    // scale was a 670 × 640 px dead-ink mass sitting exactly on the horizon line —
+    // it deleted the one line that establishes the scene from the first frame of
+    // the game, and swallowed a mid-distance gate with it.
+    //
+    // Now: a compact opaque core the numeral sits on (312 px wide at capture
+    // scale, 15 % of frame width instead of 23 %), plus long thin manga impact
+    // spikes radiating out of it. The spikes are hard-edged and fully opaque, but
+    // they cover only about half the annulus, so sky, horizon and gates read
+    // between them. Total extent is ~60 % of the old badge.
     g.save();
     g.translate(cx, cy);
     g.rotate((n * 0.7 + frac * 0.12) % Math.PI);
     const burst = (0.62 + easeOutCubic(1 - pop) * 0.42) * (1 - frac * 0.18);
-    const R = h * 0.3 * burst;
-    const star = new Path2D();
+    const R = h * 0.185 * burst;
     const spikes = 13;
+    // Spike ring: outer tip R, base on the core radius, so each spike is a thin
+    // wedge with an equally wide gap beside it.
+    const rays = new Path2D();
     for (let i = 0; i < spikes * 2; i++) {
       const a = (i / (spikes * 2)) * Math.PI * 2;
-      const rr = i % 2 === 0 ? R : R * 0.58;
+      const rr = i % 2 === 0 ? R : R * 0.5;
       const px = Math.cos(a) * rr;
-      const py = Math.sin(a) * rr * 0.8;
-      if (i === 0) star.moveTo(px, py);
-      else star.lineTo(px, py);
+      const py = Math.sin(a) * rr * 0.82;
+      if (i === 0) rays.moveTo(px, py);
+      else rays.lineTo(px, py);
     }
-    star.closePath();
-    // Nearly opaque: a translucent ink star over bright foam reads as grey haze
-    // instead of as a drawn shape, which is what happened in shots/pres_r1.
-    inked(g, star, rgba(HEX.ink, 0.9 - frac * 0.18), rgba(HEX.waterCrest, 0.5), 2.4 * s);
+    rays.closePath();
+    inked(g, rays, rgba(HEX.ink, 1), rgba(HEX.waterCrest, 0.75), 2.4 * s);
+    // Opaque core the numeral is legible against. Faceted, not a circle — a disc
+    // reads as a loading spinner.
+    const core = new Path2D();
+    for (let i = 0; i < 12; i++) {
+      const a = (i / 12) * Math.PI * 2 + 0.13;
+      const rr = R * (i % 2 === 0 ? 0.56 : 0.5);
+      const px = Math.cos(a) * rr;
+      const py = Math.sin(a) * rr * 0.82;
+      if (i === 0) core.moveTo(px, py);
+      else core.lineTo(px, py);
+    }
+    core.closePath();
+    inked(g, core, rgba(HEX.ink, 1), rgba(HEX.waterCrest, 0.9), 3.2 * s);
     g.restore();
 
-    // Shock ring, expanding out of the beat.
+    // Shock ring, expanding out of the beat. Kept inside the badge's own footprint
+    // so it cannot draw a second soft line across the sea.
     const ring = easeOutCubic(frac * 1.6);
     if (ring < 1) {
       g.save();
-      g.strokeStyle = rgba(HEX.waterCrest, 0.5 * (1 - ring));
-      g.lineWidth = 7 * s * (1 - ring);
+      g.strokeStyle = rgba(HEX.waterCrest, 0.55 * (1 - ring));
+      g.lineWidth = 6 * s * (1 - ring);
       g.beginPath();
-      g.ellipse(cx, cy, h * 0.2 + ring * h * 0.42, (h * 0.2 + ring * h * 0.42) * 0.72, 0, 0, Math.PI * 2);
+      g.ellipse(cx, cy, h * 0.12 + ring * h * 0.24, (h * 0.12 + ring * h * 0.24) * 0.72, 0, 0, Math.PI * 2);
       g.stroke();
       g.restore();
     }
@@ -156,12 +186,12 @@ export class Screens {
     g.save();
     g.translate(cx, cy);
     for (const [dy, hh, al, edge] of [
-      [-h * 0.115, 17 * s, 0.92, HEX.boost],
-      [h * 0.125, 10 * s, 0.75, HEX.waterCrest],
+      [-h * 0.082, 13 * s, 1, HEX.boost],
+      [h * 0.09, 8 * s, 1, HEX.waterCrest],
     ] as const) {
-      const bw2 = w * 0.34;
-      const bar = slantPath(-bw2 * 0.5, dy, bw2, hh, 24 * s);
-      inked(g, bar, rgba(HEX.ink, al), rgba(edge, 0.9), PLATE_W * s);
+      const bw2 = w * 0.22;
+      const bar = slantPath(-bw2 * 0.5, dy, bw2, hh, 18 * s);
+      inked(g, bar, rgba(HEX.ink, al), rgba(edge, 0.95), PLATE_W * s);
     }
     g.restore();
 
@@ -169,26 +199,26 @@ export class Screens {
     g.save();
     g.translate(cx, cy);
     g.scale(scale, scale);
-    const px = Math.round(h * 0.38);
+    const px = Math.round(h * 0.235);
     inkText(g, String(n), 0, px * 0.37, {
       font: `900 ${px}px ${FONT_STACK}`,
       fill: rgba(HEX.hudPaper, 1),
       ink: rgba(HEX.ink, 1),
-      inkWidth: 16 * s,
+      inkWidth: 13 * s,
       align: 'center',
       skew: 0.16,
       ghost: rgba(HEX.boost, 0.95),
-      ghostDx: 12 * s,
-      ghostDy: 13 * s,
+      ghostDx: 9 * s,
+      ghostDy: 10 * s,
     });
     g.restore();
 
     // Beat pips sit *above* the numeral, like a gantry of start lights. Below it
     // they landed on the player's bow (shots/pres_r2/countdown.png).
-    const pipY = cy - h * 0.215;
+    const pipY = cy - h * 0.155;
     for (let i = 0; i < 3; i++) {
       const lit = 3 - i <= n;
-      const d = diamondPath(cx + (i - 1) * 34 * s, pipY, 12 * s, 16 * s);
+      const d = diamondPath(cx + (i - 1) * 30 * s, pipY, 11 * s, 14 * s);
       inked(
         g,
         d,
@@ -317,28 +347,48 @@ export class Screens {
     const y0 = h * 0.31;
     const rowsBottom = y0 + board.length * (rowH + gap);
 
-    // Backdrop: a graded ink wash, heavier on the board side so the boat stays
-    // readable on the left, plus a diagonal pinstripe field confined to the board.
-    const grad = g.createLinearGradient(0, 0, w, 0);
-    grad.addColorStop(0, rgba(HEX.ink, 0.5 * wash));
-    grad.addColorStop(0.42, rgba(HEX.ink, 0.62 * wash));
-    grad.addColorStop(0.62, rgba(HEX.ink, 0.86 * wash));
-    grad.addColorStop(1, rgba(HEX.ink, 0.9 * wash));
-    g.fillStyle = grad;
-    g.fillRect(0, 0, w, h);
-
+    // ── Backdrop ─────────────────────────────────────────────────────────────
+    //
+    // ONE hard-edged opaque panel on the board side. Nothing washes the render.
+    //
+    // What was here before: a full-frame horizontal ink gradient from 0.5 to 0.9
+    // alpha. That is a multiplicative grey wash over the whole image — the water
+    // came out a flat grey-navy, the hull vermilion came out brick, the clouds
+    // came out mid-grey, and the frame the player stares at longest looked like a
+    // different, duller game than the one they just raced. A soft alpha ramp is
+    // also photographic, which the art direction rules out outright.
+    //
+    // The replacement is a graphic: a flat `ink` parallelogram with a hard slanted
+    // leading edge and a crest keyline down it, leaning with the same PLATE_SKEW
+    // as every other plate in the game. Left of that edge the render is untouched
+    // at full saturation, which is where the celebration is. Right of it nothing
+    // from the world can composite through — which is also what stops a gate mast
+    // running diagonally behind the VICTORY / 1ST lockup.
+    const panelLean = 104 * s;
+    const panelX = x0 - 46 * s;
+    const panel = slantPath(panelX, -4 * s, w - panelX + 8 * s, h + 8 * s, panelLean);
     g.save();
     g.globalAlpha = wash;
-    const band = new Path2D();
-    band.rect(x0 - 40 * s, y0 - 26 * s, w - x0 + 40 * s, rowsBottom + 120 * s - y0);
-    g.clip(band);
-    g.strokeStyle = rgba(HEX.hudPaper, 0.055);
-    g.lineWidth = 3 * s;
+    inked(g, panel, rgba(HEX.ink, 1), null, 0);
+    // Diagonal hatch, now genuinely confined to the panel backing. Over an already
+    // opaque fill this is authored shading, not transparency.
+    hatch(g, panel, panelX, 0, w - panelX + panelLean, h, rgba(HEX.inkSoft, 0.9), 16 * s, 2 * s);
+    // The leading edge, drawn as a line rather than implied by an alpha ramp.
+    g.strokeStyle = rgba(HEX.waterCrest, 0.9);
+    g.lineWidth = 3.4 * s;
     g.beginPath();
-    for (let x = x0 - 240 * s; x < w + 240 * s; x += 15 * s) {
-      g.moveTo(x, y0 - 40 * s);
-      g.lineTo(x + 220 * s, rowsBottom + 140 * s);
-    }
+    g.moveTo(panelX + panelLean, -4 * s);
+    g.lineTo(panelX, h + 4 * s);
+    g.stroke();
+    // A second, darker rule inboard of it, so the edge is a two-tone brushed
+    // border like every plate in the game rather than one hairline. Deliberately
+    // *not* magenta: a thin magenta line beside a thin cyan one is exactly the
+    // chromatic-aberration read the racing-line ribbon was pulled up for.
+    g.strokeStyle = rgba(HEX.inkSoft, 1);
+    g.lineWidth = 5 * s;
+    g.beginPath();
+    g.moveTo(panelX + panelLean + 8 * s, -4 * s);
+    g.lineTo(panelX + 8 * s, h + 4 * s);
     g.stroke();
     g.restore();
 

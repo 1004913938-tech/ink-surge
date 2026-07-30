@@ -41,7 +41,7 @@ import {
   Vector3,
 } from 'three';
 import { PAL, RACER_COLORS } from '../core/palette';
-import { applyCel, createCelMaterial, type CelMaterialSet } from '../render/celMaterial';
+import { applyCel, createCelMaterial, paletteTone, type CelMaterialSet } from '../render/celMaterial';
 // The hull publishes its seat and handlebar geometry for exactly this purpose —
 // see the "Seat contract for the rider subsystem" block in boatMesh.ts. Reading
 // it beats hard-coding an offset that a hull re-proportion would silently break.
@@ -587,6 +587,61 @@ function limbProfile(
 }
 
 /**
+ * Cloth folds, as geometry rather than paint.
+ *
+ * `limbProfile` gives a smooth taper, and a smooth taper is exactly what makes a
+ * limb read as a moulded plastic tube. Real race leather bunches: it gathers
+ * behind the elbow, above the knee, at the cuff. This inserts a **real
+ * concavity** at each normalised position in `creases` — radius dips to 82% over
+ * a ±4% window — which does three things a painted band cannot:
+ *
+ *   1. the groove wall turns away from the key light, so the cel ramp puts a
+ *      hard band on it (a fold *shape*, not a gradient),
+ *   2. the depth/normal discontinuity makes the Sobel interior pass ink a line
+ *      along it, which is what an animator would draw,
+ *   3. it survives the two-bone skin blend, so folds move with the joint.
+ *
+ * The same trick `knuckleProfile` uses for finger gaps, generalised.
+ */
+function creasedLimb(
+  rBot: number,
+  rTop: number,
+  len: number,
+  capBot: number,
+  capTop: number,
+  capSegs: number,
+  creases: number[],
+  bulge = 0,
+): Profile {
+  const p: Profile = [];
+  const rAt = (t: number) => rBot + (rTop - rBot) * t + bulge * (rBot + rTop) * 0.5 * Math.sin(t * Math.PI);
+  if (capBot > 0) {
+    const h = rBot * capBot;
+    for (let i = 0; i <= capSegs; i++) {
+      const t = (i / capSegs) * (Math.PI / 2);
+      p.push([rBot * Math.sin(t), -h * Math.cos(t)]);
+    }
+  } else {
+    p.push([rBot, 0]);
+  }
+  for (const t of creases) {
+    const r = rAt(t);
+    p.push([r * 1.07, len * (t - 0.055)]);
+    p.push([r * 0.82, len * t]);
+    p.push([r * 1.05, len * (t + 0.055)]);
+  }
+  p.push([rTop, len]);
+  if (capTop > 0) {
+    const h = rTop * capTop;
+    for (let i = capSegs - 1; i >= 0; i--) {
+      const t = (i / capSegs) * (Math.PI / 2);
+      p.push([rTop * Math.sin(t), len + h * Math.cos(t)]);
+    }
+  }
+  return p;
+}
+
+/**
  * Four-knuckle finger roll: a lathe whose radius scallops in and out `n` times
  * along its length, so revolving it produces a run of four fused sausages.
  *
@@ -679,19 +734,30 @@ export const PALM_ALONG_HAND = 0.058;
  * shadow leans on `waterDeep` so a rider in shadow sits in the sea's colour
  * family instead of going muddy grey.
  *
+ * ── Why the ladder is this wide ─────────────────────────────────────────────
+ * The previous version ran 0.88 / 0.95 / 1.00 / 1.10 — a 22% total spread. A
+ * critic measurement of a 3× rider crop came back with *six near-tones between
+ * L85 and L171 and no readable ramp*: the bands were mathematically present and
+ * visually absent, because a 6-luminance step is below the threshold at which a
+ * flat fill reads as a separate shape. The ladder is now 0.30 / 0.62 / 1.00 /
+ * 1.36, i.e. a 4.5× spread, which puts roughly 55 luminance points between
+ * consecutive bands on a mid-value fabric. `createCelMaterial` normalises the
+ * >1 top band into the 8-bit ramp texture and restores the scale in the shader
+ * (`uRampScale`), so the hot band is a real overbright and not a clamp.
+ *
  * The stops are pulled tighter than the default: a 1.3 m character seen at
  * 5 m needs its terminator inside the silhouette, not smeared across it.
  */
 function riderRamp(): Color[] {
   const w = PAL.cloudLit;
   return [
-    w.clone().lerp(PAL.waterDeep, 0.42).multiplyScalar(0.88),
-    w.clone().lerp(PAL.waterMid, 0.2).multiplyScalar(0.95),
+    w.clone().lerp(PAL.waterDeep, 0.5).multiplyScalar(0.6),
+    w.clone().lerp(PAL.waterShadow, 0.34).multiplyScalar(0.88),
     w.clone(),
-    w.clone().lerp(PAL.sun, 0.4).multiplyScalar(1.1),
+    w.clone().lerp(PAL.sun, 0.45).multiplyScalar(1.36),
   ];
 }
-const RIDER_RAMP_STOPS = [0.0, 0.4, 0.54, 0.83];
+const RIDER_RAMP_STOPS = [0.0, 0.34, 0.5, 0.82];
 
 function skinChunks(bones: { value: Float32Array }) {
   return {
@@ -739,44 +805,62 @@ export function createRiderMesh(racerId: number, build: RiderBuild): RiderMesh {
   const g = build.girth;
 
   // ── Value plan ────────────────────────────────────────────────────────────
-  // Four values and one accent, because a cel figure is read as *shapes of
+  // Five values and one accent, because a cel figure is read as *shapes of
   // value* long before anyone sees its hue:
-  //   pale   back panel, shoulder caps, pads      (reads first, at the top)
-  //   mid    the suit itself                      (most of the body)
-  //   dark   gloves, boots, forearm cuffs         (terminates the limbs)
-  //   ink    visor                                (the one true black)
-  //   accent racer hull colour: helmet, yoke, stripes, scarf
+  //   pale   back panel, race-number plate, boot soles   (L≈245)
+  //   lit    fold highlights, sleeve caps                (L≈180)
+  //   mid    the suit itself                             (L≈125, most of body)
+  //   shade  folds, chest front, pad interiors           (L≈75)
+  //   dark   belt, gorget, boots, palms                  (L≈35)
+  //   accent racer hull colour: helmet, yoke, gloves, stripes, scarf
   //
-  // The palette's `suit0..3` tones are gorgeous but they sit at ~0.03 relative
-  // luminance — at 1.3 m tall and 5 m away, a whole rider painted in them is a
-  // black silhouette with no internal drawing at all (verified in a raw capture,
-  // no post). So the *fabric* tones are derived from the committed suit colour by
-  // mixing toward `skyHorizon`, the same shift `celMaterial`'s own ramp uses.
-  // Flagged in the hand-off: the palette wants a mid-value rider fabric tone.
-  const hull = colors.hull;
-  const suit = colors.suit;
-  // Lifted toward `skyHorizon` for value, then pulled a little way toward the
-  // racer's own hull colour for hue — otherwise all four riders end up wearing
-  // the same cyan and only the helmet tells them apart.
-  //
-  // The pull toward the hull colour used to be 0.18, which was not enough to
-  // survive the ramp: a capture of KAIRA from behind showed a rider who was
-  // uniformly grey, with no trace of her yellow anywhere below the helmet. At
-  // 0.34 the fabric still reads as fabric rather than as painted hull, but each
-  // racer's suit is now recognisably *their* colour at pack distance.
-  const fabric = suit.clone().lerp(PAL.skyHorizon, 0.38).lerp(hull, 0.34);
-  const fabricDark = suit.clone().lerp(PAL.skyHorizon, 0.22).lerp(hull, 0.2);
-  const light = PAL.foamShade;
-  const litePanel = PAL.foam;
-  const skin = PAL.skin;
-  const skinDark = PAL.skinShade;
+  // ── Two bugs fixed here, both measured ────────────────────────────────────
+  // 1. **Every tint went out uncorrected.** `celMaterial` documents that
+  //    `palette.ts` applies a second sRGB→linear decode and exports
+  //    `paletteTone()` to undo it; `createCelMaterial` runs `opts.color` through
+  //    it, which is why the *hulls* are vermilion and the riders were not. The
+  //    rider's colours do not arrive as `opts.color` — they arrive per-vertex in
+  //    `aTint` and are multiplied into `baseColor` in the same place, so they
+  //    need exactly the same correction and were not getting it. Every tone below
+  //    now goes through `T()`, and every mix is done *after* correction (mixing
+  //    in the doubly-decoded space is a different, wrong interpolation).
+  // 2. **The fabric was mixed out of hue.** It was
+  //    `suit → skyHorizon(0.38) → hull(0.34)`: navy, plus pale cyan, plus
+  //    vermilion. Those are three points spread right around the wheel, so the
+  //    mix landed on grey. Predicted output for racer 0 was (165,111,140) and the
+  //    critic measured exactly (165,111,140) in a 3× crop — "an unsaturated
+  //    grey-mauve leotard", the only surface in frame off the high-saturation
+  //    palette. The palette already ships the right tone for this: `suitMid0..3`
+  //    were committed as "mid-value race-suit fabric, ~40% relative luminance,
+  //    hue-matched to the suit tones" and were simply never used. They are the
+  //    fabric now, undiluted, so the suit is a saturated hue and each racer's
+  //    fabric hue is already distinct without borrowing the hull colour.
+  const T = paletteTone;
+  const SUIT_MID = [PAL.suitMid0, PAL.suitMid1, PAL.suitMid2, PAL.suitMid3];
+  const hull = T(colors.hull);
+  const suit = T(colors.suit);
+  /** The committed mid-value fabric: saturated, hue-matched, ~L125 rendered. */
+  const fabric = T(SUIT_MID[racerId % SUIT_MID.length]);
+  /** Same hue, dropped toward the committed suit tone. Folds and shadow planes. */
+  const fabricDark = fabric.clone().lerp(suit, 0.52);
+  /** Same hue, lifted. Fold highlights and the sleeve cap. */
+  const fabricLit = fabric.clone().lerp(T(PAL.foam), 0.4);
+  const light = T(PAL.foamShade);
+  const litePanel = T(PAL.foam);
+  const skin = T(PAL.skin);
+  const skinDark = T(PAL.skinShade);
   /** Underside of the scarf, and any cloth face turned away from the sun. */
   const accentShade = hull.clone().lerp(suit, 0.55);
-  // Gloves and boots keep the *committed* suit tone, undiluted. They are the
-  // one place its near-black value is an asset: dark extremities terminate the
-  // limbs and give the figure weight, the way ink does in a cel drawing.
+  // Belt, gorget, boots and palms keep the *committed* suit tone, undiluted.
+  // They are the one place its near-black value is an asset: dark extremities
+  // and a dark waist terminate the figure and give it weight, the way ink does
+  // in a cel drawing.
   const dark = suit;
-  const visorInk = PAL.ink;
+  /** Visor glass. Dark cyan, not ink: ink is the outline's colour, and a visor
+   *  painted in it merges with its own rim line instead of reading as glass. */
+  const visorGlass = T(PAL.waterDeep).lerp(T(PAL.waterShadow), 0.45);
+  /** The one hard highlight band raked across the visor. */
+  const visorLit = T(PAL.waterCrest);
 
   /** True on the outward-facing columns of a limb, for either side. */
   const outerStripe = (side: number, u: number) =>
@@ -820,13 +904,18 @@ export function createRiderMesh(racerId: number, build: RiderBuild): RiderMesh {
     ],
     14,
     (u, v) => {
-      // Two values, one boundary. An earlier pass painted a belt band, a spine
+      // Four shapes, no patchwork. An earlier pass painted a belt band, a spine
       // stripe and a chest panel here; with 5 rings and 14 columns that lands as
-      // a patchwork of large blocks — cel art wants few, big shapes. So: dark
-      // waist and dark front, pale upper back, and let the yoke and the sleeve
-      // stripes carry the accent. u = 0 faces +X, 0.25 is the chest, 0.75 the back.
-      if (v < 0.38) return fabricDark;
-      return u > 0.5 ? light : fabric;
+      // a mosaic of small blocks — cel art wants few, big shapes.
+      // u = 0 faces +X, 0.25 is the chest, 0.75 the back.
+      // The waist was `dark` for one capture round. `dark` is the committed suit
+      // tone, which is also the tone the boat's saddle is painted, so the rider's
+      // whole lower torso merged into the seat behind it and the figure lost its
+      // legs. The belt keeps the dark line; the fabric keeps its hue.
+      if (v < 0.3) return fabricDark;
+      if (u > 0.62 && u < 0.9) return light; // pale back panel, carries the number
+      if (u > 0.12 && u < 0.4) return fabricDark; // chest front, turned from the sun
+      return fabric; // flanks
     },
     // Was 1.2 wide. At that beam the torso was wider than the shoulders, so from
     // directly behind it *ate both arms* — a capture of KAIRA showed a grey sack
@@ -853,9 +942,93 @@ export function createRiderMesh(racerId: number, build: RiderBuild): RiderMesh {
     0.8,
   );
 
+  // ── Belt + buckle ─────────────────────────────────────────────────────────
+  // A hard dark band across the narrowest part of the torso. It is the single
+  // cheapest "this is a costume, not a leotard" mark available: it cuts the
+  // body into two shapes with different jobs, and the buckle puts one small
+  // saturated accent on the figure's centre line.
+  soft.at(B.spine, setLocal(0, torsoLen * 0.16, 0));
+  soft.lathe(
+    [
+      [0.128 * g, -0.012],
+      [0.142 * g, 0.0],
+      [0.143 * g, 0.03],
+      [0.13 * g, 0.042],
+    ],
+    14,
+    // u ≈ 0.25 is dead ahead, so a narrow window there is a front buckle.
+    (u) => (u > 0.19 && u < 0.31 ? hull : dark),
+    1.08,
+    0.9,
+  );
+
+  // Chest harness — a strap raked across the ribs, canted so it is not a second
+  // belt. Scaled to the torso's own ellipse so it hugs rather than hoops, and
+  // the rake is kept to ~10°: at the 24° first attempt the ring's own tilt
+  // exceeded the clearance and the strap lifted clean off the body on one side.
+  soft.at(B.spine, setLocal(0, torsoLen * 0.58, 0, 0, 0, 0.18));
+  soft.lathe(
+    [
+      [0.15 * g, -0.011],
+      [0.157 * g, 0.0],
+      [0.157 * g, 0.022],
+      [0.148 * g, 0.033],
+    ],
+    14,
+    (u) => (u > 0.6 && u < 0.9 ? fabricLit : dark),
+    1.06,
+    0.88,
+  );
+
+  // Race-number plate on the pale back panel, with `racerId + 1` tally bars.
+  // A logo is one of the critic's named misses, and a *counted* logo also makes
+  // the four riders non-interchangeable from behind, which phase offsets alone
+  // never achieve.
+  //
+  // Built as a partial-revolve shell on the torso's own ellipse, not as a box:
+  // a flat plate pressed against a curved back is buried at its centre and
+  // floating ~8 mm clear at its edges, which is exactly the "poking corners"
+  // failure the visor already taught this file.
+  //
+  // The tally bars are painted into the plate's own tint function rather than
+  // stacked on as separate arcs. As separate geometry they had to sit ~2 mm
+  // proud of the plate, which is under a device pixel at closeup range: the bars
+  // dithered against the panel and simply did not appear. Inside the tint they
+  // are polygon-edge hard by construction, cost nothing, and cannot z-fight.
+  // `lathe` hands the tint `u` as the fraction *across the revolved arc*, so the
+  // 9 columns of the plate double as a 9-cell grid to print into.
+  const plateSpan = 0.2;
+  const plateT0 = 0.75 - plateSpan * 0.5;
+  const tally = (racerId % 4) + 1;
+  /** Column indices, out of 9, that carry a tally bar. Centred, one gap apart. */
+  const bars = new Set<number>();
+  for (let i = 0; i < tally; i++) bars.add(4 - (tally - 1) + i * 2);
+  soft.at(B.spine);
+  soft.lathe(
+    [
+      [0.14 * g, torsoLen * 0.6],
+      [0.15 * g, torsoLen * 0.64],
+      [0.15 * g, torsoLen * 0.79],
+      [0.14 * g, torsoLen * 0.83],
+    ],
+    9,
+    (u, v) => (v > 0.2 && v < 0.8 && bars.has(Math.floor(u * 9)) ? dark : litePanel),
+    1.06,
+    0.86,
+    plateT0,
+    plateT0 + plateSpan,
+  );
+
   // ── Neck + face ───────────────────────────────────────────────────────────
   soft.at(B.neck);
   soft.lathe(limbProfile(0.052 * g, 0.047 * g, skel.bones[B.neck].len * 1.15, 0.2, 0, 2), 8, skinDark);
+  // Gorget. The critic's crop showed "no neck" — correctly, because the helmet
+  // sat straight on the shoulder yoke with nothing between them. A dark collar
+  // ring wider than the neck puts a hard shadow shape under the jaw, which is
+  // what makes a helmeted head read as *carried by* a neck rather than balanced
+  // on a torso. Every rider gets one; the scarf collar (below) stacks on top.
+  soft.at(B.neck, setLocal(0, 0.008, 0));
+  soft.lathe(limbProfile(0.074 * g, 0.062 * g, 0.052, 0.35, 0.3, 2), 10, dark, 1.06, 1.06);
   soft.at(B.head);
   soft.lathe(sphereProfile(0.088 * build.headSize, 0.085, 9, 1.12), 12, (_u, v) => (v < 0.4 ? skinDark : skin), 1, 1.05);
 
@@ -871,18 +1044,33 @@ export function createRiderMesh(racerId: number, build: RiderBuild): RiderMesh {
     // each shoulder. Smaller, and in the racer's own colour, it reads as a
     // shoulder seam and puts the identity hue on the highest lit surface.
     soft.at(up);
-    soft.lathe(sphereProfile(0.059 * g, 0.006, 8, 0.92), 10, fabric);
+    soft.lathe(sphereProfile(0.059 * g, 0.006, 8, 0.92), 10, fabricLit);
     // Sleeve: mid-value, with an accent stripe down the *outer* face. u = 0.5
     // faces -X and u = 0/1 faces +X, so the stripe has to flip with the side —
     // painted at a fixed u it runs down the inside of one arm.
+    //
+    // Two creases where the fabric gathers above the elbow. See `creasedLimb`:
+    // these are real grooves, so the ramp bands them and the Sobel inks them.
     soft.lathe(
-      limbProfile(0.062 * g, 0.05 * g, skel.bones[up].len, 0, 0.4, 3),
+      creasedLimb(0.062 * g, 0.05 * g, skel.bones[up].len, 0, 0.4, 3, [0.58, 0.82]),
       10,
       (u) => (outerStripe(side, u) ? hull : fabric),
     );
     soft.at(lo);
     soft.lathe(sphereProfile(0.051 * g, 0.0, 6, 1), 8, fabricDark);
-    soft.lathe(limbProfile(0.05 * g, 0.042 * g, skel.bones[lo].len, 0, 0.3, 2), 10, fabricDark);
+    soft.lathe(
+      creasedLimb(0.05 * g, 0.042 * g, skel.bones[lo].len, 0, 0.3, 2, [0.3]),
+      10,
+      (u) => (outerStripe(side, u) ? accentShade : fabricDark),
+    );
+    // One arm band, on one arm only. Constant asymmetry beats any amount of
+    // animated variety for making four riders read as four people: `bias` is
+    // already the build's standing left/right lean, so hanging the band off its
+    // sign means each rider wears it on the side their posture already favours.
+    if ((build.bias >= 0 ? -1 : 1) === side) {
+      soft.at(up, setLocal(0, skel.bones[up].len * 0.34, 0));
+      soft.lathe(limbProfile(0.062 * g, 0.06 * g, 0.026, 0.25, 0.25, 2), 10, hull, 1.0, 1.0);
+    }
 
     // ── Hand ──────────────────────────────────────────────────────────────
     // Not a fist-shaped lump. A rider who is not visibly *gripping* reads as a
@@ -899,18 +1087,33 @@ export function createRiderMesh(racerId: number, build: RiderBuild): RiderMesh {
     // side axis (see the `hint` note on `BoneDef`). The bar also runs along the
     // world side axis, so the finger roll is the bone's own lathe rotated a
     // quarter turn about Z, which maps its +Y axis onto ∓X.
+    //
+    // ── Why the glove is now a saturated accent ─────────────────────────────
+    // Every part of it was previously `dark` or `fabricDark` — near-black cloth
+    // against a near-black ink line — and the critic read the result as "arms
+    // terminate in blunt cylinders with no hands and no gloves". A hand is ~14
+    // device px across at pack distance; at that size it only exists if it is a
+    // different *hue* from the sleeve, not just a different shape. So the glove
+    // is the racer's own colour with a pale cuff above it and a dark palm below:
+    // three values inside 14 px, and the brightest thing on the whole arm sits
+    // exactly where the eye is meant to go — the grip.
     soft.at(hand);
-    soft.lathe(limbProfile(0.05 * g, 0.047 * g, 0.019, 0.4, 0, 2), 10, hull, 1.0, 1.06);
+    soft.lathe(limbProfile(0.052 * g, 0.049 * g, 0.02, 0.4, 0, 2), 10, litePanel, 1.0, 1.06);
+    // Wrist strap, dark, so the pale cuff has a hard lower boundary.
+    soft.at(hand, setLocal(0, 0.019, 0));
+    soft.lathe(limbProfile(0.05 * g, 0.048 * g, 0.014, 0.2, 0.2, 2), 10, dark, 1.0, 1.06);
     // Back of the hand.
+    soft.at(hand);
     soft.lathe(
       [
-        [0.026 * g, 0.016],
-        [0.037 * g, 0.028],
-        [0.042 * g, 0.052],
-        [0.036 * g, 0.07],
+        [0.028 * g, 0.03],
+        [0.04 * g, 0.04],
+        [0.046 * g, 0.06],
+        [0.039 * g, 0.076],
       ],
       10,
-      dark,
+      // u ≈ 0.25 is the back of the hand (local +Z), u ≈ 0.75 the palm.
+      (u) => (u > 0.55 && u < 0.95 ? dark : hull),
       1.32,
       0.74,
     );
@@ -922,17 +1125,24 @@ export function createRiderMesh(racerId: number, build: RiderBuild): RiderMesh {
     // half a length the other way to end up centred on the wrist — starting at
     // `+side · half` (the first attempt) pushed the whole fist a full roll
     // length outboard, which is why the captured hand sat beside its own arm.
-    const rollLen = 0.098 * g;
+    const rollLen = 0.108 * g;
     soft.at(
       hand,
       setLocal(-side * rollLen * 0.5, PALM_ALONG_HAND, 0.008 * g, 0, 0, -side * Math.PI * 0.5),
     );
-    // Fingers get the *mid* tone, not the near-black one. A fist painted in the
+    // Fingers in the racer's colour, knuckles shaded. A fist painted in the
     // committed suit colour is the same value as its own ink outline: the crit
     // called the celebration hand "a stump" because at 40 px the whole hand was
-    // one black silhouette. Mid-value fingers against a dark palm and a hull
-    // cuff give the hand three values, so it draws as a hand.
-    soft.lathe(knuckleProfile(0.036 * g, rollLen), 8, fabricDark, 1.0, 1.14);
+    // one black silhouette, and called it a missing hand entirely at pack size.
+    // The knuckle grooves are real concavities, so the Sobel pass inks a line
+    // between every finger and the hand draws as a hand rather than a lozenge.
+    soft.lathe(
+      knuckleProfile(0.04 * g, rollLen),
+      8,
+      (u) => (u > 0.55 && u < 0.95 ? accentShade : hull),
+      1.0,
+      1.14,
+    );
     // Thumb, laid inboard across the top of the bar and angled forward. `side`
     // twice over: once to pick the inboard direction in bone space, once to
     // send the lathe axis the same way.
@@ -940,7 +1150,7 @@ export function createRiderMesh(racerId: number, build: RiderBuild): RiderMesh {
       hand,
       setLocal(side * 0.012 * g, PALM_ALONG_HAND - 0.02, -0.016 * g, 0, -0.55, -side * Math.PI * 0.5),
     );
-    soft.lathe(limbProfile(0.021 * g, 0.017 * g, 0.055 * g, 0.9, 0.9, 2), 8, fabricDark, 1.0, 1.1);
+    soft.lathe(limbProfile(0.023 * g, 0.018 * g, 0.058 * g, 0.9, 0.9, 2), 8, hull, 1.0, 1.1);
   }
 
   // ── Legs ──────────────────────────────────────────────────────────────────
@@ -950,50 +1160,160 @@ export function createRiderMesh(racerId: number, build: RiderBuild): RiderMesh {
     const ft = side < 0 ? B.footL : B.footR;
     soft.at(th);
     soft.lathe(
-      limbProfile(0.082 * g, 0.062 * g, skel.bones[th].len, 0.3, 0.2, 3, 0.04),
+      creasedLimb(0.082 * g, 0.062 * g, skel.bones[th].len, 0.3, 0.2, 3, [0.42, 0.72], 0.04),
       10,
       (u) => (outerStripe(side, u) ? hull : fabric),
     );
     soft.at(sh);
     soft.lathe(sphereProfile(0.062 * g, 0, 7, 0.9), 10, fabricDark);
-    soft.lathe(limbProfile(0.056 * g, 0.044 * g, skel.bones[sh].len, 0, 0.2, 2), 10, fabric);
+    soft.lathe(
+      creasedLimb(0.056 * g, 0.044 * g, skel.bones[sh].len, 0, 0.2, 2, [0.34]),
+      10,
+      (u) => (outerStripe(side, u) ? accentShade : fabric),
+    );
     // Boot — hard family: it wants the tight, glossy highlight. Built as a
     // tapered lathe along the foot bone rather than a box: a brick on the end of
     // a leg is the single most obvious "programmer art" tell.
+    //
+    // The whole boot used to be one `dark` tone, i.e. one silhouette the same
+    // value as its own outline — "no boots" in the crit, and correctly so. In
+    // this bone's space +Y runs ankle→toe, so the *sole* is a u band rather than
+    // a v band: local +Z is roughly up, which puts down at u ≈ 0.75.
     hard.at(ft);
-    hard.lathe(limbProfile(0.056 * g, 0.04 * g, skel.bones[ft].len * 1.5, 0.9, 0.7, 3), 10, dark, 1.0, 0.95);
+    hard.lathe(
+      limbProfile(0.056 * g, 0.04 * g, skel.bones[ft].len * 1.5, 0.9, 0.7, 3),
+      10,
+      (u) => (u > 0.6 && u < 0.9 ? light : dark),
+      1.0,
+      0.95,
+    );
     // Ankle cuff, half a size up, so the boot has a top edge to ink.
     hard.at(ft);
     hard.lathe(limbProfile(0.066 * g, 0.058 * g, 0.045, 0.3, 0.2, 2), 10, dark, 1.0, 1.0);
+    // Instep strap in the racer's colour: a boot needs one bright mark or it is
+    // just the dark end of a leg.
+    hard.at(ft, setLocal(0, skel.bones[ft].len * 0.62, 0));
+    hard.lathe(limbProfile(0.05 * g, 0.047 * g, 0.024, 0.2, 0.2, 2), 10, hull, 1.0, 0.96);
   }
 
   // ── Helmet ────────────────────────────────────────────────────────────────
+  //
+  // ── The circle problem ──────────────────────────────────────────────────────
+  // The visor, brow and chin bands below are all *front* features, and the shots
+  // that matter are chase-camera: from behind, the previous helmet was a
+  // perfectly circular disc with a specular dot on it, which is what the critic
+  // measured ("a perfect featureless sphere ... no visor, no jaw, no chin"). A
+  // character's head has to break its own circle from **every** azimuth, so the
+  // shell now carries three rear/side features as well: ear pods on ±X, a nape
+  // skirt that drops behind the jaw line, and a fore-aft aero fin. From directly
+  // behind the silhouette is now a shell with two side lobes, a tail and a
+  // dorsal blade.
   const hr = 0.118 * build.headSize;
+  const hcy = 0.088;
   hard.at(B.head);
-  hard.lathe(sphereProfile(hr, 0.088, 11, 1.06), 14, (_u, v) => (v < 0.2 ? dark : hull), 1.02, 1.04);
-  // Visor: an ink band lying *on* the helmet shell — same sphere, 3% larger,
-  // revolved only across the front 150°. That guarantees it hugs the helmet at
-  // every corner, and because it is a shell the inverted hull inks only its
-  // rim, which is exactly the drawn line a visor wants.
+  // Egg, not ball: 1.13 in Z makes the shell longer front-to-back than it is
+  // wide, so even a pure profile view has a direction to it.
+  hard.lathe(sphereProfile(hr, hcy, 11, 1.05), 14, (_u, v) => (v < 0.2 ? accentShade : hull), 1.0, 1.13);
+  // Visor: a dark-cyan glass band lying *on* the helmet shell — same sphere, 3%
+  // larger, revolved only across the front 165°. That guarantees it hugs the
+  // helmet at every corner, and because it is a shell the inverted hull inks
+  // only its rim, which is exactly the drawn line a visor wants.
   // +Z is a quarter turn round from +X, so the front arc is centred on 0.25.
-  hard.at(B.head);
-  hard.lathe(sphereBand(hr * 1.03, 0.088, 0.4, 0.62, 3, 1.06), 12, visorInk, 1.02, 1.04, 0.03, 0.47);
+  hard.lathe(sphereBand(hr * 1.03, hcy, 0.36, 0.63, 3, 1.05), 12, visorGlass, 1.0, 1.13, 0.02, 0.48);
+  // The one hard highlight band. Deliberately **not** symmetric: it runs across
+  // the upper-left of the glass only, because a symmetric highlight reads as two
+  // eyes and an off-centre one reads as a reflection of the sky.
+  hard.lathe(sphereBand(hr * 1.05, hcy, 0.535, 0.6, 1, 1.05), 12, visorLit, 1.0, 1.13, 0.06, 0.245);
   // Brow: a second, thinner band above the visor in the racer colour.
-  hard.lathe(sphereBand(hr * 1.05, 0.088, 0.62, 0.7, 2, 1.06), 12, hull, 1.02, 1.04, 0.02, 0.48);
-  // Chin guard below the visor, closing the face opening.
-  hard.lathe(sphereBand(hr * 1.04, 0.088, 0.29, 0.4, 2, 1.06), 12, dark, 1.02, 1.04, 0.06, 0.44);
+  hard.lathe(sphereBand(hr * 1.06, hcy, 0.63, 0.71, 2, 1.05), 12, hull, 1.0, 1.13, 0.01, 0.49);
+  // Chin guard below the visor, closing the face opening. In the *racer's* dark
+  // tone, not the suit's: at `dark` it was the same value as the glass above it,
+  // so the visor and the chin bar merged into one navy hood covering two thirds
+  // of the head (shots/rider_r2/ocean_low.png, bow camera). A dark red chin bar
+  // separates from dark cyan glass and the helmet reads as a full-face lid.
+  hard.lathe(sphereBand(hr * 1.04, hcy, 0.26, 0.36, 2, 1.05), 12, accentShade, 1.0, 1.13, 0.05, 0.45);
+  // Jaw. A forward-and-down wedge under the chin guard — the feature that turns
+  // the profile silhouette from a circle into a face shape.
+  hard.at(B.head, setLocal(0, hcy - hr * 0.52, hr * 0.74, -0.35));
+  hard.lathe(limbProfile(hr * 0.46, hr * 0.3, hr * 0.34, 0.7, 0.6, 2), 10, accentShade, 1.5, 0.72);
+  // Ear pods. Break the circle on both flanks from *any* azimuth, and give the
+  // helmet the one thing a sphere cannot have: a left and a right.
+  for (const side of [-1, 1] as const) {
+    hard.at(B.head, setLocal(side * hr * 0.88, hcy - hr * 0.1, hr * 0.02, 0, 0, side * Math.PI * 0.5));
+    hard.lathe(limbProfile(hr * 0.34, hr * 0.26, hr * 0.3, 0.5, 0.55, 2), 8, dark, 1.0, 1.25);
+  }
+  // Nape skirt — a partial-revolve shell across the back, dropped below the
+  // shell's own equator so it hangs over the gorget. This is the rear
+  // silhouette break: from the chase camera the head now has a tail.
+  hard.at(B.head);
+  hard.lathe(sphereBand(hr * 1.04, hcy - hr * 0.16, 0.2, 0.46, 3, 1.14), 12, accentShade, 1.0, 1.13, 0.56, 0.94);
 
-  // Crown detail. Sits half-buried in the helmet shell — a fin that floats
-  // clear of the sphere reads as a modelling mistake, not a design.
-  const crown = 0.088 + hr * 1.06;
+  // Crown detail: a fore-aft aero blade, half-buried in the shell.
+  //
+  // It used to be `hard.box(0.015, hr*0.46, hr*1.15, …, litePanel)` — a
+  // near-white axis-aligned cuboid on a red sphere, which the critic reported
+  // literally as "a stray grey box intersecting the helmet crown". Two faults:
+  // a box has no taper so it cannot read as a fin from any angle, and painting
+  // it the palest tone in the set made it the loudest shape on the head. It is
+  // now a flattened lathe — `sx` squashes the revolve onto the YZ plane, so the
+  // profile's radius becomes the blade's fore-aft chord and its height becomes
+  // the blade's rise — tapered to a point at both ends, in the *dark* tone with
+  // the racer's colour on its top edge, so it reads as a fin with a lit spine.
+  // The blade has to *clear* the crown or it does not exist: the first version
+  // put its top ring exactly at `crown`, i.e. flush with the shell, and the
+  // rear-quarter capture showed a perfectly smooth dome. Its origin is now
+  // 0.34·hr below the crown with 0.66·hr of rise above that, so 0.32·hr — about
+  // 11 device px at closeup scale — stands clear of the shell.
+  const crown = hcy + hr * 1.05;
+  const bladeTint = (_u: number, v: number) => (v > 0.7 ? hull : dark);
   if (build.crest === 'fin') {
-    hard.at(B.head, setLocal(0, crown - 0.028, -0.012));
-    hard.box(0.015, hr * 0.46, hr * 1.15, 0, 0, 0, litePanel);
+    hard.at(B.head, setLocal(0, crown - hr * 0.34, -hr * 0.1));
+    hard.lathe(
+      [
+        [0.0, -hr * 0.44],
+        [hr * 0.66, -hr * 0.16],
+        [hr * 0.8, hr * 0.24],
+        [hr * 0.46, hr * 0.54],
+        [0.0, hr * 0.66],
+      ],
+      7,
+      bladeTint,
+      0.26,
+      1.0,
+    );
   } else if (build.crest === 'mohawk') {
     for (let i = 0; i < 3; i++) {
-      hard.at(B.head, setLocal(0, crown - 0.02 - i * 0.016, 0.03 - i * 0.045));
-      hard.box(0.013, hr * (0.44 - i * 0.09), hr * 0.34, 0, 0, 0, litePanel);
+      hard.at(B.head, setLocal(0, crown - hr * 0.3 - i * hr * 0.14, hr * (0.3 - i * 0.34)));
+      hard.lathe(
+        [
+          [0.0, -hr * 0.4],
+          [hr * 0.24, -hr * 0.14],
+          [hr * 0.3, hr * (0.3 - i * 0.05)],
+          [0.0, hr * (0.5 - i * 0.08)],
+        ],
+        6,
+        bladeTint,
+        0.24,
+        1.0,
+      );
     }
+  } else {
+    // No crest: the shell still needs a rear feature, so it gets a low ridge
+    // sitting over the nape — squat and swept, so NOX still reads as helmeted
+    // rather than finned.
+    hard.at(B.head, setLocal(0, crown - hr * 0.34, -hr * 0.36));
+    hard.lathe(
+      [
+        [0.0, -hr * 0.36],
+        [hr * 0.44, -hr * 0.1],
+        [hr * 0.5, hr * 0.2],
+        [0.0, hr * 0.36],
+      ],
+      6,
+      bladeTint,
+      0.3,
+      1.0,
+    );
   }
 
   // ── Shoulder pad(s) — the silhouette break that makes a rider read ────────
@@ -1014,19 +1334,23 @@ export function createRiderMesh(racerId: number, build: RiderBuild): RiderMesh {
         [0.042 * g, 0.05],
       ],
       10,
-      // Pale only on the first two rings. Painted pale over 70% of the shell (the
-      // previous split) the pad was the brightest, largest, smoothest object on
-      // the rider — the "white marshmallow with no outline" in the crit. Now the
-      // racer's colour owns the pad and the pale tone is a lit top edge.
+      // No pale tone on the pad at all any more. `v < 0.3` is the pad's inner
+      // cap, which from a bow camera is presented dead face-on: painted
+      // `litePanel` it came back as a white disc the size of the helmet — the
+      // "marshmallow" the crit has now flagged twice. The pad is two values of
+      // the racer's own colour, which keeps it a silhouette break instead of a
+      // value event, and the pale highlight job moves to the deltoid underneath.
       //
       // v = 0 is the *shoulder* end: `up` runs shoulder→elbow, so +Y goes down
-      // the arm. Putting the highlight at v > 0.66 (the first fix) hung it off
-      // the bottom lip of the pad, lit from below, which is worse than no
-      // highlight at all.
-      (_u, v) => (v < 0.3 ? litePanel : hull),
+      // the arm.
+      (_u, v) => (v < 0.34 ? accentShade : hull),
       1.12,
       0.95,
     );
+    // Hard lower lip in the dark tone so the pad has a drawn boundary against
+    // the sleeve rather than fading into it.
+    hard.at(up, setLocal(0, 0.028, 0));
+    hard.lathe(limbProfile(0.09 * g, 0.062 * g, 0.016, 0, 0, 2), 10, dark, 1.12, 0.95);
   }
 
   // ── Scarf ─────────────────────────────────────────────────────────────────
@@ -1080,8 +1404,18 @@ export function createRiderMesh(racerId: number, build: RiderBuild): RiderMesh {
     specSize: 0.978,
     specSize2: 0.995,
     specStrength: 0.13,
+    // Cloth is not glossy. The shared gloss matcap was landing thresholded marks
+    // on the suit and the shoulder pads — the flat hexagonal grey patch visible
+    // on the player's pad in shots/r3/ocean_low.png is one of its disc marks, and
+    // on fabric it reads as a hole rather than as a reflection. `null` drops the
+    // USE_MATCAP define entirely, so this is one less texture fetch too.
+    matcap: null,
     outlineWidthPx: 2.0,
-    edgeBias: 1.15,
+    // Raised from 1.15. The rider is one merged mesh, so the Sobel pass has no
+    // object-id discontinuity to work with where an arm crosses the chest — only
+    // depth and normal — and 1.15 was leaving that crossing un-inked at pack
+    // distance. Interior ink on limb-over-torso is an explicit art-direction ask.
+    edgeBias: 1.5,
     name: `riderSoft${racerId}`,
     chunks: skinChunks(bonesUniform),
   });
@@ -1100,8 +1434,12 @@ export function createRiderMesh(racerId: number, build: RiderBuild): RiderMesh {
     specSize: 0.966,
     specSize2: 0.991,
     specStrength: 0.5,
+    // Halved from the 0.34 default: the helmet keeps a hint of drawn reflection,
+    // but at full strength the disc's sky strip washed a second pale cap across
+    // the shell right next to the banded spec, giving the head two highlights.
+    matcapStrength: 0.16,
     outlineWidthPx: 2.2,
-    edgeBias: 1.3,
+    edgeBias: 1.5,
     name: `riderHard${racerId}`,
     chunks: skinChunks(bonesUniform),
   });
