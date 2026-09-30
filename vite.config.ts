@@ -1,6 +1,8 @@
 import { defineConfig } from 'vite';
 
 export default defineConfig({
+  // GitHub Pages project site: https://1004913938-tech.github.io/ink-surge/
+  base: process.env.GITHUB_PAGES === '1' ? '/ink-surge/' : '/',
   server: {
     port: 5173,
     strictPort: true,
