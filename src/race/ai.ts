@@ -228,9 +228,17 @@ export class AiDrivers implements Subsystem {
     }
   }
 
+  setTrack(track: Track) {
+    this.trk = track;
+  }
+
   update(ctx: GameContext) {
+    const n = ctx.racers.length;
     for (const r of this.racers) {
       if (r.isPlayer) continue;
+      // Time-trial / solo sessions park unused AI boats.
+      if (!r.root.visible || r.id >= n) continue;
+      if (r.finished) continue;
       this.drive(ctx, r);
     }
   }

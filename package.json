@@ -1,9 +1,9 @@
 {
-  "name": "ink-tide",
+  "name": "ink-surge",
   "private": true,
-  "version": "1.0.0",
+  "version": "1.1.0",
   "type": "module",
-  "description": "Ink Tide — a cel-shaded arcade boat racing game on an infinite procedural ocean.",
+  "description": "INK SURGE — cel-shaded arcade boat racing with career cups on a procedural ocean.",
   "scripts": {
     "dev": "vite",
     "build": "vite build",

@@ -1,13 +1,29 @@
-# INK TIDE
+# INK SURGE
 
-A cel-shaded arcade boat racing game on an infinite procedural ocean.
-Vite + TypeScript + Three.js. **Zero external assets** — every mesh, every
-texture and every sound is generated in code.
+Cel-shaded arcade boat racing on an infinite procedural ocean — **career cups,
+garage hulls, and data-driven tracks** built on the Wave-Racer / Ink Tide engine
+fork. Vite + TypeScript + Three.js. **Zero external assets** — every mesh,
+texture and sound is generated in code.
+
+> **Commercial use:** upstream currently has no LICENSE. Read [LICENSE](LICENSE)
+> and [STORE.md](STORE.md) before publishing.
 
 ```bash
 npm install
 npm run dev      # → http://localhost:5173
 ```
+
+## Modes
+
+| Mode | What it is |
+|---|---|
+| Career Cup | Novice Bay Cup — 4 events, medals unlock boats |
+| **Swell Run** | Timed airtime scoring (Career event 3) — not lap racing |
+| Quick Race | Pick Novice Bay / Storm Atoll / Reverse |
+| Time Trial | Solo 2-lap clock |
+| Garage | Reef Runner / Spine Cutter / Buoy Dancer + liveries |
+
+Menu: `↑↓←→` select · `Enter` confirm · `Esc` back. In results: `R` retry · `Enter` menu.
 
 ## Controls
 
@@ -17,8 +33,11 @@ npm run dev      # → http://localhost:5173
 | Brake / reverse | `S` / `↓` | LT |
 | Steer | `A` `D` / `← →` | Left stick |
 | Powerslide (hold, release for boost) | `Shift` / `Space` | B or RB |
+| Use item | `E` | X / Square |
 | Race again (on results) | `R` | — |
 | Cycle camera | `C` | — |
+
+**Items (standard / elimination races):** hit yellow boxes for 浪推 / 墨障 / 涌盾, press `E` to use. Disabled in Swell Run and Time Trial.
 
 Hold the powerslide through a corner to charge boost — three tiers, longer
 charge means a longer boost. Take the crests on the cross-swell leg at speed
@@ -26,9 +45,9 @@ and you will get air; land flat or you lose time.
 
 ## What's in here
 
-**Three laps, four boats, one closed circuit** marked on open water by a glowing
-racing line that rides the swell. Countdown start, checkpoint gates, wrong-way
-detection, split times, results board.
+**Career + quick race + time trial** on data-driven circuits (`src/race/trackDef.ts`),
+with local save (`src/meta/`). A glowing racing line rides the swell. Countdown
+start, checkpoint gates, wrong-way detection, split times, results board.
 
 - **Infinite ocean** — 6 summed Gerstner waves (long swell + chop + fine detail)
   displaced in the vertex shader, on a radial grid re-centred on the camera.

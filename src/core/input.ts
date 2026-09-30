@@ -17,6 +17,15 @@ export interface InputState {
   startPressed: boolean;
   restartPressed: boolean;
   cameraTogglePressed: boolean;
+  /** Edge-triggered item use (E / gamepad X). */
+  itemPressed: boolean;
+  /** Menu navigation edges. */
+  menuUp: boolean;
+  menuDown: boolean;
+  menuLeft: boolean;
+  menuRight: boolean;
+  menuConfirm: boolean;
+  menuBack: boolean;
 }
 
 export function createInputState(): InputState {
@@ -28,6 +37,13 @@ export function createInputState(): InputState {
     startPressed: false,
     restartPressed: false,
     cameraTogglePressed: false,
+    itemPressed: false,
+    menuUp: false,
+    menuDown: false,
+    menuLeft: false,
+    menuRight: false,
+    menuConfirm: false,
+    menuBack: false,
   };
 }
 
@@ -37,9 +53,11 @@ const KEYS = {
   fwd: ['ArrowUp', 'KeyW'],
   back: ['ArrowDown', 'KeyS'],
   drift: ['ShiftLeft', 'ShiftRight', 'Space'],
-  start: ['Enter', 'Space'],
+  start: ['Enter'],
   restart: ['KeyR'],
   camera: ['KeyC'],
+  item: ['KeyE'],
+  menuBack: ['Escape', 'Backspace'],
 };
 
 export class InputManager {
@@ -105,6 +123,16 @@ export class InputManager {
     s.startPressed = this.anyPressed(KEYS.start) || !!(pad && pad.buttons[9]?.pressed);
     s.restartPressed = this.anyPressed(KEYS.restart);
     s.cameraTogglePressed = this.anyPressed(KEYS.camera);
+    s.itemPressed =
+      this.anyPressed(KEYS.item) || !!(pad && pad.buttons[2]?.pressed); // X / square
+
+    // Menu uses the same arrows/WASD edges; racing screens ignore these flags.
+    s.menuUp = this.anyPressed(KEYS.fwd);
+    s.menuDown = this.anyPressed(KEYS.back);
+    s.menuLeft = this.anyPressed(KEYS.left);
+    s.menuRight = this.anyPressed(KEYS.right);
+    s.menuConfirm = s.startPressed || this.anyPressed(['Space']);
+    s.menuBack = this.anyPressed(KEYS.menuBack);
 
     this.pressedThisFrame.clear();
   }

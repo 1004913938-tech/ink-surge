@@ -1,17 +1,19 @@
 /**
  * Bootstrap and frame loop.
  *
- * Owns the `GameContext`, the ordered subsystem list, resize handling, and the
- * `window.__INKTIDE__` harness API. Nothing here knows how any subsystem works
- * — it only knows the interfaces in core/types.
+ * Owns the `GameContext`, the ordered subsystem list, resize handling, menu
+ * flow, and the `window.__INKTIDE__` harness API.
  */
 
-import { Scene, Vector3 } from 'three';
+import { Scene } from 'three';
+import { applySession, ACTIVE } from './core/activeRace';
 import { CONFIG } from './core/config';
 import { InputManager } from './core/input';
 import { clamp } from './core/mathx';
 import { setSeaState } from './water/gerstner';
-import type { GameContext, Racer, RacerId, Subsystem } from './core/types';
+import type { GameContext, RacePhase, Racer, RacerId, Subsystem } from './core/types';
+import { defaultSession, type RaceSession } from './meta/session';
+import { getTrackDef } from './race/trackDef';
 
 import { AdaptiveResolution, createRenderer } from './render/renderer';
 import { InkComposer } from './render/composer';
@@ -22,10 +24,13 @@ import { Track } from './race/track';
 import { BoatPhysics, createRacer } from './boat/boat';
 import { AiDrivers } from './race/ai';
 import { RaceState } from './race/raceState';
+import { SwellRun } from './race/swellRun';
+import { ItemSystem } from './race/items';
 import { Riders } from './rider/rider';
 import { ChaseCamera, type CameraPreset } from './camera/chaseCamera';
 import { Hud } from './ui/hud';
 import { GameAudio } from './audio/audio';
+import { BRAND } from './brand';
 
 class Game {
   private scene = new Scene();
@@ -40,6 +45,10 @@ class Game {
   private hud: Hud;
   private audio = new GameAudio();
   private racers: Racer[] = [];
+  private ai!: AiDrivers;
+  private swell!: SwellRun;
+  private items!: ItemSystem;
+  private settledResults = false;
 
   private ctx: GameContext;
   private lastTime = 0;
@@ -49,7 +58,6 @@ class Game {
   private forcedControls:
     | Partial<{ steer: number; throttle: number; brake: number; drift: boolean; autopilot: boolean }>
     | null = null;
-  private fixedDt: number | null = null;
   /** True while a harness script owns the clock; suppresses the rAF step. */
   private scripted = false;
 
@@ -64,13 +72,12 @@ class Game {
     const aspect = window.innerWidth / window.innerHeight;
     this.cameraRig = new ChaseCamera(aspect);
 
-    // ── Scene assembly ──────────────────────────────────────────────────────
     this.scene.add(createSky());
 
     this.ocean = new Ocean();
     this.scene.add(this.ocean.mesh);
 
-    this.track = new Track();
+    this.track = new Track(getTrackDef('noviceBay'));
     this.scene.add(this.track.group);
 
     for (let i = 0; i < CONFIG.race.racerCount; i++) {
@@ -80,11 +87,19 @@ class Game {
       this.scene.add(racer.root);
     }
 
-    this.race = new RaceState(this.racers, this.track, () => this.resetRacers());
+    this.race = new RaceState(this.racers, this.track, () => {
+      this.swell.reset();
+      this.items.reset();
+      this.resetRacers();
+    });
+    this.race.setReturnToMenu(() => this.enterHub());
+    this.swell = new SwellRun(this.race);
+    this.items = new ItemSystem(this.track, this.racers);
+    this.scene.add(this.items.group);
     this.hud = new Hud(hudCanvas, this.track);
     this.composer = new InkComposer(renderer, this.scene, this.cameraRig.camera);
+    this.ai = new AiDrivers(this.racers, this.track);
 
-    // ── Context ─────────────────────────────────────────────────────────────
     this.ctx = {
       renderer,
       scene: this.scene,
@@ -105,21 +120,26 @@ class Game {
       height: window.innerHeight,
       pixelRatio: 1,
       perf: { fps: 60, frameMs: 16.6, gpuScale: 1, drawCalls: 0, triangles: 0 },
+      swell: this.swell.snapshot(),
+      items: this.items.view(),
     };
 
-    // ── Subsystems, in execution order ──────────────────────────────────────
     this.subsystems = [
       this.ocean,
       this.track,
       new BoatPhysics(this.racers),
-      new AiDrivers(this.racers, this.track),
+      this.ai,
       this.race,
+      this.swell,
+      this.items,
       new Riders(this.racers),
     ].sort((a, b) => a.order - b.order);
 
+    this.race.phase = 'hub';
+    this.hud.menus.syncFromSave();
+
     this.resize();
     window.addEventListener('resize', () => this.resize());
-    // Audio can only start from a gesture; arm it on the first interaction.
     const unlock = () => {
       void this.audio.unlock();
       window.removeEventListener('pointerdown', unlock);
@@ -129,13 +149,6 @@ class Game {
     window.addEventListener('keydown', unlock);
   }
 
-  /**
-   * Minimal lookahead steering for the harness-driven player.
-   *
-   * Deliberately lives here rather than in the AI subsystem: the harness must
-   * keep working regardless of how the AI is rewritten, and a captured frame is
-   * only comparable across rounds if the player's line is reproducible.
-   */
   private autopilotSteer(racer: Racer): number {
     const proj = this.track.project(racer.root.position);
     const speed = racer.state.velocity.length();
@@ -150,9 +163,19 @@ class Game {
   }
 
   private resetRacers() {
+    const count = ACTIVE.session.racerCount;
     for (const r of this.racers) {
+      const active = r.id < count;
+      r.root.visible = active;
+      if (!active) {
+        r.finished = true;
+        r.finishTime = 0;
+        r.state.velocity.set(0, 0, 0);
+        continue;
+      }
       const grid = this.track.startGrid(r.id);
       r.root.position.copy(grid.position);
+      r.root.rotation.y = grid.heading;
       r.state.velocity.set(0, 0, 0);
       r.state.heading = grid.heading;
       r.state.forwardSpeed = 0;
@@ -172,6 +195,45 @@ class Game {
       r.wrongWay = false;
     }
     this.cameraRig.snapToTarget();
+  }
+
+  private enterHub() {
+    this.race.phase = 'hub';
+    this.settledResults = false;
+    this.hud.menus.syncFromSave();
+    this.hud.menus.lastPayout = '';
+    applySession(defaultSession());
+    this.swell.reset();
+    this.items.reset();
+    setSeaState(0.55);
+    this.resetRacers();
+  }
+
+  private startRace(session: RaceSession) {
+    applySession(session);
+    const def = getTrackDef(session.trackId);
+
+    if (this.track.def.id !== def.id) {
+      this.scene.remove(this.track.group);
+      this.track = new Track(def);
+      this.scene.add(this.track.group);
+      this.race.setTrack(this.track);
+      this.ai.setTrack(this.track);
+      this.items.setTrack(this.track);
+      this.hud.setTrack(this.track);
+      this.ctx.track = this.track;
+      // Swap track subsystem slot.
+      const idx = this.subsystems.findIndex((s) => s.name === 'track');
+      if (idx >= 0) this.subsystems[idx] = this.track;
+    }
+
+    setSeaState(session.seaState);
+    this.settledResults = false;
+    this.hud.menus.lastPayout = '';
+    this.swell.reset();
+    this.items.reset();
+    this.resetRacers();
+    this.race.beginCountdown();
   }
 
   resize() {
@@ -199,12 +261,6 @@ class Game {
     this.lastTime = performance.now();
     const loop = (now: number) => {
       if (!this.running) return;
-      // While a scripted harness run is in flight, the rAF loop must not step
-      // the simulation. `simulate()` awaits between batches, and those awaits
-      // used to let real-dt frames slip in — so the same (phase, controls, t)
-      // triple produced different boat state on every run and the harness was
-      // not actually deterministic. Keep the loop alive, but let the script own
-      // the clock.
       if (!this.scripted) this.frame(now);
       requestAnimationFrame(loop);
     };
@@ -218,46 +274,60 @@ class Game {
     this.lastTime = now;
 
     ctx.rawDt = rawDt;
-    // Clamp so a tab-switch or a breakpoint cannot fling the boats into orbit.
     ctx.dt = clamp(rawDt, 0, 1 / 20);
     ctx.time += ctx.dt;
     ctx.frame++;
 
     const t0 = performance.now();
 
-    // ── Input ───────────────────────────────────────────────────────────────
     this.input.update(ctx.dt);
     const pc = this.racers[0].controls;
+    const menuPhase = isMenuPhase(this.race.phase);
+
     if (this.forcedControls) {
       pc.throttle = this.forcedControls.throttle ?? 0;
       pc.brake = this.forcedControls.brake ?? 0;
       pc.drift = this.forcedControls.drift ?? false;
-      // A scripted `steer: 0` drives the player dead straight off the circuit —
-      // 1.2 km off-line after a minute, which put the WRONG WAY banner in almost
-      // every captured frame and pushed the AI pack out of shot. Autopilot steers
-      // the player along the spline so shots frame a real racing situation.
       pc.steer = this.forcedControls.autopilot
         ? this.autopilotSteer(this.racers[0])
         : this.forcedControls.steer ?? 0;
-    } else {
+    } else if (!menuPhase) {
       const s = this.input.state;
       pc.steer = s.steer;
       pc.throttle = s.throttle;
       pc.brake = s.brake;
       pc.drift = s.drift;
     }
-    if (this.input.state.restartPressed && this.race.phase === 'results') this.race.restart();
 
-    // ── Shared shader uniforms — written once for the whole scene ────────────
+    if (menuPhase) {
+      const action = this.hud.menus.update(ctx, ctx.dt);
+      if (action.type === 'setPhase') this.race.phase = action.phase;
+      if (action.type === 'startRace') this.startRace(action.session);
+    }
+
     SHARED.uTime.value = ctx.time;
     SHARED.uCameraPos.value.copy(this.cameraRig.camera.position);
     SHARED.uTanHalfFov.value = Math.tan((this.cameraRig.camera.fov * Math.PI) / 360);
 
-    // ── Subsystems ──────────────────────────────────────────────────────────
     for (const s of this.subsystems) s.update(ctx);
+    ctx.swell = this.swell.snapshot();
+    ctx.items = this.items.view();
 
-    // Camera and audio run after everything that can move the boat.
-    if (this.race.phase === 'countdown' || this.race.phase === 'results') {
+    if (this.race.phase === 'results' && !this.settledResults) {
+      this.settledResults = true;
+      const snap = this.swell.snapshot();
+      this.hud.menus.settleResults(
+        this.ctx.player.place,
+        this.ctx.player.finishTime,
+        snap.active ? snap.score : 0,
+      );
+    }
+
+    if (
+      this.race.phase === 'countdown' ||
+      this.race.phase === 'results' ||
+      menuPhase
+    ) {
       this.cameraRig.applyCinematicOrbit(ctx);
       this.cameraRig.update(ctx);
     } else {
@@ -265,10 +335,8 @@ class Game {
     }
     this.audio.update(ctx);
 
-    // ── Render ──────────────────────────────────────────────────────────────
     ctx.renderer.info.reset();
     this.composer.render();
-    // Hand the G-buffer depth to the water so its foam ring can read it.
     this.ocean.setSceneDepth(this.composer.gbufferDepth);
 
     const stats = this.adaptive.drawStats();
@@ -277,7 +345,6 @@ class Game {
 
     this.hud.render(ctx);
 
-    // ── Adaptive resolution ─────────────────────────────────────────────────
     const frameMs = performance.now() - t0;
     if (this.adaptive.update(frameMs, ctx.dt)) this.resize();
     ctx.perf.fps = this.adaptive.fps;
@@ -294,7 +361,17 @@ class Game {
 
       reset() {
         self.ctx.time = 0;
-        self.race.restart();
+        applySession({
+          mode: 'quick',
+          trackId: 'noviceBay',
+          laps: 3,
+          racerCount: 4,
+          seaState: 1,
+          boatClass: 'balanced',
+          liveryId: 'vermilion',
+          eventKind: 'standard',
+        });
+        self.startRace(ACTIVE.session);
         self.forcedControls = null;
       },
 
@@ -307,7 +384,6 @@ class Game {
           self.race.phase = 'countdown';
           self.race.raceTime = -CONFIG.race.countdownSeconds;
         } else {
-          // Fabricate a plausible finished race so the results board has data.
           self.race.phase = 'results';
           self.racers.forEach((r, i) => {
             r.finished = true;
@@ -315,7 +391,7 @@ class Game {
             r.lapTimes = [71.2 + i, 70.8 + i, 72.5 + i];
             r.bestLap = Math.min(...r.lapTimes);
             r.place = i + 1;
-            r.lap = CONFIG.race.laps;
+            r.lap = ACTIVE.session.laps;
           });
         }
       },
@@ -324,26 +400,15 @@ class Game {
         self.forcedControls = c as any;
       },
 
-      /** Fixed-step advance — identical output on every machine. */
       async simulate(seconds: number, dt = 1 / 60) {
         self.scripted = true;
         const steps = Math.max(1, Math.round(seconds / dt));
         for (let i = 0; i < steps; i++) {
           self.frame(performance.now(), dt);
-          // Yield periodically so the compositor can breathe and WebGL does not
-          // build an unbounded command backlog.
           if (i % 30 === 29) await new Promise((r) => setTimeout(r, 0));
         }
       },
 
-      /**
-       * Advance until a predicate over stats() holds, or `maxSeconds` elapses.
-       *
-       * Fixed-t shots are brittle for transient states: the boat physics was
-       * retuned and the old `air` timestamp stopped landing on an airborne
-       * frame, so a shot that existed to prove the landing crouch was silently
-       * proving nothing. Hunting for the state instead survives retuning.
-       */
       async simulateUntil(
         predicateSource: string,
         maxSeconds = 90,
@@ -359,13 +424,12 @@ class Game {
           try {
             if (pred(this.stats())) return { found: true, t: self.ctx.time };
           } catch {
-            /* a malformed predicate should not wedge the run */
+            /* ignore */
           }
         }
         return { found: false, t: self.ctx.time };
       },
 
-      /** Render N frames so springs and particles settle. Still script-owned. */
       async settle(frames = 6) {
         self.scripted = true;
         for (let i = 0; i < frames; i++) {
@@ -374,16 +438,11 @@ class Game {
         }
       },
 
-      /** Hand the clock back to real time. */
       release() {
         self.scripted = false;
         self.lastTime = performance.now();
       },
 
-      /**
-       * Per-racer diagnostic dump. Exists because "the boats are driving the
-       * wrong way" is a claim that needs numbers, not a screenshot.
-       */
       probe() {
         return self.racers.map((r) => {
           const proj = self.track.project(r.root.position);
@@ -396,7 +455,6 @@ class Game {
             heading: r.state.heading,
             headingFwd: fwd,
             trackTangent: { x: tp.tangent.x, z: tp.tangent.z },
-            // >0 means the hull points along the track; <0 means backwards.
             headingDotTangent: fwd.x * tp.tangent.x + fwd.z * tp.tangent.z,
             velDotTangent: speed > 0.01 ? r.state.velocity.dot(tp.tangent) / speed : 0,
             speed,
@@ -456,10 +514,19 @@ class Game {
         };
       },
 
-      /** Escape hatch for ad-hoc probing from the harness. */
       _game: self,
     };
   }
+}
+
+function isMenuPhase(phase: RacePhase): boolean {
+  return (
+    phase === 'hub' ||
+    phase === 'career' ||
+    phase === 'garage' ||
+    phase === 'quick' ||
+    phase === 'trial'
+  );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -474,7 +541,6 @@ try {
   const game = new Game(glCanvas, hudCanvas);
   game.start();
 
-  // Expose the harness API once the first frame is definitely on screen.
   requestAnimationFrame(() =>
     requestAnimationFrame(() => {
       (window as any).__INKTIDE__ = game.harness();
@@ -483,7 +549,7 @@ try {
     }),
   );
 } catch (err) {
-  console.error('[ink-tide] boot failed', err);
+  console.error(`[${BRAND.id}] boot failed`, err);
   if (boot) {
     boot.textContent = 'Boot failed — see console';
     boot.style.letterSpacing = '0.1em';

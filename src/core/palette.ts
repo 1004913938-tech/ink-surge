@@ -1,5 +1,5 @@
 /**
- * INK TIDE — committed palette.
+ * INK SURGE — committed palette.
  *
  * One palette, used by every subsystem: water, sky, hulls, riders, ink, HUD.
  * High-saturation, limited, deliberately anime. Nothing here is "physically

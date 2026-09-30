@@ -10,6 +10,7 @@
  * dropped frame shortens no beat. Nothing here reads `Date.now()`.
  */
 
+import { activeLaps } from '../core/activeRace';
 import { CONFIG } from '../core/config';
 import { clamp01, formatTime, ordinal } from '../core/mathx';
 import { HEX } from '../core/palette';
@@ -67,7 +68,7 @@ export class Screens {
     if (this.lastLap < 0) this.lastLap = lap;
     else if (lap !== this.lastLap) {
       this.lastLap = lap;
-      if (lap > 0 && lap < CONFIG.race.laps) this.lapBanner = 0;
+      if (lap > 0 && lap < activeLaps()) this.lapBanner = 0;
     }
     if (this.lapBanner >= 0) {
       this.lapBanner += dt;
@@ -314,7 +315,93 @@ export class Screens {
     const x = w * 0.5 + (1 - inT) * w * 0.28;
     g.save();
     g.globalAlpha = out;
-    this.tab(g, x, y, `LAP ${Math.min(ctx.player.lap + 1, CONFIG.race.laps)}`, s, rgba(HEX.boostHot, 1), t);
+    this.tab(g, x, y, `LAP ${Math.min(ctx.player.lap + 1, activeLaps())}`, s, rgba(HEX.boostHot, 1), t);
+    g.restore();
+  }
+
+  // ── Swell Run presentation ─────────────────────────────────────────────────
+
+  swellFinish(g: CanvasRenderingContext2D, ctx: GameContext, w: number, h: number, s: number) {
+    const T = this.phaseTime;
+    const fade = 1 - clamp01((T - 1.0) / 0.8);
+    g.save();
+    g.globalAlpha = fade;
+    const cx = w * 0.5;
+    const cy = h * 0.38;
+    const slab = slantPath(cx - w * 0.28, cy - 48 * s, w * 0.56, 96 * s, 32 * s);
+    inked(g, slab, rgba(HEX.ink, 1), rgba(HEX.raceLine, 0.95), PLATE_W * s);
+    inkText(g, 'TIME UP', cx, cy + 18 * s, {
+      font: `900 ${Math.round(52 * s)}px ${FONT_STACK}`,
+      fill: rgba(HEX.hudPaper, 1),
+      ink: rgba(HEX.ink, 1),
+      inkWidth: 8 * s,
+      align: 'center',
+      skew: 0.16,
+      tracking: 5 * s,
+    });
+    inkText(g, `AIR  ${ctx.swell.score.toFixed(1)}s`, cx, cy + 72 * s, {
+      font: `800 ${Math.round(22 * s)}px ${FONT_STACK}`,
+      fill: rgba(HEX.boostHot, 1),
+      align: 'center',
+      skew: 0.1,
+      tracking: 3 * s,
+    });
+    g.restore();
+  }
+
+  swellResults(g: CanvasRenderingContext2D, ctx: GameContext, w: number, h: number, s: number) {
+    const T = this.phaseTime;
+    const sw = ctx.swell;
+    const cx = w * 0.5;
+    const wash = clamp01(T / 0.4);
+
+    g.save();
+    g.globalAlpha = wash * 0.55;
+    g.fillStyle = rgba(HEX.ink, 1);
+    g.fillRect(0, 0, w, h);
+    g.restore();
+
+    const panelW = Math.min(560 * s, w * 0.7);
+    const panelH = 280 * s;
+    const px = cx - panelW * 0.5;
+    const py = h * 0.28;
+    const path = slantPath(px, py, panelW, panelH, 48 * s);
+    g.save();
+    g.globalAlpha = clamp01((T - 0.1) / 0.35);
+    plate(g, path, s, { edge: rgba(HEX.raceLine, 1) });
+
+    inkText(g, 'SWELL RUN', cx, py + 48 * s, {
+      font: `800 ${Math.round(14 * s)}px ${FONT_STACK}`,
+      fill: rgba(HEX.raceLine, 1),
+      align: 'center',
+      tracking: 4 * s,
+    });
+    inkText(g, 'AIR TIME', cx, py + 88 * s, {
+      font: `700 ${Math.round(13 * s)}px ${FONT_STACK}`,
+      fill: rgba(HEX.hudDim, 1),
+      align: 'center',
+      tracking: 3 * s,
+    });
+    segText(g, sw.score.toFixed(2), cx, py + 110 * s, 48 * s, {
+      lit: rgba(HEX.boostHot, 1),
+      ink: rgba(HEX.ink, 1),
+      inkWidth: 2 * s,
+      align: 'center',
+      skew: 0.1,
+    });
+    inkText(g, `BEST HOP  ${sw.bestHop.toFixed(2)}s`, cx, py + 200 * s, {
+      font: `800 ${Math.round(18 * s)}px ${FONT_STACK}`,
+      fill: rgba(HEX.foamShade, 1),
+      align: 'center',
+      skew: 0.08,
+      tracking: 2 * s,
+    });
+    inkText(g, '冲进涌浪 · 滞空得分', cx, py + 240 * s, {
+      font: `700 ${Math.round(13 * s)}px ${FONT_STACK}`,
+      fill: rgba(HEX.hudDim, 1),
+      align: 'center',
+      tracking: 2 * s,
+    });
     g.restore();
   }
 
@@ -633,7 +720,7 @@ export class Screens {
         g.lineTo(bx2 - dir * 10 * s, py + 6 * s);
         g.stroke();
       }
-      inkText(g, 'PRESS  R  TO RACE AGAIN', boardCx, py + 2 * s, {
+      inkText(g, 'R RETRY    ENTER MENU', boardCx, py + 2 * s, {
         font: `800 ${Math.round(17 * s)}px ${FONT_STACK}`,
         fill: rgba(HEX.hudPaper, 0.55 + 0.45 * blink),
         align: 'center',

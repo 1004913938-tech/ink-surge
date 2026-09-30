@@ -44,6 +44,11 @@ export class Minimap {
 
   constructor(private track: TrackAPI) {}
 
+  setTrack(track: TrackAPI) {
+    this.track = track;
+    this.path = null;
+  }
+
   /** Recompute the projection. Called from the HUD's resize path only. */
   layout(x: number, y: number, size: number) {
     this.x = x;

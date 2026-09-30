@@ -134,7 +134,17 @@ export interface TrackAPI {
 // Race flow
 // ─────────────────────────────────────────────────────────────────────────────
 
-export type RacePhase = 'boot' | 'countdown' | 'racing' | 'finished' | 'results';
+export type RacePhase =
+  | 'boot'
+  | 'hub'
+  | 'career'
+  | 'garage'
+  | 'quick'
+  | 'trial'
+  | 'countdown'
+  | 'racing'
+  | 'finished'
+  | 'results';
 
 export interface RaceAPI {
   phase: RacePhase;
@@ -147,6 +157,8 @@ export interface RaceAPI {
   /** Field sorted by current position. */
   standings(): Racer[];
   restart(): void;
+  /** Leave results and return control to the menu flow. */
+  returnToMenu?(): void;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -185,6 +197,29 @@ export interface CameraRig {
 // The one object passed to every per-frame update
 // ─────────────────────────────────────────────────────────────────────────────
 
+/** Live Swell Run telemetry for HUD / results. Null when not in that mode. */
+export interface SwellRunView {
+  active: boolean;
+  timeLeft: number;
+  duration: number;
+  score: number;
+  bestHop: number;
+  currentHop: number;
+  showTip: boolean;
+  finished: boolean;
+}
+
+export type ItemKindView = 'surge' | 'ink' | 'shield' | null;
+
+/** Player item slot for Mario-style boxes. */
+export interface ItemHudView {
+  enabled: boolean;
+  held: ItemKindView;
+  shield: number;
+  pickupFlash: number;
+  tip: boolean;
+}
+
 export interface GameContext {
   renderer: WebGLRenderer;
   scene: Scene;
@@ -213,6 +248,12 @@ export interface GameContext {
 
   /** Rolling perf numbers, published by the perf controller. */
   perf: { fps: number; frameMs: number; gpuScale: number; drawCalls: number; triangles: number };
+
+  /** Swell Run scoreboard; inactive modes leave this with active=false. */
+  swell: SwellRunView;
+
+  /** Item boxes / held power-up. */
+  items: ItemHudView;
 }
 
 /**

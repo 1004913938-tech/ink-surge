@@ -79,39 +79,11 @@ import { applyCel, createCelMaterial, SHARED } from '../render/celMaterial';
 import type { CelChunks } from '../render/celMaterial';
 import { GERSTNER_GLSL, sampleHeight, waveUniformArrays } from '../water/gerstner';
 import type { Checkpoint, GameContext, Subsystem, TrackAPI, TrackPoint } from '../core/types';
+import { TRACK_NOVICE_BAY, type TrackDef, type TrackLayout } from './trackDef';
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Layout
+// Layout — authored in trackDef.ts; defaults kept for harness / docs.
 // ─────────────────────────────────────────────────────────────────────────────
-
-/**
- * Polygon vertices in metres, in the direction of travel, plus the fillet
- * radius at each vertex. The XZ pair is scaled by LAYOUT_SCALE to set the lap
- * length; the radii are NOT scaled, because they are dictated by the boat's
- * turning circle and not by how big we want the course to be.
- */
-const LAYOUT_SCALE = 0.7;
-const VERTS: readonly (readonly [number, number, number])[] = [
-  [0, 0, 11], //     V0  hairpin      138° right → 17.8 m/s
-  [0, 300, 90], //   V1  wide sweeper  60° left  → flat out
-  [170, 400, 70], // V2                54° left  → flat out
-  [330, 330, 45], // V3                55° left  → flat out
-  [360, 180, 16], // V4  buoy turn     68° left  → 22.6 m/s
-  [270, 120, 17], // V5  counter-flick 72° right → 23.2 m/s
-  [300, 10, 13], //  V6  tight buoy    81° left  → 19.9 m/s
-  [100, -80, 120], // V7 kink           7° left  → flat out
-  [-160, -160, 55], // V8              66° left  → flat out
-  [-300, 0, 60], //  V9                72° left  → flat out
-  [-180, 200, 17], // V10             107° left  → 23.2 m/s
-];
-
-/**
- * Where the start/finish line sits, in metres measured from the exit of the
- * hairpin fillet (i.e. along the S1 straight). 88 m leaves the 2×2 grid — which
- * stacks back to 26 m — comfortably on the straight, and still leaves a run to
- * the V1 sweeper.
- */
-const START_S = 88;
 
 /** Stations in the arc-length lookup. 2048 over ~1470 m ≈ 0.72 m spacing. */
 const STATIONS = 2048;
@@ -252,6 +224,7 @@ export class Track implements TrackAPI, Subsystem {
   readonly group = new Group();
   readonly checkpoints: GateSpec[] = [];
   readonly length: number;
+  readonly def: TrackDef;
 
   /** Uniform-arc-length station tables. Index 0 is the start/finish line. */
   private readonly N = STATIONS;
@@ -324,8 +297,9 @@ export class Track implements TrackAPI, Subsystem {
   private lampAttr!: BufferAttribute;
   private lampTarget = -1;
 
-  constructor() {
-    const built = buildCentreline();
+  constructor(def: TrackDef = TRACK_NOVICE_BAY) {
+    this.def = def;
+    const built = buildCentreline(def.layout);
     this.length = built.length;
     this.ds = built.length / this.N;
     this.px = built.px;
@@ -1692,7 +1666,10 @@ export class Track implements TrackAPI, Subsystem {
  *   6. resample to exactly uniform arc length and re-derive tangent and
  *      curvature from the final polyline, so what the AI reads is what is drawn.
  */
-function buildCentreline() {
+function buildCentreline(layout: TrackLayout) {
+  const VERTS = layout.verts;
+  const LAYOUT_SCALE = layout.layoutScale;
+  const START_S = layout.startS;
   const n = VERTS.length;
   const vx: number[] = [];
   const vz: number[] = [];

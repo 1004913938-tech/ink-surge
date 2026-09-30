@@ -25,6 +25,7 @@
  */
 
 import { Vector3 } from 'three';
+import { activeLaps, isSwellRun } from '../core/activeRace';
 import { CONFIG } from '../core/config';
 import { clamp } from '../core/mathx';
 import type { GameContext, Racer, RaceAPI, RacePhase, Subsystem, TrackPoint } from '../core/types';
@@ -58,7 +59,7 @@ export class RaceState implements RaceAPI, Subsystem {
   readonly name = 'raceState';
   readonly order = 50;
 
-  phase: RacePhase = 'countdown';
+  phase: RacePhase = 'hub';
   raceTime = -CONFIG.race.countdownSeconds;
   countdownNumber = 3;
 
@@ -72,6 +73,7 @@ export class RaceState implements RaceAPI, Subsystem {
   private leaderFinishedAt = Infinity;
   /** Harness telemetry: gates fired, in order, per racer. */
   readonly gateLog = new Map<number, number[]>();
+  private onReturnToMenu: (() => void) | null = null;
 
   constructor(
     racers: Racer[],
@@ -81,6 +83,39 @@ export class RaceState implements RaceAPI, Subsystem {
     this.racers = racers;
     this.player = racers.find((r) => r.isPlayer)!;
     this.resetProgress();
+  }
+
+  setTrack(track: Track) {
+    this.track = track;
+  }
+
+  setReturnToMenu(cb: () => void) {
+    this.onReturnToMenu = cb;
+  }
+
+  returnToMenu() {
+    this.onReturnToMenu?.();
+  }
+
+  /** Start a fresh countdown from a prepared grid. */
+  beginCountdown() {
+    this.phase = 'countdown';
+    this.raceTime = -CONFIG.race.countdownSeconds;
+    this.countdownNumber = 3;
+    this.finishOrder = [];
+    this.resultsTimer = 0;
+    this.lastCountdownBeep = 99;
+    this.resetProgress();
+  }
+
+  /** Called by SwellRun when the clock hits zero. */
+  forceFinished() {
+    if (this.phase !== 'racing') return;
+    this.phase = 'finished';
+    this.resultsTimer = 0;
+    if (!this.finishOrder.includes(this.player)) {
+      this.finishOrder.push(this.player);
+    }
   }
 
   private resetProgress() {
@@ -124,7 +159,8 @@ export class RaceState implements RaceAPI, Subsystem {
   }
 
   standings(): Racer[] {
-    return [...this.racers].sort((a, b) => {
+    const active = this.racers.filter((r) => r.root.visible);
+    return [...active].sort((a, b) => {
       if (a.finished && b.finished) return a.finishTime - b.finishTime;
       if (a.finished) return -1;
       if (b.finished) return 1;
@@ -144,6 +180,26 @@ export class RaceState implements RaceAPI, Subsystem {
 
   update(ctx: GameContext) {
     const { dt } = ctx;
+
+    // Menu / hub phases: hold the field still until a race is started.
+    if (
+      this.phase === 'boot' ||
+      this.phase === 'hub' ||
+      this.phase === 'career' ||
+      this.phase === 'garage' ||
+      this.phase === 'quick' ||
+      this.phase === 'trial'
+    ) {
+      for (const r of this.racers) {
+        r.controls.throttle = 0;
+        r.controls.brake = 0;
+        r.controls.steer = 0;
+        r.controls.drift = false;
+        r.state.velocity.set(0, 0, 0);
+        r.state.forwardSpeed = 0;
+      }
+      return;
+    }
 
     switch (this.phase) {
       case 'countdown': {
@@ -172,6 +228,15 @@ export class RaceState implements RaceAPI, Subsystem {
 
       case 'racing': {
         this.raceTime += dt;
+        // Swell Run owns its own win condition (clock); skip lap finish.
+        if (isSwellRun()) {
+          for (const r of this.racers) {
+            if (!r.root.visible || r.finished) continue;
+            this.trackProgress(ctx, r);
+          }
+          break;
+        }
+
         for (const r of this.racers) this.trackProgress(ctx, r);
         this.assignPlaces();
 
@@ -199,13 +264,19 @@ export class RaceState implements RaceAPI, Subsystem {
       case 'finished': {
         this.raceTime += dt;
         this.resultsTimer += dt;
-        if (this.resultsTimer > 2.2) this.phase = 'results';
+        // Swell Run: shorter beat before the scoreboard so the loop stays snappy.
+        const hold = isSwellRun() ? 1.45 : 2.2;
+        if (this.resultsTimer > hold) this.phase = 'results';
         break;
       }
 
       case 'results': {
         this.resultsTimer += dt;
-        if (ctx.input.restartPressed || ctx.input.startPressed) this.restart();
+        // R = race again. Enter / confirm = back to hub (career continues from menu).
+        if (ctx.input.restartPressed) this.restart();
+        else if (ctx.input.menuBack || (ctx.input.startPressed && this.resultsTimer > 0.6)) {
+          this.returnToMenu();
+        }
         break;
       }
     }
@@ -278,7 +349,8 @@ export class RaceState implements RaceAPI, Subsystem {
       if (d.lapDistance < milestone) break;
       r.nextCheckpoint = (idx + 1) % cps.length;
       this.gateLog.get(r.id)!.push(idx);
-      if (r.isPlayer) ctx.audio.checkpoint();
+      // Swell Run is free-form scoring — gate beeps would just be noise.
+      if (r.isPlayer && !isSwellRun()) ctx.audio.checkpoint();
     }
     // Backward: a spin or a wrong-way excursion rewinds the odometer, so rewind
     // the gate pointer with it. Otherwise the racer keeps their credit for a
@@ -301,11 +373,16 @@ export class RaceState implements RaceAPI, Subsystem {
     d.lapDistance -= this.track.length;
     d.furthest = d.lapDistance;
     r.nextCheckpoint = 1;
+    // Swell Run: crossing the line just wraps the odometer — never finishes a race.
+    if (isSwellRun()) {
+      r.lap++;
+      return;
+    }
     r.lapTimes.push(lapTime);
     if (lapTime < r.bestLap) r.bestLap = lapTime;
     r.lap++;
 
-    if (r.lap >= CONFIG.race.laps) {
+    if (r.lap >= activeLaps()) {
       r.finished = true;
       r.finishTime = this.raceTime;
       this.finishOrder.push(r);

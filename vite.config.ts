@@ -11,6 +11,10 @@ export default defineConfig({
       ignored: ['**/shots/**', '**/.scratch*/**'],
     },
   },
+  preview: {
+    // Cloudflare quick tunnels rewrite Host; allow any host so public demos work.
+    allowedHosts: true,
+  },
   build: {
     target: 'es2022',
     sourcemap: true,

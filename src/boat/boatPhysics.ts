@@ -42,10 +42,12 @@
  */
 
 import { Quaternion, Vector3 } from 'three';
+import { ACTIVE } from '../core/activeRace';
 import { CONFIG } from '../core/config';
 import { clamp, clamp01, damp, smoothstep } from '../core/mathx';
 import type { BoatState, GameContext, Racer, Subsystem } from '../core/types';
 import type { OceanSample } from '../water/gerstner';
+import type { BoatProfile } from '../meta/catalog';
 
 const GRAVITY = 9.81;
 
@@ -184,7 +186,10 @@ export class BoatPhysics implements Subsystem {
   }
 
   update(ctx: GameContext) {
-    for (const r of this.racers) this.step(ctx, r);
+    for (const r of this.racers) {
+      if (!r.root.visible) continue;
+      this.step(ctx, r);
+    }
     this.resolveCollisions(ctx);
     // Attitude is written after collisions so a hit that kicks yaw shows up on
     // the same frame rather than one frame late.
@@ -209,12 +214,30 @@ export class BoatPhysics implements Subsystem {
   }
 
   // ───────────────────────────────────────────────────────────────────────────
+  private boatCfg(racer: Racer): typeof CONFIG.boat {
+    const base = CONFIG.boat;
+    // Only the player hull uses the selected garage profile; AI stay on stock
+    // so difficulty is temperament + rubber-band, not hidden stat stacks.
+    if (!racer.isPlayer) return base;
+    const p: BoatProfile = ACTIVE.profile;
+    const tiers = base.driftTiers.map((t) => t / p.boostCharge);
+    return {
+      ...base,
+      topSpeed: base.topSpeed * p.topSpeed,
+      boostTopSpeed: base.boostTopSpeed * p.topSpeed,
+      turnRateLow: base.turnRateLow * p.turnRate,
+      turnRateHigh: base.turnRateHigh * p.turnRate,
+      thrust: base.thrust * p.thrust,
+      driftTiers: [tiers[0], tiers[1], tiers[2]] as [number, number, number],
+    } as unknown as typeof CONFIG.boat;
+  }
+
   private step(ctx: GameContext, racer: Racer) {
     const dt = ctx.dt;
     if (dt <= 0) return;
     const s = racer.state;
     const c = racer.controls;
-    const cfg = CONFIG.boat;
+    const cfg = this.boatCfg(racer);
     const g = this.internals.get(racer.id)!;
     const pos = racer.root.position;
 

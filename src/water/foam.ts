@@ -105,7 +105,8 @@ function hullWetness(ctx: GameContext, racer: Racer): number {
     const c = _keelP.y - ctx.ocean.height(_keelP.x, _keelP.z, ctx.time);
     if (c < clearance) clearance = c;
   }
-  return 1 - Math.min(1, Math.max(0, clearance / 0.34));
+  // Wider wet band so a skeg-kiss still reads a collar (KNOWN_GAPS #2).
+  return 1 - Math.min(1, Math.max(0, clearance / 0.48));
 }
 
 /** Trail samples per boat. 96 × ~1.15 m ≈ 110 m of visible wake. */

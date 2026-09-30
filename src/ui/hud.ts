@@ -25,6 +25,7 @@
  * window to a retina 1440p capture without a media query.
  */
 
+import { activeLaps } from '../core/activeRace';
 import { CONFIG } from '../core/config';
 import { HEX } from '../core/palette';
 import { clamp, clamp01, damp, formatTime, ordinal } from '../core/mathx';
@@ -43,6 +44,7 @@ import {
   segWidth,
   slantPath,
 } from './inkDraw';
+import { Menus } from './menus';
 import { Minimap } from './minimap';
 import { Screens } from './screens';
 import type { GameContext, HudAPI, Racer, TrackAPI } from '../core/types';
@@ -101,6 +103,7 @@ export class Hud implements HudAPI {
 
   private minimap: Minimap;
   private screens = new Screens();
+  readonly menus = new Menus();
   private L: Layout = {
     s: 1, gx: 0, gy: 0, gr: 1, rx: 0, ry: 0, rw: 1, rh: 1,
     ix: 0, iy: 0, iw: 1, ih1: 1, ih: 1, bx: 0, by: 0, bw: 1, bh: 1,
@@ -137,6 +140,12 @@ export class Hud implements HudAPI {
     this.chromeCtx = cc;
   }
 
+  setTrack(track: TrackAPI) {
+    this.track = track;
+    this.minimap.setTrack(track);
+    this.resize(this.w, this.h, this.dpr);
+  }
+
   // ───────────────────────────────────────────────────────────────────────────
   // Layout
   // ───────────────────────────────────────────────────────────────────────────
@@ -164,15 +173,12 @@ export class Hud implements HudAPI {
     // used to end at y 780 device, so it permanently occupied right-hand racing
     // space and in shots/pres2_base/ocean_low.png the 2nd-place AI — the most
     // tactically important object in frame — was a quarter hidden behind it.
-    // 22 + 160 + 12 + 4 × 28 = 306 CSS px = 612 device px, i.e. above the band.
-    const map = Math.round(160 * s);
-    // Speedometer tucked further into the corner (and slightly smaller) for the
-    // same reason: in pack.png the violet AI was behind it. This moves the dial's
-    // top-left corner 26 CSS / 52 device px right and 40 CSS / 80 device px down.
-    const gr = 76 * s;
-    const gx = width - 100 * s;
-    const gy = height - 108 * s;
-    const rw = 186 * s;
+    // Compact stack (KNOWN_GAPS #6): smaller map keeps standings above horizon.
+    const map = Math.round(132 * s);
+    const gr = 70 * s;
+    const gx = width - 96 * s;
+    const gy = height - 100 * s;
+    const rw = 170 * s;
 
     this.L = {
       s,
@@ -180,14 +186,14 @@ export class Hud implements HudAPI {
       gx,
       gy,
       rw,
-      rh: 84 * s,
-      rx: gx - gr - 32 * s - rw,
-      ry: gy - 42 * s,
-      ix: 28 * s,
-      iy: 26 * s,
-      iw: 336 * s,
-      ih1: 92 * s,
-      ih: 144 * s,
+      rh: 76 * s,
+      rx: gx - gr - 28 * s - rw,
+      ry: gy - 38 * s,
+      ix: 22 * s,
+      iy: 18 * s,
+      iw: 300 * s,
+      ih1: 78 * s,
+      ih: 122 * s,
       bx: 30 * s,
       by: height - 78 * s,
       bw: 78 * s,
@@ -382,52 +388,280 @@ export class Hud implements HudAPI {
     this.advance(ctx, dt);
     this.screens.update(ctx, dt);
 
+    const swell = ctx.swell.active;
+
     // ── In-race instruments ─────────────────────────────────────────────────
     if (this.hudAlpha > 0.004) {
       g.save();
       g.globalAlpha = this.hudAlpha;
-      // Instruments slide in from the edges as they fade in — a static fade
-      // reads as an opacity tween, a slide reads as hardware powering up.
-      //
-      // The baked chrome has to move *with* its own cluster, so it is blitted in
-      // three sub-rects rather than as one full-screen image. Blitting it whole
-      // and offsetting only the live layer leaves the minimap frame and its pips
-      // travelling in different directions for the length of the fade.
-      const off = (1 - this.hudAlpha) * 34 * s;
+      if (swell) {
+        this.drawSwellHud(ctx, s);
+        if (st.boostTime > 0) this.drawBoostFrame(s);
+      } else {
+        const off = (1 - this.hudAlpha) * 34 * s;
 
-      g.save();
-      g.translate(off, 0);
-      this.blitChrome(this.CHROME_MAP);
-      this.minimap.drawLive(g, ctx, s, this.pulse);
-      this.drawStandings(ctx, s);
-      g.restore();
+        g.save();
+        g.translate(off, 0);
+        this.blitChrome(this.CHROME_MAP);
+        this.minimap.drawLive(g, ctx, s, this.pulse);
+        this.drawStandings(ctx, s);
+        g.restore();
 
-      g.save();
-      g.translate(0, off);
-      this.blitChrome(this.CHROME_GAUGE);
-      this.blitChrome(this.CHROME_BOOST);
-      this.drawGauge(ctx, s);
-      this.drawBoost(ctx, s);
-      g.restore();
+        g.save();
+        g.translate(0, off);
+        this.blitChrome(this.CHROME_GAUGE);
+        this.blitChrome(this.CHROME_BOOST);
+        this.drawGauge(ctx, s);
+        this.drawBoost(ctx, s);
+        g.restore();
 
-      g.save();
-      g.translate(-off, 0);
-      this.drawInfoSlab(ctx, s);
-      g.restore();
+        g.save();
+        g.translate(-off, 0);
+        this.drawInfoSlab(ctx, s);
+        g.restore();
 
-      if (st.boostTime > 0) this.drawBoostFrame(s);
-      if (p.wrongWay && phase === 'racing') this.drawWrongWay(s);
+        if (st.boostTime > 0) this.drawBoostFrame(s);
+        if (p.wrongWay && phase === 'racing') this.drawWrongWay(s);
+        if (ctx.items.enabled) this.drawItemSlot(ctx, s);
+      }
       g.restore();
     }
 
     // ── Screens ─────────────────────────────────────────────────────────────
     if (phase === 'countdown') this.screens.countdown(g, ctx, this.w, this.h, s);
     this.screens.go(g, this.w, this.h, s);
-    this.screens.lapFlash(g, ctx, this.w, this.h, s);
-    if (phase === 'finished') this.screens.finishFlash(g, ctx, this.w, this.h, s);
-    if (phase === 'results') this.screens.results(g, ctx, this.w, this.h, s);
+    if (!swell) this.screens.lapFlash(g, ctx, this.w, this.h, s);
+    if (phase === 'finished') {
+      if (swell) this.screens.swellFinish(g, ctx, this.w, this.h, s);
+      else this.screens.finishFlash(g, ctx, this.w, this.h, s);
+    }
+    if (phase === 'results') {
+      if (swell) this.screens.swellResults(g, ctx, this.w, this.h, s);
+      else this.screens.results(g, ctx, this.w, this.h, s);
+      this.drawResultsFooter(s);
+    }
+
+    // ── Meta menus ──────────────────────────────────────────────────────────
+    const menuPhases = ['hub', 'career', 'garage', 'quick', 'trial'];
+    if (menuPhases.includes(phase)) {
+      this.menus.render(g, ctx, this.w, this.h);
+    }
+
+    if (swell && ctx.swell.showTip && phase === 'racing') {
+      this.drawSwellTip(s);
+    } else if (!swell && ctx.items.enabled && ctx.items.tip && phase === 'racing') {
+      this.drawItemTip(s);
+    } else if (!swell) {
+      this.drawTutorial(ctx, s);
+    }
 
     if (CONFIG.debug.enabled) this.drawDebug(ctx, s);
+  }
+
+  /** Compact top strip for Swell Run — no standings / lap clutter. */
+  private drawSwellHud(ctx: GameContext, s: number) {
+    const g = this.ctx2d;
+    const sw = ctx.swell;
+    const cx = this.w * 0.5;
+    const y = 22 * s;
+    const barW = Math.min(this.w * 0.72, 620 * s);
+    const barH = 56 * s;
+    const path = slantPath(cx - barW * 0.5, y, barW, barH, barH * PLATE_SKEW);
+    plate(g, path, s, { edge: rgba(HEX.raceLine, 0.9) });
+
+    const urgent = sw.timeLeft < 10;
+    const tCol = urgent ? HEX.warn : HEX.hudPaper;
+    inkText(g, 'SWELL RUN', cx - barW * 0.5 + 22 * s, y + 22 * s, {
+      font: `800 ${Math.round(11 * s)}px ${FONT_STACK}`,
+      fill: rgba(HEX.raceLine, 1),
+      align: 'left',
+      tracking: 2.5 * s,
+    });
+    segText(g, sw.timeLeft.toFixed(1), cx - barW * 0.5 + 22 * s, y + 28 * s, 22 * s, {
+      lit: rgba(tCol, 1),
+      ink: rgba(HEX.ink, 1),
+      inkWidth: 1.2 * s,
+      align: 'left',
+      skew: 0.08,
+    });
+
+    inkText(g, 'AIR', cx - 40 * s, y + 22 * s, {
+      font: `800 ${Math.round(11 * s)}px ${FONT_STACK}`,
+      fill: rgba(HEX.hudDim, 1),
+      align: 'left',
+      tracking: 2 * s,
+    });
+    segText(g, sw.score.toFixed(1), cx - 40 * s, y + 28 * s, 22 * s, {
+      lit: rgba(HEX.boostHot, 1),
+      ink: rgba(HEX.ink, 1),
+      inkWidth: 1.2 * s,
+      align: 'left',
+      skew: 0.08,
+    });
+
+    inkText(g, 'BEST', cx + barW * 0.5 - 110 * s, y + 22 * s, {
+      font: `800 ${Math.round(11 * s)}px ${FONT_STACK}`,
+      fill: rgba(HEX.hudDim, 1),
+      align: 'left',
+      tracking: 2 * s,
+    });
+    segText(g, sw.bestHop.toFixed(1), cx + barW * 0.5 - 110 * s, y + 28 * s, 22 * s, {
+      lit: rgba(HEX.foamShade, 1),
+      ink: rgba(HEX.ink, 1),
+      inkWidth: 1.2 * s,
+      align: 'left',
+      skew: 0.08,
+    });
+
+    if (sw.currentHop > 0.05) {
+      inkText(g, `HOP ${sw.currentHop.toFixed(1)}`, cx, y + barH + 22 * s, {
+        font: `800 ${Math.round(16 * s)}px ${FONT_STACK}`,
+        fill: rgba(HEX.boost, 0.95),
+        ink: rgba(HEX.ink, 1),
+        inkWidth: 3 * s,
+        align: 'center',
+        skew: 0.12,
+        tracking: 2 * s,
+      });
+    }
+  }
+
+  private drawItemSlot(ctx: GameContext, s: number) {
+    const g = this.ctx2d;
+    const it = ctx.items;
+    const size = 72 * s;
+    const x = this.w - 36 * s - size;
+    const y = this.h * 0.42;
+    const flash = it.pickupFlash;
+    const path = slantPath(x, y, size, size, size * PLATE_SKEW);
+    plate(g, path, s, {
+      edge: rgba(flash > 0 ? HEX.boostHot : HEX.hudPaper, flash > 0 ? 1 : 0.85),
+    });
+
+    const label =
+      it.held === 'surge' ? '浪推' : it.held === 'ink' ? '墨障' : it.held === 'shield' ? '涌盾' : '—';
+    const sub =
+      it.held === 'surge' ? 'SURGE' : it.held === 'ink' ? 'INK' : it.held === 'shield' ? 'SHIELD' : 'EMPTY';
+    const col =
+      it.held === 'surge'
+        ? HEX.boostHot
+        : it.held === 'ink'
+          ? HEX.boost
+          : it.held === 'shield'
+            ? HEX.raceLine
+            : HEX.hudDim;
+
+    inkText(g, label, x + size * 0.5, y + size * 0.48, {
+      font: `900 ${Math.round(18 * s)}px ${FONT_STACK}`,
+      fill: rgba(col, 1),
+      align: 'center',
+      skew: 0.1,
+    });
+    inkText(g, sub, x + size * 0.5, y + size * 0.72, {
+      font: `700 ${Math.round(10 * s)}px ${FONT_STACK}`,
+      fill: rgba(HEX.foamShade, 0.95),
+      align: 'center',
+      tracking: 1.5 * s,
+    });
+    inkText(g, 'E', x + size * 0.5, y + size + 18 * s, {
+      font: `800 ${Math.round(12 * s)}px ${FONT_STACK}`,
+      fill: rgba(it.held ? HEX.buoy : HEX.hudDim, 1),
+      align: 'center',
+      tracking: 2 * s,
+    });
+
+    if (it.shield > 0) {
+      inkText(g, `SHIELD ${it.shield.toFixed(1)}`, x + size * 0.5, y - 14 * s, {
+        font: `800 ${Math.round(11 * s)}px ${FONT_STACK}`,
+        fill: rgba(HEX.raceLine, 1),
+        align: 'center',
+        tracking: 1.5 * s,
+      });
+    }
+  }
+
+  private drawItemTip(s: number) {
+    const g = this.ctx2d;
+    inkText(g, '撞黄箱捡道具 · 按 E 使用', this.w * 0.5, this.h * 0.2, {
+      font: `800 ${Math.round(16 * s)}px ${FONT_STACK}`,
+      fill: rgba(HEX.buoy, 0.95),
+      ink: rgba(HEX.ink, 1),
+      inkWidth: 3.5 * s,
+      align: 'center',
+      tracking: 2 * s,
+    });
+    inkText(g, 'HIT YELLOW BOXES  ·  PRESS E TO USE', this.w * 0.5, this.h * 0.2 + 26 * s, {
+      font: `700 ${Math.round(12 * s)}px ${FONT_STACK}`,
+      fill: rgba(HEX.foamShade, 0.9),
+      align: 'center',
+      tracking: 2 * s,
+    });
+  }
+
+  private drawSwellTip(s: number) {
+    const g = this.ctx2d;
+    inkText(g, '冲进涌浪直道，滞空即得分', this.w * 0.5, this.h * 0.2, {
+      font: `800 ${Math.round(16 * s)}px ${FONT_STACK}`,
+      fill: rgba(HEX.raceLine, 0.95),
+      ink: rgba(HEX.ink, 1),
+      inkWidth: 3.5 * s,
+      align: 'center',
+      tracking: 2 * s,
+    });
+    inkText(g, 'HIT THE SWELL STRAIGHT — AIRTIME IS SCORE', this.w * 0.5, this.h * 0.2 + 26 * s, {
+      font: `700 ${Math.round(12 * s)}px ${FONT_STACK}`,
+      fill: rgba(HEX.foamShade, 0.9),
+      align: 'center',
+      tracking: 2 * s,
+    });
+  }
+
+  private drawResultsFooter(s: number) {
+    const g = this.ctx2d;
+    const pay = this.menus.lastPayout;
+    if (!pay) return;
+    inkText(g, pay, this.w * 0.5, this.h - 78 * s, {
+      font: `800 ${Math.round(14 * s)}px ${FONT_STACK}`,
+      fill: rgba(HEX.buoy, 1),
+      align: 'center',
+      tracking: 2 * s,
+    });
+    inkText(g, 'R RETRY   ENTER / ESC MENU', this.w * 0.5, this.h - 52 * s, {
+      font: `700 ${Math.round(12 * s)}px ${FONT_STACK}`,
+      fill: rgba(HEX.hudDim, 1),
+      align: 'center',
+      tracking: 2 * s,
+    });
+  }
+
+  private drawTutorial(ctx: GameContext, s: number) {
+    if (ctx.race.phase !== 'racing') return;
+    const save = this.menus.getSave();
+    const st = ctx.player.state;
+    let tip = '';
+    if (!save.tutorialDriftDone) {
+      tip = 'HOLD SHIFT TO POWERSLIDE — RELEASE FOR BOOST';
+      if (st.driftTier >= 1 || st.boostTime > 0) {
+        save.tutorialDriftDone = true;
+        this.menus.persist();
+      }
+    } else if (!save.tutorialAirDone) {
+      tip = 'HIT THE SWELL STRAIGHT FLAT-OUT FOR AIRTIME';
+      if (st.airborne && st.airTime > 0.35) {
+        save.tutorialAirDone = true;
+        this.menus.persist();
+      }
+    }
+    if (!tip) return;
+    const g = this.ctx2d;
+    inkText(g, tip, this.w * 0.5, this.h * 0.18, {
+      font: `800 ${Math.round(14 * s)}px ${FONT_STACK}`,
+      fill: rgba(HEX.raceLine, 0.95),
+      ink: rgba(HEX.ink, 1),
+      inkWidth: 3 * s,
+      align: 'center',
+      tracking: 2 * s,
+    });
   }
 
   /** All time-varying state advanced in one place, frame-rate independent. */
@@ -828,8 +1062,9 @@ export class Hud implements HudAPI {
       align: 'left',
       tracking: 3.4 * s,
     });
-    const lapNum = String(Math.min(p.lap + 1, CONFIG.race.laps));
-    segText(g, `${lapNum}/${CONFIG.race.laps}`, lx, iy + 32 * s, 30 * s, {
+    const laps = activeLaps();
+    const lapNum = String(Math.min(p.lap + 1, laps));
+    segText(g, `${lapNum}/${laps}`, lx, iy + 32 * s, 30 * s, {
       lit: rgba(HEX.hudPaper, 1),
       ink: rgba(HEX.ink, 1),
       inkWidth: 1.2 * s,
