@@ -1,0 +1,28 @@
+[project]
+name = "livecaption"
+version = "0.1.0"
+description = "Real-time multilingual captions for meetings: LiveKit agent + API"
+requires-python = ">=3.11"
+dependencies = [
+    "livekit-agents[deepgram]==1.8.4",
+    "livekit==1.1.20",
+    "livekit-api>=1.2.1",
+    "anthropic==1.11.0",
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "pydantic>=2.7",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-asyncio>=0.24"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["livecaption_core*", "livecaption_agent*", "livecaption_api*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
