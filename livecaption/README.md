@@ -43,9 +43,19 @@ npm test                                 # 字幕合并/排序逻辑测试
 
 LiveKit 本地可用 `docker compose up livekit redis`，或 `livekit-server --dev`（dev 模式 key 为 `devkey/secret`）。
 
-## 不花钱先跑通
+## 不花钱先跑通（演示模式）
 
-`LC_TRANSLATOR=fake` 用假翻译（`[en] 原文`）验证整条链路；STT 目前必须 Deepgram（有免费额度）。
+`.env` 里设 `LC_STT=demo LC_TRANSLATOR=fake`：不需要任何 API Key。只要主持人开着麦克风，agent 每 4 秒
+"听到"一句预设中文，翻译输出 `[en] 原文 / [id] 原文`。整条链路（LiveKit → agent → 字幕流 → 主持人页 / 听众手机页）
+和正式模式完全一样，只是识别和翻译是假的。
+
+真实联调脚本（需要栈已启动）：
+
+```bash
+cd livecaption/agent && python tests/e2e_livekit.py   # Python 客户端：主持人推音频，听众收字幕，断言顺序与译文
+```
+
+已在真实 LiveKit + Chromium（假麦克风）上验证：主持人页出二维码，听众页扫码后 2 句内看到中文/英文/印尼语三行，agent 入房延迟 0.2 s。
 
 ## 测试覆盖了什么（`agent/tests/`）
 
@@ -73,4 +83,5 @@ web/                      主持人控制台 + 听众页（React）
 2. **登录**：主持人用 API Key；邮箱 OTP 注册是 Phase 2。
 3. **STT 后端**：Deepgram 已接；阿里 Paraformer、sherpa-onnx 本地识别接口已留位（`providers.py`）。
 4. **中文识别准确率**：行业术语靠 `glossary`（创建会议时传）+ `LC_DOMAIN_HINT`；需要热词时切 Paraformer。
-5. **真机联调**：本仓库的 CI 环境没有 Docker daemon，`docker compose up` 需在有 Docker 的机器上执行；核心逻辑和网页构建已在本地验证。
+5. **代理环境**：`livekit-agents` 只读 `HTTPS_PROXY`，不认 `NO_PROXY`。如果机器上设了全局代理，启动 agent 时去掉代理变量，否则连不上本机 LiveKit（报 405）。
+6. **已验证范围**：核心单测、LiveKit 真机 e2e（Python 客户端）、Chromium 浏览器 e2e（演示模式）。真实 Deepgram + Claude 的联调需要你的 API Key，尚未跑。

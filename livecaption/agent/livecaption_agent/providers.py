@@ -23,6 +23,10 @@ def make_stt(cfg: AgentConfig, lang: str) -> stt.STT:
             punctuate=True,
             sample_rate=cfg.stt_sample_rate,
         )
+    if cfg.stt_provider == "demo":
+        from .demo_stt import DemoSTT
+
+        return DemoSTT()
     if cfg.stt_provider == "paraformer":
         raise NotImplementedError(
             "Alibaba Paraformer realtime adapter is reserved (see ARCHITECTURE.md §1); "
