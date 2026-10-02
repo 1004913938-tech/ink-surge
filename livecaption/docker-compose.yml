@@ -1,0 +1,69 @@
+name: livecaption
+
+services:
+  livekit:
+    image: livekit/livekit-server:v1.9
+    command: --config /etc/livekit.yaml
+    ports:
+      - "7880:7880"       # websocket / http
+      - "7881:7881"       # rtc tcp
+      - "50000-50200:50000-50200/udp"  # rtc udp (narrowed range for dev)
+    volumes:
+      - ./livekit.yaml:/etc/livekit.yaml:ro
+    depends_on: [redis]
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+
+  api:
+    build: { context: ./agent, dockerfile: Dockerfile }
+    command: uvicorn livecaption_api.app:app --host 0.0.0.0 --port 8000
+    environment:
+      LIVEKIT_URL: ${LIVEKIT_URL:-ws://livekit:7880}
+      LIVEKIT_API_KEY: ${LIVEKIT_API_KEY:-devkey}
+      LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET:-secretsecretsecretsecretsecret12}
+      LC_PUBLIC_WEB_URL: ${LC_PUBLIC_WEB_URL:-http://localhost:5173}
+      LC_CORS_ORIGINS: ${LC_CORS_ORIGINS:-http://localhost:5173}
+      LC_DEV_API_KEY: ${LC_DEV_API_KEY:-lc_dev_key}
+      LC_INTERNAL_TOKEN: ${LC_INTERNAL_TOKEN:-dev-internal}
+      LC_DB_PATH: /data/livecaption.db
+    volumes:
+      - apidata:/data
+    ports:
+      - "8000:8000"
+    depends_on: [livekit]
+    restart: unless-stopped
+
+  agent:
+    build: { context: ./agent, dockerfile: Dockerfile }
+    command: python -m livecaption_agent.worker start
+    environment:
+      LIVEKIT_URL: ${LIVEKIT_URL:-ws://livekit:7880}
+      LIVEKIT_API_KEY: ${LIVEKIT_API_KEY:-devkey}
+      LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET:-secretsecretsecretsecretsecret12}
+      DEEPGRAM_API_KEY: ${DEEPGRAM_API_KEY}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      LC_STT: ${LC_STT:-deepgram}
+      LC_TRANSLATOR: ${LC_TRANSLATOR:-claude}
+      LC_TARGETS: ${LC_TARGETS:-en,id}
+      LC_DOMAIN_HINT: ${LC_DOMAIN_HINT:-}
+      LC_API_URL: http://api:8000
+      LC_INTERNAL_TOKEN: ${LC_INTERNAL_TOKEN:-dev-internal}
+    depends_on: [livekit, api]
+    restart: unless-stopped
+
+  web:
+    build:
+      context: ./web
+      dockerfile: Dockerfile
+      args:
+        VITE_API_URL: ${LC_PUBLIC_API_URL:-http://localhost:8000}
+    ports:
+      - "5173:80"
+    depends_on: [api]
+    restart: unless-stopped
+
+volumes:
+  apidata:
