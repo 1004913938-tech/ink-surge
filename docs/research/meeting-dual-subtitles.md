@@ -82,6 +82,37 @@
 
 参考：[Azure 语音翻译概述（多目标语言）](https://learn.microsoft.com/en-us/azure/ai-services/speech-service/speech-translation)、[语言支持（含印尼语 id）](https://learn.microsoft.com/en-us/azure/ai-services/speech-service/language-support)
 
+## 4.2 需求升级：做成订阅产品 + 听众扫码看字幕
+
+目标形态：付费用户（主持人）开会说中文 → 听众扫码/点链接，在自己手机或电脑浏览器上看字幕，自选 中文 / 英文 / 印尼语（或原文+译文）。
+
+### 已有同类商业产品（竞品）
+
+| 产品 | 听众扫码自选语言 | 备注 |
+| --- | --- | --- |
+| Wordly | 是 | 行业标杆，面向活动/会议，按小时计费 |
+| KUDO | 是 | AI + 真人同传，60+ 语种 AI |
+| Interprefy | 是 | 企业级大型活动 |
+| Boostlingo | 是 | 130+ 语种，扫码看字幕，可选原文/译文/双语 |
+| Transync AI 同言翻译 | 是（演示模式） | 中文团队，60+ 语种，支持腾讯会议等，Win/Mac/iOS/Android/Web |
+
+结论：这一形态已被验证且有竞品；差异化可放在 **中文 → 印尼语等东南亚语种**、**行业术语表**、价格。
+
+### 可作为产品底座的开源项目
+
+| 项目 | 契合度 | 说明 |
+| --- | --- | --- |
+| [g0v/OpenTransLive](https://github.com/g0v/OpenTransLive) | ★★★★★ | 正是"一人讲、无限观众用自己语言看字幕"的广播式框架：观众页免登录无上限（SSE 推送）、LLM 多语言翻译、关键词/术语字典、主持人控制台、历史字幕编辑、SRT 导出、YouTube 同步、Email 登录与权限、MongoDB + Redis 可横向扩展、Docker 部署。STT 支持 Gemini Live / ElevenLabs / Google / OpenAI / WhisperX。**许可证 AGPL-3.0**：做 SaaS 对外提供服务时，修改后的源码必须向用户公开；若要闭源商业化需自研或与作者另行授权。 |
+| [livekit-examples/live-translated-captioning](https://github.com/livekit-examples/live-translated-captioning) | ★★★★ | LiveKit Agent 示例：每个听众自选语言，Agent 只为被选中的语言做翻译（省成本）。Apache-2.0，可闭源商用；但只是 demo，账号/计费/控制台需自建。 |
+
+### 推荐路线
+
+1. **验证期（1–2 周）**：直接部署 OpenTransLive，配置 中文识别 + 英文/印尼语翻译，自己和几个客户试用，验证需求与翻译质量。
+2. **产品期**：
+   - 能接受开源 → 在 OpenTransLive 上加 订阅计费（Stripe / 微信支付）、套餐时长限制、桌面悬浮窗客户端（采集会议声音），按 AGPL 开源修改。
+   - 要闭源 → 参考 OpenTransLive 的产品设计，用 LiveKit（Apache-2.0）或自研 WebSocket/SSE 广播重写。
+3. **主持人端采集**：桌面客户端采集麦克风 + 系统音频（这样腾讯会议/Zoom 里别人说的话也能翻），推流到服务器；听众端纯网页，扫码即看。
+
 ## 五、行业会议的选型建议
 
 - **术语准确度**是工业/行业会议的关键：优先选支持术语表/热词的方案（讯飞同传热词、getfine333 版 LiveCaptions-Translator 术语表、LLM 翻译加 system prompt 术语）。
