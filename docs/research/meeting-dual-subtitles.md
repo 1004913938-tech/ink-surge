@@ -70,6 +70,18 @@
 
    `fmadore/Live-translation`（Tauri 悬浮窗）或 `Sokuji` 是最好的改造起点。
 
+## 4.1 已确认需求：说中文 → 同时显示 中文原文 / 英文 / 印尼语
+
+现成产品里没有确认能"一个窗口同时出英文 + 印尼语"的（讯飞实时翻译公开语种列表不含印尼语；会议内置字幕每人只能选一种语言）。可行方案：
+
+| 方案 | 做法 | 成本 |
+| --- | --- | --- |
+| 零开发 | 开两个 LiveCaptions-Translator（getfine333 衍生版，本地中文识别）实例，目标语言分别设英文、印尼语，上下摆放 | 免费；两次识别，两个窗口可能不同步 |
+| **推荐：小工具** | **Azure Speech 语音翻译**：单次 API 调用即可 `zh-CN` → `en` + `id` 两种目标语言（官方限制单次最多两种，正好满足），返回原文 + 两路译文；做一个透明置顶悬浮窗显示三行 | 按用量付费；延迟约 1 秒；一次识别，三行同步 |
+| 本地/保密 | sherpa-onnx（SenseVoice/Paraformer 中文识别）+ 本地 LLM（Ollama）同时翻译英文、印尼语 | 免费；需较好硬件，印尼语质量取决于模型 |
+
+参考：[Azure 语音翻译概述（多目标语言）](https://learn.microsoft.com/en-us/azure/ai-services/speech-service/speech-translation)、[语言支持（含印尼语 id）](https://learn.microsoft.com/en-us/azure/ai-services/speech-service/language-support)
+
 ## 五、行业会议的选型建议
 
 - **术语准确度**是工业/行业会议的关键：优先选支持术语表/热词的方案（讯飞同传热词、getfine333 版 LiveCaptions-Translator 术语表、LLM 翻译加 system prompt 术语）。
