@@ -30,6 +30,10 @@ class AgentConfig:
         default_factory=lambda: tuple(_split_ordered(os.getenv("LC_LANG_HINTS", "zh,id,en")))
     )
     """Languages expected in auto-detect mode (meeting audio); improves detection."""
+    deepgram_auto_lang: str = os.getenv("LC_DEEPGRAM_AUTO_LANG", "id")
+    """Deepgram cannot auto-detect zh/id: meeting audio in "auto" mode is transcribed as this."""
+    soniox_url: str = os.getenv("LC_SONIOX_URL", "")
+    """e.g. wss://stt-rt.jp.soniox.com/transcribe-websocket (region-bound key; no mainland-China region)."""
     stt_sample_rate: int = 16000
 
 

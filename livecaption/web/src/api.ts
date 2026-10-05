@@ -52,3 +52,9 @@ export const LANG_LABEL: Record<string, string> = {
   zh: "中文", en: "English", id: "Bahasa Indonesia", ja: "日本語", ko: "한국어", th: "ไทย", vi: "Tiếng Việt", ms: "Bahasa Melayu",
   es: "Español", fr: "Français", de: "Deutsch", pt: "Português", ru: "Русский", ar: "العربية", hi: "हिन्दी",
 };
+
+export interface ServerConfig { stt: string; auto_lang: boolean; lang_hints: string[] }
+
+export function serverConfig(): Promise<ServerConfig> {
+  return fetch(`${API_URL}/api/config`).then((r) => check<ServerConfig>(r));
+}

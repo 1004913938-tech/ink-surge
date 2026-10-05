@@ -15,13 +15,18 @@
 | WhisperLiveKit | 活跃 / MIT | 好引擎，但只是 ASR 服务端，没有房间/多人/广播概念。后续可作本地 STT 后端。 |
 | sherpa-onnx | 15k★ / Apache-2.0 | 离线中文识别（SenseVoice/Paraformer）首选，Phase 2 作为私有化部署的 STT 后端。 |
 
-STT 选型（可插拔，环境变量切换）：
+STT 选型（可插拔，`LC_STT` 切换；2026-10 调研 + 对抗核实）：
 
-| 后端 | 中文 | 印尼语 | 延迟 | 用途 |
+| 后端 | 一路混音分说话人 | 中/印/英自动识别混说 | 价格 | 结论 |
 | --- | --- | --- | --- | --- |
-| Deepgram Nova-3（已接入） | zh / zh-CN / zh-TW | id | < 300 ms | 默认云端 |
-| 阿里 Paraformer 实时（接口预留） | 最强 | — | 低 | 中文为主的客户 |
-| sherpa-onnx 本地（接口预留） | SenseVoice | — | CPU 可跑 | 私有化/涉密 |
+| **Soniox stt-rt-v5**（已接入） | ✔ 逐 token 说话人（≤15） | ✔ 逐 token 语种 | ≈ $0.12/h | **个人模式首选**。无中国大陆节点：agent 部署在港/东京/新加坡，`LC_SONIOX_URL` 指向 JP 节点 |
+| Deepgram Nova-3（已接入） | ✔ 仅定稿上、整句多数说话人 | ✘ `multi` 只含 10 种语言，无中文/印尼语 | ≈ $0.46/h | 单一语种会议可用；`auto` 时退回 `LC_DEEPGRAM_AUTO_LANG` |
+| Azure ConversationTranscriber | ✔ | 逐句语言识别（≤10 候选） | ≈ $1.3/h | 唯一有中国大陆区（世纪互联）的候选；LiveKit 插件不支持分人，需自写适配（未做） |
+| Speechmatics | ✔ 逐段 | ✘ 实时需固定语言包 | — | 等自动语种模型转正后再评估 |
+| AssemblyAI / Gladia / ElevenLabs / 阿里 / 腾讯 | 无印尼语或无实时分人 | — | — | 不适用 |
+| sherpa-onnx 本地（接口预留） | — | — | CPU | 私有化/涉密 |
+
+任何服务在混音里分说话人都会出错（第三方测得 Soniox 实时 DER 40%+）。产品上用"改名"兜底：把两个编号改成同一个名字即视为同一人。
 
 翻译：LLM（Claude `claude-opus-5-5`，`effort=low` 保证延迟），**一次调用同时产出所有目标语言**，结构化 JSON 输出；接口可插拔（`Translator` 协议）。
 
@@ -126,6 +131,13 @@ STT 选型（可插拔，环境变量切换）：
 | Safari / Firefox | ✘ | ✘ | ✘ / Firefox 151+ |
 
 不满足时的兜底：Electron 桌面壳（Windows `audio:'loopback'`，macOS Core Audio process tap），估算 1–1.5 周，未实现。
+
+识别服务的影响：说话人分离 + 自动语种需要 Soniox（见 §1）。用 Deepgram 时 `/api/config` 返回 `auto_lang=false`，页面禁用"自动识别"，用户需选定对方语言。
+
+可靠性约束（代码审查后补）：
+- 说话人标签按 **STT 连接代** 命名空间（`<gen>:<label>`），连接重建后新声音得到新编号，不会冒用别人的名字。
+- 个人房间 **失败即关闭**：agent 读不到 `mode`/`owner` 元数据就不出字幕，绝不退化成全房间广播；每个 token 都带 RoomConfiguration，房间被自动重建时元数据仍在；`departure_timeout=300s`。
+- 回声判定 = 顺序相似度（词序列 / 中日韩按字）≥ 0.7 且 3 秒内；短句（< 4 个词/字）需 ≥ 0.9 且 1.5 秒内，避免吞掉你的"好的/OK"。
 
 ---
 

@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { CaptionView } from "./CaptionView";
-import { createSession, endSession, LANG_LABEL, type HostSession } from "./api";
+import { createSession, endSession, LANG_LABEL, serverConfig, type HostSession, type ServerConfig } from "./api";
 import type { Line } from "./captions";
 import { captureHint, captureMeetingAudio, MIC_CONSTRAINTS, unsupportedReason, type MeetingCapture } from "./meetingAudio";
 import { openPip, PipPortal, pipSupported } from "./pip";
@@ -30,6 +30,14 @@ export function Personal() {
   const [pipWin, setPipWin] = useState<Window | null>(null);
   const [, bump] = useState(0);
   const namesRef = useRef<SpeakerNames | null>(null);
+  const [cfg, setCfg] = useState<ServerConfig | null>(null);
+  useEffect(() => {
+    serverConfig().then((c) => {
+      setCfg(c);
+      // e.g. Deepgram cannot auto-detect zh/id: pre-select a concrete language instead
+      if (!c.auto_lang) setRemoteLang((v) => (v === "auto" ? "id" : v));
+    }).catch(() => {});
+  }, []);
 
   const { store, state, error, micError, publishMeetingAudio, stopMeetingAudio } = useCaptionRoom(
     session?.livekit_url ?? null, session?.host_token ?? null, { mic: withMic, micOptions: MIC_CONSTRAINTS },
@@ -126,7 +134,11 @@ export function Personal() {
           <label>API Key<input value={apiKey} onChange={(e) => setApiKey(e.target.value)} required placeholder="lc_…" /></label>
           <label>对方说的语言
             <select value={remoteLang} onChange={(e) => setRemoteLang(e.target.value)}>
-              {REMOTE_LANGS.map((l) => <option key={l} value={l}>{l === "auto" ? "自动识别（多语混说）" : LANG_LABEL[l]}</option>)}
+              {REMOTE_LANGS.map((l) => (
+                <option key={l} value={l} disabled={l === "auto" && cfg?.auto_lang === false}>
+                  {l === "auto" ? (cfg?.auto_lang === false ? "自动识别（当前识别服务不支持，需要 Soniox）" : "自动识别（多语混说）") : LANG_LABEL[l]}
+                </option>
+              ))}
             </select>
           </label>
           <fieldset><legend>字幕翻译成</legend>

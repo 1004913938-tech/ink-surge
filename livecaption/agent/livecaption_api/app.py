@@ -112,6 +112,16 @@ class CreateSession(BaseModel):
     """personal: what the other participants speak, or "auto" to detect per utterance."""
 
 
+@app.get("/api/config")
+def public_config() -> dict:
+    """What the configured STT can do, so the UI only offers working options."""
+    from livecaption_agent.providers import supports_auto_lang
+
+    stt = os.getenv("LC_STT", "deepgram")
+    hints = tuple(x.strip() for x in os.getenv("LC_LANG_HINTS", "zh,id,en").split(",") if x.strip())
+    return {"stt": stt, "auto_lang": supports_auto_lang(stt, hints), "lang_hints": list(hints)}
+
+
 @app.get("/api/plans")
 def plans() -> dict:
     return PLANS

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+
 from livekit.agents import stt
 
 from livecaption_core import FakeTranslator, Translator
@@ -9,8 +11,21 @@ from livecaption_core.models import AUTO_LANG
 
 from .config import AgentConfig
 
+log = logging.getLogger("livecaption.providers")
+
 # Deepgram language codes per spoken language. Nova-3 streams zh / zh-CN / zh-TW / id.
 _DEEPGRAM_LANG = {"zh": "zh-CN", "zh-TW": "zh-TW", "en": "en", "id": "id", "ja": "ja", "ko": "ko"}
+# Nova-3 language="multi" code-switches only across these (research 2026-10): no zh, no id.
+_DEEPGRAM_MULTI = {"en", "es", "fr", "de", "hi", "ru", "pt", "ja", "it", "nl"}
+
+# Which providers can detect the language per utterance on one stream ("auto").
+AUTO_LANG_PROVIDERS = {"soniox", "demo"}
+
+
+def supports_auto_lang(provider: str, hints: tuple[str, ...] = ()) -> bool:
+    if provider == "deepgram":
+        return bool(hints) and set(hints) <= _DEEPGRAM_MULTI
+    return provider in AUTO_LANG_PROVIDERS
 
 
 def make_stt(cfg: AgentConfig, lang: str, *, diarize: bool = False) -> stt.STT:
@@ -19,6 +34,11 @@ def make_stt(cfg: AgentConfig, lang: str, *, diarize: bool = False) -> stt.STT:
     if cfg.stt_provider == "deepgram":
         from livekit.plugins import deepgram
 
+        if lang == AUTO_LANG and not supports_auto_lang("deepgram", cfg.lang_hints):
+            # Deepgram cannot code-switch zh/id; use one fixed language for the meeting.
+            lang = cfg.deepgram_auto_lang
+            log.warning("Deepgram cannot auto-detect %s; transcribing meeting audio as %r "
+                        "(set the meeting language explicitly, or LC_STT=soniox)", cfg.lang_hints, lang)
         return deepgram.STT(
             model="nova-3",
             language="multi" if lang == AUTO_LANG else _DEEPGRAM_LANG.get(lang, lang),
@@ -35,10 +55,12 @@ def make_stt(cfg: AgentConfig, lang: str, *, diarize: bool = False) -> stt.STT:
 
         soniox_patch.apply()
         hints = list(cfg.lang_hints) if lang == AUTO_LANG else [lang]
-        return SonioxSTT(params=STTOptions(
+        kwargs = {"base_url": cfg.soniox_url} if cfg.soniox_url else {}
+        return SonioxSTT(**kwargs, params=STTOptions(
             language_hints=hints,
             enable_language_identification=True,
             enable_speaker_diarization=diarize,
+            max_endpoint_delay_ms=1500,  # captions: commit a line within ~1.5 s of a pause
             sample_rate=cfg.stt_sample_rate,
         ))
     if cfg.stt_provider == "demo":

@@ -106,3 +106,11 @@ def test_migration_adds_columns_to_old_db(tmp_path):
     assert old["mode"] == "broadcast" and old["meta"] == "{}"
     new = db.create_session("acc", "t", "zh", ["en"], mode="personal")
     assert db.session_by_id(new["id"])["mode"] == "personal"
+
+
+@pytest.mark.parametrize("stt,auto", [("deepgram", False), ("soniox", True), ("demo", True)])
+def test_config_tells_ui_whether_auto_language_works(client, monkeypatch, stt, auto):
+    c, app_mod, _ = client
+    monkeypatch.setenv("LC_STT", stt)
+    monkeypatch.setenv("LC_LANG_HINTS", "zh,id,en")
+    assert c.get("/api/config").json()["auto_lang"] is auto

@@ -29,6 +29,8 @@ services:
       LC_DEV_API_KEY: ${LC_DEV_API_KEY:-lc_dev_key}
       LC_INTERNAL_TOKEN: ${LC_INTERNAL_TOKEN:-dev-internal}
       LC_DB_PATH: /data/livecaption.db
+      LC_STT: ${LC_STT:-deepgram}
+      LC_LANG_HINTS: ${LC_LANG_HINTS:-zh,id,en}
     volumes:
       - apidata:/data
     ports:
@@ -45,6 +47,8 @@ services:
       LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET:-secretsecretsecretsecretsecret12}
       DEEPGRAM_API_KEY: ${DEEPGRAM_API_KEY}
       SONIOX_API_KEY: ${SONIOX_API_KEY:-}
+      LC_SONIOX_URL: ${LC_SONIOX_URL:-}
+      LC_DEEPGRAM_AUTO_LANG: ${LC_DEEPGRAM_AUTO_LANG:-id}
       LC_LANG_HINTS: ${LC_LANG_HINTS:-zh,id,en}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
       LC_STT: ${LC_STT:-deepgram}
