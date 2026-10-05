@@ -15,6 +15,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import urllib.request
+from urllib.parse import urlparse
 
 import aiohttp
 from livekit import rtc
@@ -109,7 +112,10 @@ class TrackPipe:
 
     async def _run_once(self) -> None:
         tid = self.spec.track_id
-        stt_impl = make_stt(self._cfg, self.spec.owner.lang, diarize=self.spec.diarized)
+        # Own session with trust_env: the STT host is reached through HTTPS_PROXY / NO_PROXY
+        # like any HTTP client, independent of the worker's LiveKit proxy (see livekit_proxy).
+        http = aiohttp.ClientSession(trust_env=True)
+        stt_impl = make_stt(self._cfg, self.spec.owner.lang, diarize=self.spec.diarized, http_session=http)
         audio = rtc.AudioStream.from_track(
             track=self._track, sample_rate=self._cfg.stt_sample_rate, num_channels=1
         )
@@ -149,6 +155,7 @@ class TrackPipe:
             await audio.aclose()
             await stream.aclose()
             await stt_impl.aclose()
+            await http.close()
 
 
     def _label(self, speaker_id: str | None) -> str | None:
@@ -335,9 +342,21 @@ async def entrypoint(ctx: JobContext) -> None:
     await RoomCaptioner(ctx, cfg).run()
 
 
+def livekit_proxy(url: str) -> str | None:
+    """Proxy for the agent's own LiveKit connection. livekit-agents takes HTTPS_PROXY but
+    ignores NO_PROXY, so a LiveKit server on the local network (ws://livekit:7880 behind a
+    proxy that is only needed to reach the STT / translation APIs) failed with HTTP 405."""
+    host = urlparse(url).hostname or ""
+    if host and urllib.request.proxy_bypass(host):
+        return None
+    return next((v for k in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy")
+                 if (v := os.environ.get(k))), None)
+
+
 def main() -> None:
     logging.basicConfig(level=logging.INFO)
-    cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint))
+    cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint,
+                              http_proxy=livekit_proxy(os.environ.get("LIVEKIT_URL", ""))))
 
 
 if __name__ == "__main__":

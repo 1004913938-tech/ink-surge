@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 
+import aiohttp
 from livekit.agents import stt
 
 from livecaption_core import FakeTranslator, Translator
@@ -28,9 +29,11 @@ def supports_auto_lang(provider: str, hints: tuple[str, ...] = ()) -> bool:
     return provider in AUTO_LANG_PROVIDERS
 
 
-def make_stt(cfg: AgentConfig, lang: str, *, diarize: bool = False) -> stt.STT:
+def make_stt(cfg: AgentConfig, lang: str, *, diarize: bool = False,
+             http_session: aiohttp.ClientSession | None = None) -> stt.STT:
     """`lang` is the spoken language or "auto" (detect per utterance). `diarize` asks the
-    provider to label speakers inside one stream (the meeting's system audio)."""
+    provider to label speakers inside one stream (the meeting's system audio).
+    `http_session`: owned by the caller (plugins do not close a session they were given)."""
     if cfg.stt_provider == "deepgram":
         from livekit.plugins import deepgram
 
@@ -46,6 +49,7 @@ def make_stt(cfg: AgentConfig, lang: str, *, diarize: bool = False) -> stt.STT:
             punctuate=True,
             enable_diarization=diarize,
             sample_rate=cfg.stt_sample_rate,
+            http_session=http_session,
         )
     if cfg.stt_provider == "soniox":
         from livekit.plugins.soniox import STT as SonioxSTT
@@ -56,7 +60,7 @@ def make_stt(cfg: AgentConfig, lang: str, *, diarize: bool = False) -> stt.STT:
         soniox_patch.apply()
         hints = list(cfg.lang_hints) if lang == AUTO_LANG else [lang]
         kwargs = {"base_url": cfg.soniox_url} if cfg.soniox_url else {}
-        return SonioxSTT(**kwargs, params=STTOptions(
+        return SonioxSTT(**kwargs, http_session=http_session, params=STTOptions(
             language_hints=hints,
             enable_language_identification=True,
             enable_speaker_diarization=diarize,
