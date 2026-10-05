@@ -8,6 +8,10 @@ def _split(s: str) -> frozenset[str]:
     return frozenset(x.strip() for x in s.split(",") if x.strip())
 
 
+def _split_ordered(s: str) -> list[str]:
+    return [x.strip() for x in s.split(",") if x.strip()]
+
+
 @dataclass
 class AgentConfig:
     stt_provider: str = os.getenv("LC_STT", "deepgram")
@@ -22,6 +26,10 @@ class AgentConfig:
     reorder_window_s: float = float(os.getenv("LC_REORDER_WINDOW_S", "1.5"))
     api_url: str = os.getenv("LC_API_URL", "")  # usage metering; empty disables
     internal_token: str = os.getenv("LC_INTERNAL_TOKEN", "")
+    lang_hints: tuple[str, ...] = field(
+        default_factory=lambda: tuple(_split_ordered(os.getenv("LC_LANG_HINTS", "zh,id,en")))
+    )
+    """Languages expected in auto-detect mode (meeting audio); improves detection."""
     stt_sample_rate: int = 16000
 
 

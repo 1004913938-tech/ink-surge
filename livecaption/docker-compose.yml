@@ -44,6 +44,8 @@ services:
       LIVEKIT_API_KEY: ${LIVEKIT_API_KEY:-devkey}
       LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET:-secretsecretsecretsecretsecret12}
       DEEPGRAM_API_KEY: ${DEEPGRAM_API_KEY}
+      SONIOX_API_KEY: ${SONIOX_API_KEY:-}
+      LC_LANG_HINTS: ${LC_LANG_HINTS:-zh,id,en}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
       LC_STT: ${LC_STT:-deepgram}
       LC_TRANSLATOR: ${LC_TRANSLATOR:-claude}

@@ -87,12 +87,54 @@ STT 选型（可插拔，环境变量切换）：
 
 ---
 
+## 3a. 个人模式（`#/me`）：线上会议，只有我看得到
+
+场景：我在腾讯会议 / Zoom / Teams 里和 6 个人开会，别人说印尼语、英语、中文，我要看到"谁说了什么"的中文字幕，别人看不到。
+
+```
+腾讯会议客户端 / 网页版 ──扬声器──▶ 我的耳朵
+        │ 系统声音 / 应用声音 / 标签页声音（getDisplayMedia）
+        ▼
+ 我的 Chrome（#/me）──▶ LiveKit 私人房间 ──▶ agent
+   ├ 音轨 A：screen_share_audio = 会议声音（别人）  → STT 说话人分离 + 自动语种 → 说话人 1..N
+   └ 音轨 B（可选）：microphone = 我              → 已知说话人"我"，回声去重
+        ◀── 字幕只发给房主（send_text destination_identities=[owner]）
+ Document Picture-in-Picture 悬浮窗（置顶，浮在会议软件上方）
+```
+
+关键设计：
+
+1. **按音轨建管道**，不是按参会者：同一个人可同时推"麦克风"和"会议声音"两条音轨，agent 按 `TrackSource` 区分。
+2. **说话人分离在 core 里做归属**（`CaptionSession.on_track_*`）：
+   - 多数 STT 只在 final 上给说话人。interim 先挂在占位"会议声音"下显示；final 到达时**复用同一 sid** 改挂到"说话人 N"，客户端原地替换，不闪不跳。
+   - STT 标签（S0 / "1" / "A"）→ 每条音轨按首次出现编号"说话人 1..N"。改名只在本机（localStorage），不上传。
+   - 一个 final 跨了说话人（带逐词说话人时）→ 按词切成多条 final（`word_runs`）。Soniox 插件原生只取首个说话人，`soniox_patch.py` 补齐逐 token 说话人。
+3. **按句语种**：会议声音设为 `auto`，STT 每句给语种；只翻成"我要看的语言"里与原文不同的那些（中文发言不翻）。
+4. **回声**：没戴耳机时麦克风会听到会议声音。三层防护：
+   - 我的麦克风默认**不开**（自己的话自己知道）；
+   - 开麦时用 `echoCancellation: "all"`（Chrome 141+，Win11 / macOS 14.2+ 用系统回环做参考，能消掉腾讯会议客户端的外放）；
+   - core 做文本相似度去重：麦克风 final 先压 1 秒，期间会议声音出现相似句则丢弃；已显示的发 `retract` 撤回。
+5. **隐私**：房间 `max_participants=3`，agent 只给房主发字幕（e2e 测试验证：拿到同房间 token 的第三者收到 0 条）；个人会话不能用入会码查到。悬浮窗无法从屏幕共享中排除，界面提示"共享屏幕前先关悬浮窗"。
+
+浏览器能力（2026-10 调研，详见 `docs/research/`）：
+
+| 平台 | 会议客户端的声音 | 网页版会议（标签页） | 悬浮窗 |
+| --- | --- | --- | --- |
+| Windows 10/11 + Chrome/Edge | 整个屏幕 +「共享系统音频」；Win11 + Chrome 146+ 可只选会议窗口 | ✔ | ✔ 116+ |
+| macOS 14.2+ + Chrome 141+ | 整个屏幕 +「共享系统音频」（需系统录音权限） | ✔ | ✔（会议软件全屏时会被盖住） |
+| macOS < 14.2 | ✘（只能用网页版会议） | ✔ | ✔ |
+| Safari / Firefox | ✘ | ✘ | ✘ / Firefox 151+ |
+
+不满足时的兜底：Electron 桌面壳（Windows `audio:'loopback'`，macOS Core Audio process tap），估算 1–1.5 周，未实现。
+
+---
+
 ## 4. 消息协议（text stream，topic `lc.caption`，JSON）
 
 ```jsonc
 {
   "v": 1,
-  "kind": "interim" | "final" | "patch" | "reset",
+  "kind": "interim" | "final" | "patch" | "reset" | "retract",
   "sid": "s_7f3a",            // segment_id
   "spk": {"id": "host-1", "name": "张总"},
   "seq": 42,
@@ -107,6 +149,8 @@ STT 选型（可插拔，环境变量切换）：
 - `final`：`src` 定稿；`tr` 可能为空（随后 `patch`）。
 - `patch`：只带 `sid` + `tr` + `tr_status`。
 - `reset`：agent 重启或会话切换，客户端清空。
+- `retract`：撤回一行（回声重复、或 STT 放弃的临时句）。客户端删除该 sid，并忽略它之后的任何消息。
+- 个人模式下，同一 sid 的 interim 与 final 的 `spk` 可以不同（占位"会议声音" → "说话人 N"），客户端以 final 为准。
 
 ---
 

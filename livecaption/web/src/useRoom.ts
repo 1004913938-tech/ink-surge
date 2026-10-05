@@ -1,4 +1,4 @@
-import { Room, RoomEvent, Track } from "livekit-client";
+import { Room, RoomEvent, Track, type AudioCaptureOptions } from "livekit-client";
 import { useEffect, useRef, useState } from "react";
 
 import { CaptionStore, parseCaption } from "./captions";
@@ -11,7 +11,11 @@ export type ConnState = "idle" | "connecting" | "connected" | "reconnecting" | "
  * Connects to a LiveKit room, feeds caption text streams into a CaptionStore and
  * re-renders on every message (throttled to animation frames).
  */
-export function useCaptionRoom(url: string | null, token: string | null, opts: { mic?: boolean; langs?: string[] } = {}) {
+export function useCaptionRoom(
+  url: string | null,
+  token: string | null,
+  opts: { mic?: boolean; micOptions?: MediaTrackConstraints; langs?: string[] } = {},
+) {
   const storeRef = useRef(new CaptionStore());
   const roomRef = useRef<Room | null>(null);
   const [state, setState] = useState<ConnState>("idle");
@@ -42,7 +46,7 @@ export function useCaptionRoom(url: string | null, token: string | null, opts: {
       try {
         await room.connect(url, token);
         if (opts.langs) await room.localParticipant.setAttributes({ "lc.langs": opts.langs.join(",") });
-        if (opts.mic) await room.localParticipant.setMicrophoneEnabled(true);
+        if (opts.mic) await room.localParticipant.setMicrophoneEnabled(true, opts.micOptions as AudioCaptureOptions | undefined);
       } catch (e) {
         setError(String(e));
         setState("error");

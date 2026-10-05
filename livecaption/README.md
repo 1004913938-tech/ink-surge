@@ -24,6 +24,23 @@ docker compose up -d --build
 
 > 浏览器开麦需要 HTTPS（localhost 除外）。上线时给 web/api/livekit 套一层 TLS（Caddy 两行配置）。
 
+## 个人模式：线上会议，只有你看得到（`#/me`）
+
+适合：你在腾讯会议 / Zoom / Teams 里和几个人开会，想看到"每个人说了什么"的中文字幕，别人看不到。
+
+1. 用 **电脑版 Chrome 或 Edge** 打开 `http://localhost:5173/#/me`（Safari / Firefox 拿不到会议声音）。
+2. 选"对方说的语言"（不确定就选 **自动识别**）、"字幕翻译成"（默认中文），点 **开始**。
+3. 正常进腾讯会议，然后回到本页点 **选择会议声音**：
+   - Windows：选「整个屏幕」并打开「同时共享系统音频」（Win11 + Chrome 146+ 也可只选腾讯会议窗口 +「共享应用音频」）。
+   - Mac（macOS 14.2+、Chrome 141+）：选「整个屏幕」并打开「同时共享系统音频」，第一次要在 系统设置 → 隐私与安全性 → 录屏与系统录音 里允许 Chrome。
+   - 网页版会议：选会议所在标签页并打开「同时共享标签页音频」（所有系统都行）。
+4. 字幕按说话人分颜色出现（说话人 1、2、3…）。**点名字可以改成真名**，只存在你电脑上。
+5. 点 **悬浮字幕窗**，一个置顶小窗浮在会议软件上方。⚠ 你在会议里共享整个屏幕时别人能看到它，共享前先关掉。
+
+可选：勾选"也显示我自己说的话"会同时识别你的麦克风。建议戴耳机；不戴时 Chrome 141+ 会尽量消掉外放的会议声音，残留的重复句会被自动撤回。
+
+识别服务（`LC_STT`）：说话人分离要求服务能在一路混音里分人。`deepgram`（已接，标签只在定稿上）、`soniox`（已接，自动识别中/印/英混说，需要 `SONIOX_API_KEY`）、`demo`（演示：模拟 6 个人轮流说印尼语/英语/中文）。
+
 ## 本地开发（不用 Docker）
 
 ```bash
@@ -52,7 +69,8 @@ LiveKit 本地可用 `docker compose up livekit redis`，或 `livekit-server --d
 真实联调脚本（需要栈已启动）：
 
 ```bash
-cd livecaption/agent && python tests/e2e_livekit.py   # Python 客户端：主持人推音频，听众收字幕，断言顺序与译文
+cd livecaption/agent && python tests/e2e_livekit.py   # 广播模式：主持人推音频，听众收字幕，断言顺序与译文
+cd livecaption/agent && python tests/e2e_personal.py  # 个人模式：6 人会议声音分人分语种、只发给房主、第三者收不到
 ```
 
 已在真实 LiveKit + Chromium（假麦克风）上验证：主持人页出二维码，听众页扫码后 2 句内看到中文/英文/印尼语三行，agent 入房延迟 0.2 s。

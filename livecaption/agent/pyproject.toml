@@ -5,6 +5,7 @@ description = "Real-time multilingual captions for meetings: LiveKit agent + API
 requires-python = ">=3.11"
 dependencies = [
     "livekit-agents[deepgram]==1.8.4",
+    "livekit-plugins-soniox==1.8.4",
     "livekit==1.1.20",
     "livekit-api>=1.2.1",
     "anthropic==1.11.0",

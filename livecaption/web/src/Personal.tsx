@@ -3,7 +3,7 @@ import { useCallback, useMemo, useRef, useState } from "react";
 import { CaptionView } from "./CaptionView";
 import { createSession, endSession, LANG_LABEL, type HostSession } from "./api";
 import type { Line } from "./captions";
-import { captureHint, captureMeetingAudio } from "./meetingAudio";
+import { captureHint, captureMeetingAudio, MIC_CONSTRAINTS, unsupportedReason, type MeetingCapture } from "./meetingAudio";
 import { openPip, PipPortal, pipSupported } from "./pip";
 import { SpeakerNames } from "./speakers";
 import { useCaptionRoom } from "./useRoom";
@@ -25,13 +25,14 @@ export function Personal() {
   const [session, setSession] = useState<HostSession | null>(null);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
-  const [meetingTrack, setMeetingTrack] = useState<MediaStreamTrack | null>(null);
+  const [capture, setCapture] = useState<MeetingCapture | null>(null);
+  const unsupported = unsupportedReason();
   const [pipWin, setPipWin] = useState<Window | null>(null);
   const [, bump] = useState(0);
   const namesRef = useRef<SpeakerNames | null>(null);
 
   const { store, state, error, publishMeetingAudio, stopMeetingAudio } = useCaptionRoom(
-    session?.livekit_url ?? null, session?.host_token ?? null, { mic: withMic },
+    session?.livekit_url ?? null, session?.host_token ?? null, { mic: withMic, micOptions: MIC_CONSTRAINTS },
   );
 
   const start = async () => {
@@ -53,10 +54,10 @@ export function Personal() {
   const listen = async () => {
     setErr(null);
     try {
-      const track = await captureMeetingAudio();
-      track.addEventListener("ended", () => setMeetingTrack(null)); // user clicked "stop sharing"
-      await publishMeetingAudio(track);
-      setMeetingTrack(track);
+      const cap = await captureMeetingAudio();
+      cap.audio.addEventListener("ended", () => setCapture(null)); // user clicked "stop sharing"
+      await publishMeetingAudio(cap.audio);
+      setCapture(cap);
     } catch (e) {
       const msg = (e as Error).name === "NotAllowedError" ? "你取消了共享。再点一次并选择会议声音即可。" : String((e as Error).message ?? e);
       setErr(msg);
@@ -64,10 +65,10 @@ export function Personal() {
   };
 
   const stopListening = async () => {
-    if (!meetingTrack) return;
-    await stopMeetingAudio(meetingTrack).catch(() => {});
-    meetingTrack.stop();
-    setMeetingTrack(null);
+    if (!capture) return;
+    await stopMeetingAudio(capture.audio).catch(() => {});
+    capture.stop();
+    setCapture(null);
   };
 
   const stop = async () => {
@@ -114,7 +115,7 @@ export function Personal() {
           </fieldset>
           <label className="inline">
             <input type="checkbox" checked={withMic} onChange={(e) => setWithMic(e.target.checked)} />
-            也显示我自己说的话（请戴耳机，否则会重复）
+            也显示我自己说的话（建议戴耳机；Chrome 141+ 会自动消除外放的会议声音）
           </label>
           {withMic && (
             <label>我说的语言
@@ -123,7 +124,8 @@ export function Personal() {
               </select>
             </label>
           )}
-          <button disabled={busy || !apiKey || readLangs.length === 0}>{busy ? "正在准备…" : "开始"}</button>
+          {unsupported && <p className="err">{unsupported}</p>}
+          <button disabled={busy || !apiKey || readLangs.length === 0 || !!unsupported}>{busy ? "正在准备…" : "开始"}</button>
           {err && <p className="err">{err}</p>}
         </form>
       </div>
@@ -134,7 +136,7 @@ export function Personal() {
     <div className="page">
       <h1>LiveCaption <small>个人会议字幕 · 只有你看得到</small></h1>
       <div className="card">
-        {!meetingTrack ? (
+        {!capture ? (
           <>
             <div><b>第 1 步：</b>先在腾讯会议 / Zoom 里入会，然后点下面的按钮，选择会议的声音。</div>
             <div className="small">{captureHint()}</div>
@@ -150,6 +152,7 @@ export function Personal() {
           </div>
         )}
         <div className="small">连接：{state}{error ? ` — ${error}` : ""} · 点说话人名字可以改名</div>
+        {pipWin && <div className="small warn">提示：你在会议里共享屏幕时，悬浮字幕窗也会被别人看到。共享前请关闭它，或只共享某个窗口。</div>}
         <div className="actions"><button className="danger" onClick={stop}>结束</button></div>
         {err && <p className="err">{err}</p>}
       </div>

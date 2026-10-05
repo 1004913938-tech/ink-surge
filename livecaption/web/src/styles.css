@@ -48,3 +48,4 @@ button.ghost { background: #222733; }
 .captions.compact { gap: 6px; } .captions.compact .line { padding: 6px 10px; }
 .captions.compact .src { font-size: 15px; font-weight: 500; } .captions.compact .tr { font-size: 18px; font-weight: 600; margin-top: 2px; }
 .pip-body { margin: 0; padding: 8px; background: var(--bg); color: var(--fg); overflow: hidden; display: flex; flex-direction: column; justify-content: flex-end; height: 100vh; box-sizing: border-box; }
+.small.warn { color: var(--warn); }

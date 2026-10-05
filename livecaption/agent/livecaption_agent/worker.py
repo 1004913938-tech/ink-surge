@@ -125,7 +125,7 @@ class TrackPipe:
                     continue
                 alt = ev.alternatives[0]
                 lang = base_lang(alt.language) if self.spec.owner.lang == AUTO_LANG else None
-                if ev.type == stt.SpeechEventType.INTERIM_TRANSCRIPT:
+                if ev.type in (stt.SpeechEventType.INTERIM_TRANSCRIPT, stt.SpeechEventType.PREFLIGHT_TRANSCRIPT):
                     await self._session.on_track_interim(tid, alt.text, speaker_label=alt.speaker_id, lang=lang)
                 elif ev.type == stt.SpeechEventType.FINAL_TRANSCRIPT:
                     words = [Word(str(w), getattr(w, "speaker_id", None)) for w in (alt.words or [])]

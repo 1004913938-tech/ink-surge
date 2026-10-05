@@ -27,6 +27,20 @@ def make_stt(cfg: AgentConfig, lang: str, *, diarize: bool = False) -> stt.STT:
             enable_diarization=diarize,
             sample_rate=cfg.stt_sample_rate,
         )
+    if cfg.stt_provider == "soniox":
+        from livekit.plugins.soniox import STT as SonioxSTT
+        from livekit.plugins.soniox import STTOptions
+
+        from . import soniox_patch
+
+        soniox_patch.apply()
+        hints = list(cfg.lang_hints) if lang == AUTO_LANG else [lang]
+        return SonioxSTT(params=STTOptions(
+            language_hints=hints,
+            enable_language_identification=True,
+            enable_speaker_diarization=diarize,
+            sample_rate=cfg.stt_sample_rate,
+        ))
     if cfg.stt_provider == "demo":
         from .demo_stt import DemoSTT
 
