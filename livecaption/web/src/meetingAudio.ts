@@ -28,11 +28,12 @@ function chromiumMajor(): number | null {
   return m && !/Firefox|FxiOS/.test(navigator.userAgent) ? Number(m[1]) : null;
 }
 
-/** null when supported; otherwise a user-facing reason (shown before they start). */
+/** null when screen-share audio works; otherwise a user-facing reason. The virtual sound
+ *  card path (captureFromDevice) still works in every browser. */
 export function unsupportedReason(): string | null {
   const v = chromiumMajor();
-  if (v === null) return "请用电脑版 Chrome 或 Edge 打开本页：Safari / Firefox 无法获取会议声音。";
-  if (platform() === "mac" && v < 141) return "Mac 上需要 Chrome 141 或更新版本（并且 macOS 14.2+）才能获取会议声音，请先升级 Chrome。";
+  if (v === null) return "这个浏览器不能直接获取会议声音：请改用电脑版 Chrome / Edge，或用下方「高级：虚拟声卡」。";
+  if (platform() === "mac" && v < 141) return "Mac 上需要 Chrome 141+（且 macOS 14.2+）才能直接获取会议声音：请升级 Chrome，或用下方「高级：虚拟声卡」。";
   return null;
 }
 
@@ -95,6 +96,33 @@ export async function captureMeetingAudio(): Promise<MeetingCapture> {
   // When the user clicks the browser's "Stop sharing", end everything together.
   for (const t of stream.getTracks()) t.addEventListener("ended", stopAll);
   return { audio, stop: stopAll };
+}
+
+/** Audio inputs, for the virtual-sound-card path (BlackHole, VB-CABLE, "Stereo Mix",
+ *  PipeWire "Monitor of …"). Labels are only exposed after a mic permission grant. */
+export async function listAudioInputs(): Promise<MediaDeviceInfo[]> {
+  let devices = await navigator.mediaDevices.enumerateDevices();
+  if (devices.some((d) => d.kind === "audioinput" && !d.label)) {
+    const probe = await navigator.mediaDevices.getUserMedia({ audio: true });
+    probe.getTracks().forEach((t) => t.stop());
+    devices = await navigator.mediaDevices.enumerateDevices();
+  }
+  return devices.filter((d) => d.kind === "audioinput" && d.deviceId !== "default" && d.deviceId !== "communications");
+}
+
+const LOOPBACK_HINT = /blackhole|vb-?cable|cable output|stereo mix|立体声混音|loopback|monitor of|soundflower|virtual/i;
+
+export function looksLikeLoopback(d: MediaDeviceInfo): boolean {
+  return LOOPBACK_HINT.test(d.label);
+}
+
+/** Meeting audio from an input device that carries system output (works in any browser). */
+export async function captureFromDevice(deviceId: string): Promise<MeetingCapture> {
+  const stream = await navigator.mediaDevices.getUserMedia({
+    audio: { deviceId: { exact: deviceId }, echoCancellation: false, noiseSuppression: false, autoGainControl: false },
+  });
+  const [audio] = stream.getAudioTracks();
+  return { audio, stop: () => stream.getTracks().forEach((t) => t.stop()) };
 }
 
 /** Mic constraints: loopback echo cancellation removes the meeting audio the speakers play

@@ -19,8 +19,8 @@ STT 选型（可插拔，`LC_STT` 切换；2026-10 调研 + 对抗核实）：
 
 | 后端 | 一路混音分说话人 | 中/印/英自动识别混说 | 价格 | 结论 |
 | --- | --- | --- | --- | --- |
-| **Soniox stt-rt-v5**（已接入） | ✔ 逐 token 说话人（≤15） | ✔ 逐 token 语种 | ≈ $0.12/h | **个人模式首选**。无中国大陆节点：agent 部署在港/东京/新加坡，`LC_SONIOX_URL` 指向 JP 节点 |
-| Deepgram Nova-3（已接入） | ✔ 仅定稿上、整句多数说话人 | ✘ `multi` 只含 10 种语言，无中文/印尼语 | ≈ $0.46/h | 单一语种会议可用；`auto` 时退回 `LC_DEEPGRAM_AUTO_LANG` |
+| **Soniox stt-rt-v5**（已接入） | ✔ 逐 token 说话人（≤15） | ✔ 逐 token 语种 | ≈ $0.12/h（自带翻译另计，约 +$0.06–0.16/h，我们不用） | **个人模式首选**。无中国大陆节点：agent 部署在港/东京/新加坡，`LC_SONIOX_URL` 指向 JP 节点 |
+| Deepgram Nova-3（已接入） | ✔ 仅定稿上、整句多数说话人（插件仍用已弃用的 `diarize=true`，可用） | ✘ `multi` 只含 10 种语言，无中文/印尼语 | ≈ $0.4–0.6/h（含分人 $0.12） | 单一语种会议可用；`auto` 时退回 `LC_DEEPGRAM_AUTO_LANG` |
 | Azure ConversationTranscriber | ✔ | 逐句语言识别（≤10 候选） | ≈ $1.3/h | 唯一有中国大陆区（世纪互联）的候选；LiveKit 插件不支持分人，需自写适配（未做） |
 | Speechmatics | ✔ 逐段 | ✘ 实时需固定语言包 | — | 等自动语种模型转正后再评估 |
 | AssemblyAI / Gladia / ElevenLabs / 阿里 / 腾讯 | 无印尼语或无实时分人 | — | — | 不适用 |
@@ -129,6 +129,9 @@ STT 选型（可插拔，`LC_STT` 切换；2026-10 调研 + 对抗核实）：
 | macOS 14.2+ + Chrome 141+ | 整个屏幕 +「共享系统音频」（需系统录音权限） | ✔ | ✔（会议软件全屏时会被盖住） |
 | macOS < 14.2 | ✘（只能用网页版会议） | ✔ | ✔ |
 | Safari / Firefox | ✘ | ✘ | ✘ / Firefox 151+ |
+| 任何浏览器 + 虚拟声卡（BlackHole / VB-CABLE / 立体声混音 / PipeWire Monitor） | ✔（getUserMedia 选该设备） | ✔ | 同上 |
+
+Chromium 全浏览器只有一个画中画窗口（与 `<video>` PiP 共用）：其他网页打开画中画会关掉字幕窗，页面提示重新打开。
 
 不满足时的兜底：Electron 桌面壳（Windows `audio:'loopback'`，macOS Core Audio process tap），估算 1–1.5 周，未实现。
 

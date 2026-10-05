@@ -3,7 +3,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { CaptionView } from "./CaptionView";
 import { createSession, endSession, LANG_LABEL, serverConfig, type HostSession, type ServerConfig } from "./api";
 import type { Line } from "./captions";
-import { captureHint, captureMeetingAudio, MIC_CONSTRAINTS, unsupportedReason, type MeetingCapture } from "./meetingAudio";
+import { captureFromDevice, captureHint, captureMeetingAudio, listAudioInputs, looksLikeLoopback, MIC_CONSTRAINTS, unsupportedReason, type MeetingCapture } from "./meetingAudio";
 import { openPip, PipPortal, pipSupported } from "./pip";
 import { SpeakerNames } from "./speakers";
 import { useCaptionRoom } from "./useRoom";
@@ -59,10 +59,15 @@ export function Personal() {
     } catch (e) { setErr(String(e)); } finally { setBusy(false); }
   };
 
-  const listen = async () => {
+  const [devices, setDevices] = useState<MediaDeviceInfo[] | null>(null);
+  const showDevices = async () => {
+    try { setDevices(await listAudioInputs()); } catch (e) { setErr(String((e as Error).message ?? e)); }
+  };
+
+  const listen = async (deviceId?: string) => {
     setErr(null);
     try {
-      const cap = await captureMeetingAudio();
+      const cap = deviceId ? await captureFromDevice(deviceId) : await captureMeetingAudio();
       cap.audio.addEventListener("ended", () => setCapture(null)); // user clicked "stop sharing"
       await publishMeetingAudio(cap.audio);
       setCapture(cap);
@@ -159,8 +164,8 @@ export function Personal() {
               </select>
             </label>
           )}
-          {unsupported && <p className="err">{unsupported}</p>}
-          <button disabled={busy || !apiKey || readLangs.length === 0 || !!unsupported}>{busy ? "正在准备…" : "开始"}</button>
+          {unsupported && <p className="small warn">{unsupported}</p>}
+          <button disabled={busy || !apiKey || readLangs.length === 0}>{busy ? "正在准备…" : "开始"}</button>
           {err && <p className="err">{err}</p>}
         </form>
       </div>
@@ -175,7 +180,25 @@ export function Personal() {
           <>
             <div><b>第 1 步：</b>先在腾讯会议 / Zoom 里入会，然后点下面的按钮，选择会议的声音。</div>
             <div className="small">{captureHint()}</div>
-            <div className="actions"><button onClick={listen} disabled={state !== "connected"}>选择会议声音</button></div>
+            <div className="actions">
+              <button onClick={() => listen()} disabled={state !== "connected" || !!unsupported}>选择会议声音</button>
+              <button className="ghost" onClick={showDevices} disabled={state !== "connected"}>高级：虚拟声卡</button>
+            </div>
+            {unsupported && <div className="small warn">{unsupported}</div>}
+            {devices && (
+              <div className="small">
+                选择把电脑声音转成输入的设备（Mac：BlackHole；Windows：VB-CABLE 或「立体声混音」；Linux：Monitor of …）。
+                需要先在系统里把会议声音输出到它。
+                <div className="actions">
+                  {devices.length === 0 && <span>没有找到输入设备。</span>}
+                  {devices.map((d) => (
+                    <button key={d.deviceId} className={looksLikeLoopback(d) ? "" : "ghost"} onClick={() => listen(d.deviceId)}>
+                      {d.label || "未命名设备"}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
           </>
         ) : (
           <div className="row-inline">
@@ -192,6 +215,9 @@ export function Personal() {
         )}
         {micError && <div className="small warn">麦克风没有打开（{micError}），只显示会议里别人的话。</div>}
         {pipWin && <div className="small warn">提示：你在会议里共享屏幕时，悬浮字幕窗也会被别人看到。共享前请关闭它，或只共享某个窗口。</div>}
+        {capture && !pipWin && pipSupported() && (
+          <div className="small">Chrome 同时只允许一个画中画窗口：其他网页打开画中画（如 Google Meet）会关掉字幕悬浮窗，点「悬浮字幕窗」可重新打开。</div>
+        )}
         <div className="actions"><button className="danger" onClick={stop}>结束</button></div>
         {err && <p className="err">{err}</p>}
       </div>
