@@ -93,7 +93,7 @@ Soniox 账户充值后一条命令即可出结果（见「复跑」）。
 
 ### 其他观察（未改）
 
-- 仓库里提交了 `__pycache__/*.pyc`，每次跑测试都会让 git 显示改动。建议从仓库移除并加入 `.gitignore`。
+- 仓库里曾提交 `__pycache__/*.pyc`，跑测试会产生 git 改动；分支上已有提交 `0bbf2a5` 将其移出仓库。
 - 测试脚本退出时 livekit rtc SDK 会打印 `FfiHandle.__del__ AssertionError`，这是 SDK 清理阶段的噪音，不影响结果。
 
 ## 复跑（充值后）
