@@ -21,9 +21,10 @@ def test_patch_installs_and_records_runs():
         acc.update(tok)
     sd = acc.to_speech_data()
     assert sd.speaker_id == "1"  # plugin behaviour: first speaker
-    assert [(str(w), w.speaker_id) for w in sd.words] == [("Is that right?", "1"), (" Ya, betul.", "2")]
-    runs = word_runs([Word(str(w), w.speaker_id) for w in sd.words], "en")
-    assert runs == [("1", "Is that right?"), ("2", "Ya, betul.")]
+    assert [(str(w), w.speaker_id, w.language) for w in sd.words] == [
+        ("Is that right?", "1", "en"), (" Ya, betul.", "2", "id")]
+    runs = word_runs([Word(str(w), w.speaker_id, w.language) for w in sd.words], "en")
+    assert [(r.speaker, r.text, r.lang) for r in runs] == [("1", "Is that right?", "en"), ("2", "Ya, betul.", "id")]
     acc.reset()
     assert acc.speaker_words() is None and acc.text == ""
 

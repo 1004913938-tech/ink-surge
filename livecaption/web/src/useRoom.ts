@@ -20,6 +20,7 @@ export function useCaptionRoom(
   const roomRef = useRef<Room | null>(null);
   const [state, setState] = useState<ConnState>("idle");
   const [error, setError] = useState<string | null>(null);
+  const [micError, setMicError] = useState<string | null>(null);
   const [, bump] = useState(0);
 
   useEffect(() => {
@@ -36,24 +37,35 @@ export function useCaptionRoom(
       const msg = parseCaption(text);
       if (msg) { storeRef.current.apply(msg); schedule(); }
     });
-    room.on(RoomEvent.Connected, () => setState("connected"));
+    room.on(RoomEvent.Connected, () => { setError(null); setState("connected"); });
     room.on(RoomEvent.Reconnecting, () => setState("reconnecting"));
-    room.on(RoomEvent.Reconnected, () => setState("connected"));
+    room.on(RoomEvent.Reconnected, () => { setError(null); setState("connected"); });
     room.on(RoomEvent.Disconnected, () => setState("disconnected"));
 
     setState("connecting");
+    setError(null);
+    setMicError(null);
+    let disposed = false;
     (async () => {
       try {
         await room.connect(url, token);
         if (opts.langs) await room.localParticipant.setAttributes({ "lc.langs": opts.langs.join(",") });
-        if (opts.mic) await room.localParticipant.setMicrophoneEnabled(true, opts.micOptions as AudioCaptureOptions | undefined);
       } catch (e) {
-        setError(String(e));
-        setState("error");
+        if (!disposed) { setError(String(e)); setState("error"); }
+        return;
+      }
+      if (opts.mic) {
+        try {
+          await room.localParticipant.setMicrophoneEnabled(true, opts.micOptions as AudioCaptureOptions | undefined);
+        } catch (e) {
+          // The mic is optional (personal mode) — report it, keep the room usable.
+          if (!disposed) setMicError(String((e as Error).message ?? e));
+        }
       }
     })();
 
     return () => {
+      disposed = true;
       cancelAnimationFrame(raf);
       room.unregisterTextStreamHandler(CAPTION_TOPIC);
       room.disconnect();
@@ -82,5 +94,5 @@ export function useCaptionRoom(
     await roomRef.current?.localParticipant.unpublishTrack(track, true);
   };
 
-  return { store: storeRef.current, state, error, setLangs, setMic, publishMeetingAudio, stopMeetingAudio };
+  return { store: storeRef.current, state, error, micError, setLangs, setMic, publishMeetingAudio, stopMeetingAudio };
 }

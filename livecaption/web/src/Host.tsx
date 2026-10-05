@@ -1,5 +1,5 @@
 import QRCode from "qrcode";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 
 import { CaptionView } from "./CaptionView";
 import { createSession, endSession, LANG_LABEL, type HostSession } from "./api";
@@ -41,7 +41,8 @@ export function Host() {
     setSession(null);
   };
 
-  const lines = useMemo(() => store.lines().slice(-6), [store, state, store.size()]);
+  // recomputed every render: the store mutates in place and renders are rAF-throttled
+  const lines = store.lines().slice(-6);
 
   if (session && overlay) {
     // Desktop "subtitle bar": put this window on top of the meeting app.

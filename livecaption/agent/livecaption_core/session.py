@@ -9,7 +9,7 @@ from typing import Sequence
 
 from .broadcast import Broadcaster
 from .models import Caption, Segment, SpeakerInfo, new_segment_id
-from .tracks import UNKNOWN_LABEL, EchoIndex, TrackSpec, TrackState, Word, similarity, word_runs
+from .tracks import UNKNOWN_LABEL, EchoIndex, EchoPolicy, Run, TrackSpec, TrackState, Word, word_runs
 from .translate import TranslationHub
 
 log = logging.getLogger("livecaption.session")
@@ -27,8 +27,7 @@ class SessionConfig:
     echo_hold_s: float = 1.0
     """Echo-guarded (mic) finals wait this long for the meeting-audio copy before being
     shown. Only applies while a diarized track exists."""
-    echo_threshold: float = 0.5
-    echo_window_s: float = 6.0
+    echo: EchoPolicy = field(default_factory=EchoPolicy)
 
 
 class SpeakerLane:
@@ -92,6 +91,8 @@ class _HeldFinal:
     cap: Caption
     seg: Segment
     lane: SpeakerLane
+    at: float
+    """When the mic final arrived (monotonic), for echo timing."""
     task: asyncio.Task | None = None
 
 
@@ -111,9 +112,9 @@ class CaptionSession:
         self._lanes: dict[str, SpeakerLane] = {}
         self._listener_langs: dict[str, frozenset[str]] = {}
         self._tracks: dict[str, TrackState] = {}
-        self._echo = EchoIndex(self.cfg.echo_window_s)
+        self._echo = EchoIndex(self.cfg.echo)
         self._held: dict[str, _HeldFinal] = {}
-        self._shown_guarded: deque[tuple[float, str, str]] = deque(maxlen=32)  # (t, sid, text)
+        self._shown_guarded: deque[tuple[float, str, str]] = deque(maxlen=32)  # (arrived, sid, text)
         self.metrics = {"interims": 0, "finals": 0, "patches": 0, "echo_dropped": 0}
 
     # ------------------------------------------------------------ membership
@@ -173,16 +174,26 @@ class CaptionSession:
     # --------------------------------------------------- track-level captions
 
     def add_track(self, spec: TrackSpec) -> None:
-        if spec.track_id in self._tracks:
+        """Register a track. Re-adding the same track id with a NEW spec (a re-subscribe
+        while the previous pipe is still closing) replaces the state; the old pipe's
+        later remove_track(spec=old) is then a no-op."""
+        st = self._tracks.get(spec.track_id)
+        if st is not None and st.spec is spec:
             return
         self._tracks[spec.track_id] = TrackState(spec)
         if not spec.diarized:
             self.add_speaker(spec.owner)
 
-    async def remove_track(self, track_id: str) -> None:
-        st = self._tracks.pop(track_id, None)
-        if st is None:
+    async def remove_track(self, track_id: str, spec: TrackSpec | None = None) -> None:
+        """`spec`: only remove if the track still belongs to this spec (pipe ownership)."""
+        st = self._tracks.get(track_id)
+        if st is None or (spec is not None and st.spec is not spec):
             return
+        del self._tracks[track_id]
+        if not st.spec.diarized and any(
+            not o.spec.diarized and o.spec.owner.id == st.spec.owner.id for o in self._tracks.values()
+        ):
+            return  # another live track still feeds this speaker
         if st.spec.diarized:
             if st.open is not None and st.open.text:
                 await self.on_track_final(track_id, st.open.text, lang=st.open.lang or None, _state=st)
@@ -261,33 +272,33 @@ class CaptionSession:
         if words and any(w.speaker for w in words):
             runs = word_runs(words, lang or st.spec.owner.lang)
         else:
-            runs = [(speaker_label, text.strip())]
-        runs = [(label, t) for label, t in runs if t]
+            runs = [Run(speaker_label, text.strip(), None)] if text.strip() else []
         if not runs:
             if open_seg is not None:  # the interim line turned out to be nothing
                 await self._bc.send(Caption(kind="retract", sid=open_seg.sid))
             return
-        for i, (label, run_text) in enumerate(runs):
-            lane = self._lane_for(st, label)
+        for i, run in enumerate(runs):
+            lane = self._lane_for(st, run.speaker)
             reuse = open_seg.sid if (i == 0 and open_seg is not None) else None
-            res = lane.on_final(run_text, sid=reuse, lang=lang)
+            res = lane.on_final(run.text, sid=reuse, lang=run.lang or lang)
             if res is None:
                 continue
-            self._echo.add(run_text)
-            await self._suppress_echoes_of(run_text)
+            self._echo.add(run.text)
+            await self._suppress_echoes_of(run.text)
             await self._publish_final(*res, lane)
 
     # ------------------------------------------------------- echo suppression
 
     async def _guarded_final(self, cap: Caption, seg: Segment, lane: SpeakerLane) -> None:
-        if self._echo.matches(seg.text, self.cfg.echo_threshold):
+        now = time.monotonic()
+        if self._echo.matches(seg.text, at=now):
             await self._drop_echo(seg.sid)
             return
         if self.cfg.echo_hold_s <= 0:
-            self._shown_guarded.append((time.monotonic(), seg.sid, seg.text))
+            self._shown_guarded.append((now, seg.sid, seg.text))
             await self._publish_final(cap, seg, lane)
             return
-        held = _HeldFinal(cap, seg, lane)
+        held = _HeldFinal(cap, seg, lane, at=now)
         self._held[seg.sid] = held
         held.task = asyncio.create_task(self._release_held(seg.sid))
 
@@ -296,21 +307,21 @@ class CaptionSession:
         held = self._held.pop(sid, None)
         if held is None:
             return
-        self._shown_guarded.append((time.monotonic(), sid, held.seg.text))
+        self._shown_guarded.append((held.at, sid, held.seg.text))
         await self._publish_final(held.cap, held.seg, held.lane)
 
     async def _suppress_echoes_of(self, remote_text: str) -> None:
-        thr = self.cfg.echo_threshold
+        policy, now = self.cfg.echo, time.monotonic()
         for sid, held in list(self._held.items()):
-            if similarity(held.seg.text, remote_text) >= thr:
+            if policy.is_echo(held.seg.text, remote_text, now - held.at):
                 self._held.pop(sid, None)
                 if held.task:
                     held.task.cancel()
                 await self._drop_echo(sid)
-        now = time.monotonic()
-        for t, sid, text in list(self._shown_guarded):
-            if now - t <= self.cfg.echo_window_s and similarity(text, remote_text) >= thr:
-                self._shown_guarded.remove((t, sid, text))
+        for item in list(self._shown_guarded):
+            at, sid, text = item
+            if policy.is_echo(text, remote_text, now - at):
+                self._shown_guarded.remove(item)
                 await self._drop_echo(sid)
 
     async def _drop_echo(self, sid: str) -> None:
@@ -346,7 +357,7 @@ class CaptionSession:
             if held.task:
                 held.task.cancel()
             self._held.pop(sid, None)
-            self._shown_guarded.append((time.monotonic(), sid, held.seg.text))
+            self._shown_guarded.append((held.at, sid, held.seg.text))
             await self._publish_final(held.cap, held.seg, held.lane)
         for sid in list(self._lanes):
             await self.remove_speaker(sid)

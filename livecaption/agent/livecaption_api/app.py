@@ -41,7 +41,32 @@ if os.getenv("LC_DEV_API_KEY") and not db.account_by_key(os.environ["LC_DEV_API_
 
 # ---- helpers ----------------------------------------------------------------
 
-def _token(identity: str, name: str, room: str, *, role: str, attrs: dict[str, str], ttl_h: int) -> str:
+DEPARTURE_TIMEOUT_S = 300
+"""Keep a room alive this long after its last human leaves (laptop sleep, Wi-Fi drop), so
+a reconnect lands in the same room with the same metadata."""
+
+
+def _room_config(s: dict, meta: dict, max_participants: int) -> api.RoomConfiguration:
+    """Attached to every token of the session: if LiveKit ever auto-creates the room again
+    (all participants left, room deleted, client rejoins), it is recreated with OUR
+    metadata and limits instead of a bare room the agent would not understand."""
+    return api.RoomConfiguration(
+        name=s["room"],
+        metadata=json.dumps(meta),
+        max_participants=max_participants,
+        empty_timeout=600,
+        departure_timeout=DEPARTURE_TIMEOUT_S,
+    )
+
+
+def _max_participants(mode: str, plan: dict) -> int:
+    return 3 if mode == "personal" else plan["max_listeners"] + 10  # personal: owner + agent + reconnect slack
+
+
+def _token(
+    identity: str, name: str, room: str, *, role: str, attrs: dict[str, str], ttl_h: int,
+    room_config: api.RoomConfiguration | None = None,
+) -> str:
     speaker = role == "speaker"
     grants = api.VideoGrants(
         room_join=True,
@@ -50,15 +75,17 @@ def _token(identity: str, name: str, room: str, *, role: str, attrs: dict[str, s
         can_subscribe=True,
         can_publish_data=False,  # only the agent publishes captions
     )
-    return (
+    tok = (
         api.AccessToken(LIVEKIT_API_KEY, LIVEKIT_API_SECRET)
         .with_identity(identity)
         .with_name(name)
         .with_grants(grants)
         .with_attributes({"lc.role": role, **attrs})
         .with_ttl(dt.timedelta(hours=ttl_h))
-        .to_jwt()
     )
+    if room_config is not None:
+        tok = tok.with_room_config(room_config)
+    return tok.to_jwt()
 
 
 def require_account(x_api_key: str = Header(default="")) -> dict:
@@ -112,16 +139,22 @@ async def create_session(body: CreateSession, acc: dict = Depends(require_accoun
     meta = {"targets": targets, "glossary": body.glossary, "session": s["id"], "mode": body.mode}
     if personal:
         meta |= {"owner": host_identity, "remote_lang": body.remote_lang}
+    db.set_meta(s["id"], json.dumps(meta))
+    rc = _room_config(s, meta, _max_participants(body.mode, plan))
     lk = api.LiveKitAPI(LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET)
     try:
         await lk.room.create_room(
             api.CreateRoomRequest(
                 name=s["room"],
-                empty_timeout=600,
-                max_participants=3 if personal else plan["max_listeners"] + 10,  # personal: owner + agent + reconnect slack
-                metadata=json.dumps(meta),
+                empty_timeout=rc.empty_timeout,
+                departure_timeout=rc.departure_timeout,
+                max_participants=rc.max_participants,
+                metadata=rc.metadata,
             )
         )
+    except Exception:
+        db.end_session(s["id"])  # don't leave a dangling session that can never be joined
+        raise HTTPException(503, "caption server unavailable, please retry")
     finally:
         await lk.aclose()
 
@@ -137,7 +170,7 @@ async def create_session(body: CreateSession, acc: dict = Depends(require_accoun
         "targets": targets,
         "host_token": _token(
             host_identity, body.host_name, s["room"], role="speaker",
-            attrs={"lc.lang": body.src_lang, "lc.name": body.host_name}, ttl_h=12,
+            attrs={"lc.lang": body.src_lang, "lc.name": body.host_name}, ttl_h=12, room_config=rc,
         ),
     }
 
@@ -152,12 +185,15 @@ def add_speaker(sid: str, body: SpeakerToken, acc: dict = Depends(require_accoun
     s = db.session_by_id(sid)
     if s is None or s["account_id"] != acc["id"]:
         raise HTTPException(404, "session not found")
+    if s["mode"] == "personal":
+        raise HTTPException(409, "personal sessions have a single owner")
     identity = f"spk-{secrets.token_hex(3)}"
     return {
         "livekit_url": LIVEKIT_URL,
         "room": s["room"],
         "token": _token(identity, body.name, s["room"], role="speaker",
-                        attrs={"lc.lang": body.lang, "lc.name": body.name}, ttl_h=12),
+                        attrs={"lc.lang": body.lang, "lc.name": body.name}, ttl_h=12,
+                        room_config=_session_room_config(s, acc)),
     }
 
 
@@ -168,6 +204,12 @@ def end_session(sid: str, acc: dict = Depends(require_account)) -> dict:
         raise HTTPException(404, "session not found")
     db.end_session(sid)
     return {"ok": True}
+
+
+def _session_room_config(s: dict, acc: dict | None = None) -> api.RoomConfiguration:
+    meta = json.loads(s.get("meta") or "{}")
+    plan = PLANS[(acc or db.account_by_id(s["account_id"]) or {"plan": "free"})["plan"]]
+    return _room_config(s, meta, _max_participants(s["mode"], plan))
 
 
 @app.get("/api/join/{code}")
@@ -184,7 +226,8 @@ def join(code: str, langs: str = "en") -> dict:
         "title": s["title"],
         "src_lang": s["src_lang"],
         "targets": s["targets"].split(","),
-        "token": _token(identity, "listener", s["room"], role="listener", attrs={"lc.langs": wanted}, ttl_h=6),
+        "token": _token(identity, "listener", s["room"], role="listener", attrs={"lc.langs": wanted}, ttl_h=6,
+                        room_config=_session_room_config(s)),
     }
 
 

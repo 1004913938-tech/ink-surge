@@ -73,7 +73,7 @@ async def test_final_spanning_speaker_change_is_split():
 
 def test_word_runs_joins_cjk_without_spaces():
     runs = word_runs([Word("我们", "S0"), Word("下季度", "S0"), Word("好的", "S1")], "zh")
-    assert runs == [("S0", "我们下季度"), ("S1", "好的")]
+    assert [(r.speaker, r.text) for r in runs] == [("S0", "我们下季度"), ("S1", "好的")]
 
 
 async def test_per_utterance_language_controls_translation():
@@ -193,3 +193,78 @@ def test_similarity_bounds():
     assert similarity("Selamat pagi!", "selamat pagi") == 1.0
     assert similarity("你好世界", "完全不同的话") == 0.0
     assert similarity("", "x") == 0.0
+
+
+# ---------------------------------------------------------------- review regressions
+
+async def test_unrelated_same_language_reply_is_not_dropped_as_echo():
+    # review #0: bigram-set Dice matched these at 0.54 and silently dropped my reply
+    sess, sink, hub = personal(echo_hold_s=0.1)
+    sess.add_track(TrackSpec("mic", ME, echo_guard=True))
+    await sess.on_track_final("sys", "So the plan is to deliver the first container next week and the second one "
+                                     "at the end of the month.", speaker_label="S0", lang="en")
+    await sess.on_track_final("mic", "Okay, then we need the payment of thirty percent before the first container "
+                                     "leaves the port.", lang="en")
+    await asyncio.sleep(0.2)
+    await sess.on_track_final("sys", "Can you confirm the price for the second container and when we should expect "
+                                     "the invoice?", speaker_label="S1", lang="en")
+    await hub.drain()
+    mine = [m for m in sink.messages if m["kind"] == "final" and m["spk"]["id"] == "me"]
+    assert len(mine) == 1 and sess.metrics["echo_dropped"] == 0
+    assert not any(m["kind"] == "retract" for m in sink.messages)
+
+
+async def test_short_reply_only_dropped_when_simultaneous():
+    sess, sink, hub = personal(echo_hold_s=0.05)
+    sess.add_track(TrackSpec("mic", ME, echo_guard=True))
+    await sess.on_track_final("sys", "OK.", speaker_label="S0", lang="en")
+    await sess.on_track_final("mic", "OK", lang="en")          # same instant -> echo
+    assert sess.metrics["echo_dropped"] == 1
+    sess._echo._items.clear()
+    sess._echo.add("好的。", at=__import__("time").monotonic() - 2.5)  # said 2.5 s ago by someone else
+    await sess.on_track_final("mic", "好的", lang="zh")          # my own 好的 -> keep
+    await asyncio.sleep(0.1)
+    await hub.drain()
+    assert sess.metrics["echo_dropped"] == 1
+    assert any(m["kind"] == "final" and m["spk"]["id"] == "me" and m["src"]["text"] == "好的" for m in sink.messages)
+
+
+async def test_split_runs_keep_their_own_language():
+    # review #1/#5: both runs used to inherit the endpoint's majority language (zh)
+    sess, sink, hub = personal()
+    words = [Word("我们这边没问题，", "S0", "zh"), Word("What", "S1", "en"), Word("about", "S1", "en"),
+             Word("the", "S1", "en"), Word("payment?", "S1", "en")]
+    await sess.on_track_final("sys", "我们这边没问题，What about the payment?", words=words, lang="zh")
+    await hub.drain()
+    finals = [m for m in sink.messages if m["kind"] == "final"]
+    patches = {m["sid"]: m for m in sink.messages if m["kind"] == "patch"}
+    assert [(f["src"]["lang"], f["src"]["text"]) for f in finals] == [
+        ("zh", "我们这边没问题，"), ("en", "What about the payment?")]
+    assert patches[finals[0]["sid"]]["tr"] == {}                          # zh for a zh reader
+    assert patches[finals[1]["sid"]]["tr"] == {"zh": "[zh] What about the payment?"}
+
+
+async def test_labels_from_a_new_stt_connection_get_new_lanes():
+    # review #2/#4: the worker namespaces labels by connection generation ("<gen>:<label>")
+    sess, sink, hub = personal()
+    await sess.on_track_final("sys", "Saya Budi.", speaker_label="1:S0", lang="id")
+    await sess.on_track_final("sys", "I am Alice.", speaker_label="1:S1", lang="en")
+    await sess.on_track_final("sys", "Still Alice here.", speaker_label="2:S0", lang="en")  # after reconnect
+    await hub.drain()
+    finals = [(m["spk"]["id"], m["spk"]["name"]) for m in sink.messages if m["kind"] == "final"]
+    assert finals[2][0] != finals[0][0] and finals[2][1] == "说话人 3"
+
+
+async def test_resubscribe_while_old_pipe_closes_keeps_new_state():
+    # review #3: old pipe's late remove_track must not delete the new pipe's state
+    sess, sink, hub = personal()
+    old = TrackSpec("t1", MEETING, diarized=True)
+    sess.add_track(old)
+    new = TrackSpec("t1", MEETING, diarized=True)  # equal fields, different pipe
+    sess.add_track(new)
+    await sess.remove_track("t1", spec=old)          # old pipe finishes closing
+    await sess.on_track_final("t1", "masih jalan", speaker_label="1:S0", lang="id")
+    await hub.drain()
+    assert any(m["kind"] == "final" and m["src"]["text"] == "masih jalan" for m in sink.messages)
+    await sess.remove_track("t1", spec=new)
+    assert "t1" not in sess._tracks

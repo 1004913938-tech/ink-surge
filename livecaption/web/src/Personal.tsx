@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import { CaptionView } from "./CaptionView";
 import { createSession, endSession, LANG_LABEL, type HostSession } from "./api";
@@ -31,7 +31,7 @@ export function Personal() {
   const [, bump] = useState(0);
   const namesRef = useRef<SpeakerNames | null>(null);
 
-  const { store, state, error, publishMeetingAudio, stopMeetingAudio } = useCaptionRoom(
+  const { store, state, error, micError, publishMeetingAudio, stopMeetingAudio } = useCaptionRoom(
     session?.livekit_url ?? null, session?.host_token ?? null, { mic: withMic, micOptions: MIC_CONSTRAINTS },
   );
 
@@ -78,6 +78,28 @@ export function Personal() {
     setSession(null);
   };
 
+  // LiveKit stops the published track on disconnect WITHOUT firing 'ended'; release the
+  // screen capture ourselves so Chrome's sharing bar goes away and the UI tells the truth.
+  const captureRef = useRef<MeetingCapture | null>(null);
+  captureRef.current = capture;
+  const pipRef = useRef<Window | null>(null);
+  pipRef.current = pipWin;
+  useEffect(() => {
+    if (state === "disconnected" || state === "error") {
+      captureRef.current?.stop();
+      setCapture(null);
+    }
+  }, [state]);
+  useEffect(() => () => { captureRef.current?.stop(); pipRef.current?.close(); }, []);
+
+  const restart = async () => {
+    captureRef.current?.stop();
+    setCapture(null);
+    pipWin?.close();
+    setSession(null);
+    await start();
+  };
+
   const float = async () => {
     try { setPipWin(await openPip()); } catch (e) { setErr(String((e as Error).message ?? e)); }
   };
@@ -89,7 +111,8 @@ export function Personal() {
     if (n !== null && namesRef.current) { namesRef.current.rename(l.speakerId, n); bump((x) => x + 1); }
   };
 
-  const lines = useMemo(() => store.lines().slice(-30), [store, state, store.size()]); // eslint-disable-line react-hooks/exhaustive-deps
+  // recomputed every render: the store mutates in place and renders are rAF-throttled
+  const lines = store.lines().slice(-30);
   const latest = lines.slice(-3);
 
   const toggleRead = (l: string) =>
@@ -152,6 +175,10 @@ export function Personal() {
           </div>
         )}
         <div className="small">连接：{state}{error ? ` — ${error}` : ""} · 点说话人名字可以改名</div>
+        {(state === "disconnected" || state === "error") && (
+          <div className="err">连接已断开，字幕已停止。<button onClick={restart}>重新开始</button></div>
+        )}
+        {micError && <div className="small warn">麦克风没有打开（{micError}），只显示会议里别人的话。</div>}
         {pipWin && <div className="small warn">提示：你在会议里共享屏幕时，悬浮字幕窗也会被别人看到。共享前请关闭它，或只共享某个窗口。</div>}
         <div className="actions"><button className="danger" onClick={stop}>结束</button></div>
         {err && <p className="err">{err}</p>}

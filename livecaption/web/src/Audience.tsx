@@ -32,7 +32,8 @@ export function Audience({ code }: { code: string }) {
     pushLangs(next).catch(() => {});
   };
 
-  const lines = useMemo(() => store.lines().slice(-8), [store, state, store.size()]);
+  // recomputed every render: the store mutates in place and renders are rAF-throttled
+  const lines = store.lines().slice(-8);
   const choices = useMemo(() => {
     const base = new Set([...(info?.targets ?? []), ...langs, "en", "id", "zh", "ja", "ko", "th", "vi", "ms"]);
     base.delete(info?.src_lang ?? "");

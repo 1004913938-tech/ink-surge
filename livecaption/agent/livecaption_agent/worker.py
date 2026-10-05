@@ -75,6 +75,10 @@ class TrackPipe:
         self._track = track
         self._task: asyncio.Task | None = None
         self._closed = False
+        self._gen = 0
+        """STT connection generation. Providers number speakers per connection (S0, "1"…),
+        so labels are namespaced by generation: after a reconnect a new voice gets a new
+        说话人 N instead of inheriting someone else's lane and local rename."""
 
     def start(self) -> None:
         self._session.add_track(self.spec)
@@ -88,7 +92,7 @@ class TrackPipe:
                 await self._task
             except (asyncio.CancelledError, Exception):
                 pass
-        await self._session.remove_track(self.spec.track_id)
+        await self._session.remove_track(self.spec.track_id, spec=self.spec)
 
     async def _run(self) -> None:
         backoff = 0.5
@@ -110,6 +114,8 @@ class TrackPipe:
             track=self._track, sample_rate=self._cfg.stt_sample_rate, num_channels=1
         )
         stream = stt_impl.stream()
+        self._gen += 1
+        self._watch_reconnects(stream)
 
         async def pump_audio() -> None:
             try:
@@ -124,19 +130,45 @@ class TrackPipe:
                 if not ev.alternatives:
                     continue
                 alt = ev.alternatives[0]
-                lang = base_lang(alt.language) if self.spec.owner.lang == AUTO_LANG else None
+                auto = self.spec.owner.lang == AUTO_LANG
+                lang = base_lang(alt.language) if auto else None
+                label = self._label(alt.speaker_id)
                 if ev.type in (stt.SpeechEventType.INTERIM_TRANSCRIPT, stt.SpeechEventType.PREFLIGHT_TRANSCRIPT):
-                    await self._session.on_track_interim(tid, alt.text, speaker_label=alt.speaker_id, lang=lang)
+                    await self._session.on_track_interim(tid, alt.text, speaker_label=label, lang=lang)
                 elif ev.type == stt.SpeechEventType.FINAL_TRANSCRIPT:
-                    words = [Word(str(w), getattr(w, "speaker_id", None)) for w in (alt.words or [])]
+                    words = [
+                        Word(str(w), self._label(getattr(w, "speaker_id", None)),
+                             base_lang(getattr(w, "language", None)) if auto else None)
+                        for w in (alt.words or [])
+                    ]
                     await self._session.on_track_final(
-                        tid, alt.text, speaker_label=alt.speaker_id, words=words or None, lang=lang
+                        tid, alt.text, speaker_label=label, words=words or None, lang=lang
                     )
         finally:
             pump.cancel()
             await audio.aclose()
             await stream.aclose()
             await stt_impl.aclose()
+
+
+    def _label(self, speaker_id: str | None) -> str | None:
+        if not speaker_id or speaker_id in ("UU", "UNKNOWN"):  # Speechmatics / AssemblyAI "unattributed"
+            return None
+        return f"{self._gen}:{speaker_id}"
+
+    def _watch_reconnects(self, stream: stt.RecognizeStream) -> None:
+        """Plugins reconnect inside the same stream (Deepgram/Soniox/AssemblyAI open a new
+        websocket via _connect_ws after a drop or a retried error). Bump the generation
+        on every connect so their restarted speaker numbering is not mixed with ours."""
+        connect = getattr(stream, "_connect_ws", None)
+        if connect is None:
+            return
+
+        async def connect_and_bump(*args, **kwargs):
+            self._gen += 1
+            return await connect(*args, **kwargs)
+
+        stream._connect_ws = connect_and_bump  # type: ignore[method-assign]
 
 
 class RoomCaptioner:
@@ -147,11 +179,19 @@ class RoomCaptioner:
         meta = self._parse_metadata(ctx.room.metadata)
         glossary = meta.get("glossary", {}) or {}
         targets = frozenset(meta.get("targets") or cfg.base_targets)
-        self.personal = meta.get("mode") == "personal"
+        mode = meta.get("mode")
+        self.personal = mode == "personal"
         self._owner = meta.get("owner") or None
         self._remote_lang = meta.get("remote_lang") or AUTO_LANG
+        # Fail closed: only caption rooms the API created with an explicit mode. A room
+        # LiveKit re-created without our metadata must never fall back to broadcasting
+        # someone's private meeting to everyone in it.
+        self.enabled = mode == "broadcast" or (self.personal and bool(self._owner))
+        if not self.enabled:
+            log.error("room %s has no valid LiveCaption metadata (mode=%r owner=%r); not captioning",
+                      ctx.room.name, mode, self._owner)
 
-        sink = LiveKitSink(self._room, [self._owner] if (self.personal and self._owner) else None)
+        sink = LiveKitSink(self._room, [self._owner] if self.personal else None)
         self._bc = Broadcaster(sink, interim_hz=cfg.interim_hz)
         self._hub = TranslationHub(
             make_translator(cfg, glossary),
@@ -249,6 +289,8 @@ class RoomCaptioner:
     # ---- lifecycle ----------------------------------------------------------
 
     async def run(self) -> None:
+        if not self.enabled:
+            return
         self.bind()
         await self._session.reset()  # tells clients a (re)start happened
         meter = asyncio.create_task(self._meter_usage())

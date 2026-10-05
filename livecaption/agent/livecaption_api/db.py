@@ -30,13 +30,15 @@ CREATE TABLE IF NOT EXISTS sessions (
   created_at REAL NOT NULL,
   ended_at REAL,
   minutes INTEGER NOT NULL DEFAULT 0,
-  mode TEXT NOT NULL DEFAULT 'broadcast'
+  mode TEXT NOT NULL DEFAULT 'broadcast',
+  meta TEXT NOT NULL DEFAULT '{}'
 );
 """
 
 # Columns added after first release: (table, column, DDL). Applied idempotently.
 MIGRATIONS = [
     ("sessions", "mode", "ALTER TABLE sessions ADD COLUMN mode TEXT NOT NULL DEFAULT 'broadcast'"),
+    ("sessions", "meta", "ALTER TABLE sessions ADD COLUMN meta TEXT NOT NULL DEFAULT '{}'"),
 ]
 
 PLANS = {
@@ -92,6 +94,11 @@ class Database:
             row = c.execute("SELECT * FROM accounts WHERE api_key=?", (api_key,)).fetchone()
         return dict(row) if row else None
 
+    def account_by_id(self, account_id: str) -> dict | None:
+        with self.conn() as c:
+            row = c.execute("SELECT * FROM accounts WHERE id=?", (account_id,)).fetchone()
+        return dict(row) if row else None
+
     def set_plan(self, account_id: str, plan: str) -> None:
         with self.conn() as c:
             c.execute(
@@ -102,9 +109,10 @@ class Database:
     # ---- sessions ----------------------------------------------------------
 
     def create_session(
-        self, account_id: str, title: str, src_lang: str, targets: list[str], mode: str = "broadcast"
+        self, account_id: str, title: str, src_lang: str, targets: list[str], mode: str = "broadcast",
+        sid: str | None = None,
     ) -> dict:
-        sid = "ses_" + secrets.token_hex(5)
+        sid = sid or "ses_" + secrets.token_hex(5)
         s = {
             "id": sid,
             "account_id": account_id,
@@ -117,13 +125,19 @@ class Database:
             "ended_at": None,
             "minutes": 0,
             "mode": mode,
+            "meta": "{}",
         }
         with self.conn() as c:
             c.execute(
-                "INSERT INTO sessions VALUES (:id,:account_id,:room,:join_code,:title,:src_lang,:targets,:created_at,:ended_at,:minutes,:mode)",
+                "INSERT INTO sessions (id,account_id,room,join_code,title,src_lang,targets,created_at,ended_at,minutes,mode,meta)"
+                " VALUES (:id,:account_id,:room,:join_code,:title,:src_lang,:targets,:created_at,:ended_at,:minutes,:mode,:meta)",
                 s,
             )
         return s
+
+    def set_meta(self, sid: str, meta: str) -> None:
+        with self.conn() as c:
+            c.execute("UPDATE sessions SET meta=? WHERE id=?", (meta, sid))
 
     def session_by_code(self, code: str) -> dict | None:
         with self.conn() as c:
