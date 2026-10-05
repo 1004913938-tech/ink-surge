@@ -165,6 +165,7 @@ Chromium 全浏览器只有一个画中画窗口（与 `<video>` PiP 共用）�
 - `patch`：只带 `sid` + `tr` + `tr_status`。
 - `reset`：agent 重启或会话切换，客户端清空。
 - `retract`：撤回一行（回声重复、或 STT 放弃的临时句）。客户端删除该 sid，并忽略它之后的任何消息。
+- `status`：链路状态，`{"status": {"code": "stt_unavailable", "msg": "识别服务账户余额不足，字幕已暂停。…"}}`，页面显示为横幅；`code: "ok"` 或 `reset` 清除。识别服务返回不可重试的 4xx（401/402/403）时发送，之后每 60 秒重试一次，恢复后的第一个识别事件发 `ok`。
 - 个人模式下，同一 sid 的 interim 与 final 的 `spk` 可以不同（占位"会议声音" → "说话人 N"），客户端以 final 为准。
 
 ---

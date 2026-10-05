@@ -10,7 +10,7 @@ export type TrStatus = "ok" | "pending" | "failed" | "late" | "skipped";
 
 export interface CaptionMsg {
   v: number;
-  kind: "interim" | "final" | "patch" | "reset" | "retract";
+  kind: "interim" | "final" | "patch" | "reset" | "retract" | "status";
   sid: string;
   seq: number;
   t: number;
@@ -18,6 +18,8 @@ export interface CaptionMsg {
   src?: { lang: string; text: string };
   tr?: Record<string, string>;
   tr_status?: TrStatus;
+  /** kind="status": pipeline health, e.g. the STT account is out of credit. code "ok" clears it. */
+  status?: { code: string; msg: string };
 }
 
 export interface Line {
@@ -38,6 +40,8 @@ export class CaptionStore {
   private order: string[] = []; // sids in first-seen order (cheap recency)
   private retracted = new Set<string>(); // never resurrect a line the agent withdrew
   readonly maxLines: number;
+  /** Why captions are paused (shown as a banner), or null when everything works. */
+  status: { code: string; msg: string } | null = null;
 
   constructor(maxLines = 200) {
     this.maxLines = maxLines;
@@ -48,6 +52,11 @@ export class CaptionStore {
       this.bySid.clear();
       this.order = [];
       this.retracted.clear();
+      this.status = null;
+      return;
+    }
+    if (msg.kind === "status") {
+      this.status = !msg.status || msg.status.code === "ok" ? null : msg.status;
       return;
     }
     if (msg.kind === "retract") {

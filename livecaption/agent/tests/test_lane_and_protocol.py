@@ -104,3 +104,11 @@ async def test_final_cancels_pending_interim_of_same_line_under_other_speaker_ke
     await asyncio.sleep(0.3)
     assert [m["kind"] for m in sink.messages] == ["interim", "final"]
     await bc.aclose()
+
+
+def test_status_message_wire_format():
+    from livecaption_core.models import Caption
+
+    d = Caption(kind="status", sid="", status={"code": "stt_unavailable", "msg": "余额不足"}).to_dict()
+    assert d["kind"] == "status" and d["status"] == {"code": "stt_unavailable", "msg": "余额不足"}
+    assert "src" not in d and "tr" not in d

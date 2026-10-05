@@ -115,5 +115,7 @@ web/                      主持人控制台 + 听众页（React）
 2. **登录**：主持人用 API Key；邮箱 OTP 注册是 Phase 2。
 3. **STT 后端**：Deepgram 已接；阿里 Paraformer、sherpa-onnx 本地识别接口已留位（`providers.py`）。
 4. **中文识别准确率**：行业术语靠 `glossary`（创建会议时传）+ `LC_DOMAIN_HINT`；需要热词时切 Paraformer。
-5. **代理环境**：`livekit-agents` 只读 `HTTPS_PROXY`，不认 `NO_PROXY`。如果机器上设了全局代理，启动 agent 时去掉代理变量，否则连不上本机 LiveKit（报 405）。
-6. **已验证范围**：核心单测、LiveKit 真机 e2e（Python 客户端）、Chromium 浏览器 e2e（演示模式）。真实 Deepgram + Claude 的联调需要你的 API Key，尚未跑。
+5. **代理环境**：需要代理才能访问 Soniox / Deepgram 时，设 `HTTPS_PROXY`，并把 LiveKit 的主机名加进 `NO_PROXY`（如 `NO_PROXY=localhost,livekit`）。agent 连 LiveKit 遵守 `NO_PROXY`，连识别服务走代理。
+6. **识别服务欠费 / Key 无效**：agent 不再反复重连，页面顶部提示"识别服务账户余额不足，字幕已暂停"，之后每 60 秒自动重试，充值后自动恢复。
+7. **已验证范围**：核心单测、LiveKit 真机 e2e（Python 客户端）、Chromium 浏览器 e2e（演示模式）、真实 Soniox 连通与鉴权（2026-10-05，账户余额耗尽，识别质量未测，见 `docs/test-report-soniox-2026-10-05.md`）。
+   识别质量测评：`python tests/make_meeting_audio.py /tmp/meeting && python tests/e2e_soniox_personal.py /tmp/meeting result.json`（6 人中/印尼/英 TTS 会议，统计说话人分离、语种、延迟）。

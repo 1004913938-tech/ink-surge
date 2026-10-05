@@ -220,6 +220,7 @@ export function Personal() {
         {(state === "disconnected" || state === "error") && (
           <div className="err">连接已断开，字幕已停止。<button onClick={restart}>重新开始</button></div>
         )}
+        {store.status && <div className="err">⚠ {store.status.msg || store.status.code}</div>}
         {micError && <div className="small warn">麦克风没有打开（{micError}），只显示会议里别人的话。</div>}
         {pipWin && <div className="small warn">提示：你在会议里共享屏幕时，悬浮字幕窗也会被别人看到。共享前请关闭它，或只共享某个窗口。</div>}
         {capture && !pipWin && pipSupported() && (
@@ -231,6 +232,7 @@ export function Personal() {
       <CaptionView lines={lines} langs={session.targets} nameOf={nameOf} onRename={rename} translationFirst size={size} />
       {pipWin && (
         <PipPortal win={pipWin} onClose={closePip}>
+          {store.status && <div className="err">⚠ {store.status.msg || store.status.code}</div>}
           <CaptionView lines={latest} langs={session.targets} nameOf={nameOf} compact translationFirst size={size} />
         </PipPortal>
       )}

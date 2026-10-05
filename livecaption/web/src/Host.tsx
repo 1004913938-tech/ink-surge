@@ -77,6 +77,7 @@ export function Host() {
           </fieldset>
           <button disabled={busy || !apiKey}>{busy ? "正在创建…" : "开始会议"}</button>
           {err && <p className="err">{err}</p>}
+          {store.status && <p className="err">⚠ {store.status.msg || store.status.code}</p>}
         </form>
       ) : (
         <>

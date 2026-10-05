@@ -350,6 +350,11 @@ class CaptionSession:
     async def reset(self) -> None:
         await self._bc.send(Caption(kind="reset", sid=""))
 
+    async def notice(self, code: str, msg: str = "") -> None:
+        """Pipeline health for the user ("ok" clears it): e.g. the STT account is out of
+        credit, so the page says why no captions appear instead of staying blank."""
+        await self._bc.send(Caption(kind="status", sid="", status={"code": code, "msg": msg}))
+
     async def aclose(self) -> None:
         for tid in list(self._tracks):
             await self.remove_track(tid)

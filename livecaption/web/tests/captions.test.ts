@@ -78,3 +78,16 @@ test("speaker colours: distinct by first appearance, placeholder grey", async ()
   assert.equal(speakerColor("t#1:S0"), colours[0]); // stable
   assert.equal(speakerColor("host-1:meeting"), "#6b7280");
 });
+
+test("status banner: set by status, cleared by ok and by reset; lines untouched", () => {
+  const s = new CaptionStore();
+  s.apply(msg({ sid: "a" }));
+  s.apply({ v: 1, kind: "status", sid: "", seq: 0, t: 2, status: { code: "stt_unavailable", msg: "余额不足" } });
+  assert.deepEqual(s.status, { code: "stt_unavailable", msg: "余额不足" });
+  assert.equal(s.size(), 1);
+  s.apply({ v: 1, kind: "status", sid: "", seq: 0, t: 3, status: { code: "ok", msg: "" } });
+  assert.equal(s.status, null);
+  s.apply({ v: 1, kind: "status", sid: "", seq: 0, t: 4, status: { code: "stt_unavailable", msg: "x" } });
+  s.apply({ v: 1, kind: "reset", sid: "", seq: 0, t: 5 });
+  assert.equal(s.status, null);
+});

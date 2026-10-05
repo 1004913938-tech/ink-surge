@@ -21,7 +21,7 @@ from urllib.parse import urlparse
 
 import aiohttp
 from livekit import rtc
-from livekit.agents import AutoSubscribe, JobContext, WorkerOptions, cli, stt
+from livekit.agents import APIStatusError, AutoSubscribe, JobContext, WorkerOptions, cli, stt
 from livekit.agents.language import LanguageCode
 
 from livecaption_core import (
@@ -41,6 +41,19 @@ from .providers import make_stt, make_translator
 log = logging.getLogger("livecaption.worker")
 
 MEETING_AUDIO_NAME = "会议声音"
+FATAL_RETRY_S = 60.0
+"""Retry interval after an error that retrying soon cannot fix (bad key, no credit)."""
+
+
+def stt_fatal_message(e: BaseException) -> str | None:
+    """User-facing reason for an STT error that will not heal by reconnecting, else None."""
+    if not isinstance(e, APIStatusError) or e.retryable or not 400 <= e.status_code < 500:
+        return None
+    if e.status_code == 402:
+        return "识别服务账户余额不足，字幕已暂停。充值后会自动恢复。"
+    if e.status_code in (401, 403):
+        return "识别服务的 API Key 无效或没有权限，字幕已暂停。请检查服务器配置。"
+    return f"识别服务拒绝了请求（{e.status_code}），字幕已暂停，稍后自动重试。"
 
 
 class LiveKitSink:
@@ -78,6 +91,8 @@ class TrackPipe:
         self._track = track
         self._task: asyncio.Task | None = None
         self._closed = False
+        self._failing = False
+        """A fatal STT error was reported to the user; cleared (status "ok") on recovery."""
         self._gen = 0
         """STT connection generation. Providers number speakers per connection (S0, "1"…),
         so labels are namespaced by generation: after a reconnect a new voice gets a new
@@ -105,7 +120,16 @@ class TrackPipe:
                 return  # audio stream ended normally (track unpublished)
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception as e:
+                if (msg := stt_fatal_message(e)) is not None:
+                    # Reconnecting every few seconds cannot fix a bad key or an empty
+                    # balance: tell the user, then probe rarely so a top-up resumes captions.
+                    log.error("STT pipe %s: %s; retrying in %.0fs", self.spec.track_id, e, FATAL_RETRY_S)
+                    if not self._failing:
+                        self._failing = True
+                        await self._session.notice("stt_unavailable", msg)
+                    await asyncio.sleep(FATAL_RETRY_S)
+                    continue
                 log.exception("STT pipe %s crashed; restarting in %.1fs", self.spec.track_id, backoff)
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 10)
@@ -133,6 +157,9 @@ class TrackPipe:
         pump = asyncio.create_task(pump_audio())
         try:
             async for ev in stream:
+                if self._failing:
+                    self._failing = False
+                    await self._session.notice("ok")
                 if not ev.alternatives:
                     continue
                 alt = ev.alternatives[0]

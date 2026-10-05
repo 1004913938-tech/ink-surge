@@ -5,7 +5,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Literal
 
-Kind = Literal["interim", "final", "patch", "reset", "retract"]
+Kind = Literal["interim", "final", "patch", "reset", "retract", "status"]
 TrStatus = Literal["ok", "pending", "failed", "late", "skipped"]
 
 PROTOCOL_VERSION = 1
@@ -59,6 +59,8 @@ class Caption:
     tr: dict[str, str] = field(default_factory=dict)
     tr_status: TrStatus = "pending"
     t: float = field(default_factory=time.time)
+    status: dict[str, str] | None = None
+    """kind="status": {"code": "ok" | "stt_unavailable" | ..., "msg": shown to the user}."""
 
     def to_dict(self) -> dict:
         d: dict = {
@@ -70,6 +72,8 @@ class Caption:
         }
         if self.kind in ("reset", "retract"):
             return d
+        if self.kind == "status":
+            return d | {"status": dict(self.status or {})}
         if self.spk is not None:
             d["spk"] = {"id": self.spk.id, "name": self.spk.name}
         if self.kind != "patch":
