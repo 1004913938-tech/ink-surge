@@ -7,9 +7,11 @@ stack works out of the box; email-OTP signup is Phase 2 (ARCHITECTURE.md §5).
 from __future__ import annotations
 
 import datetime as dt
+import json
 import os
 import secrets
 import time
+from typing import Literal
 
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -72,8 +74,15 @@ class CreateSession(BaseModel):
     title: str = "Meeting"
     host_name: str = "Host"
     src_lang: str = "zh"
+    """Language the host speaks (their microphone)."""
     targets: list[str] = Field(default_factory=lambda: ["en", "id"])
+    """broadcast: languages shown on the host desktop besides the source.
+    personal: languages the user wants to READ (e.g. ["zh"] to understand everyone in Chinese)."""
     glossary: dict[str, str] = Field(default_factory=dict)
+    mode: Literal["broadcast", "personal"] = "broadcast"
+    """personal: captions of the meeting's system audio, visible only to the host; no join code."""
+    remote_lang: str = "auto"
+    """personal: what the other participants speak, or "auto" to detect per utterance."""
 
 
 @app.get("/api/plans")
@@ -91,33 +100,40 @@ async def create_session(body: CreateSession, acc: dict = Depends(require_accoun
     plan = PLANS[acc["plan"]]
     if acc["minutes_used"] >= acc["minutes_quota"]:
         raise HTTPException(402, "plan minutes exhausted; upgrade to continue")
-    targets = [t for t in body.targets if t != body.src_lang][: plan["max_langs"]]
-    s = db.create_session(acc["id"], body.title, body.src_lang, targets)
+    personal = body.mode == "personal"
+    if personal:
+        targets = list(dict.fromkeys(body.targets))[: plan["max_langs"]]
+    else:
+        targets = [t for t in body.targets if t != body.src_lang][: plan["max_langs"]]
+    s = db.create_session(acc["id"], body.title, body.src_lang, targets, mode=body.mode)
+    host_identity = f"host-{secrets.token_hex(3)}"
 
     # Room metadata is how the agent learns targets + glossary (ARCHITECTURE.md §2).
-    import json
-
+    meta = {"targets": targets, "glossary": body.glossary, "session": s["id"], "mode": body.mode}
+    if personal:
+        meta |= {"owner": host_identity, "remote_lang": body.remote_lang}
     lk = api.LiveKitAPI(LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET)
     try:
         await lk.room.create_room(
             api.CreateRoomRequest(
                 name=s["room"],
                 empty_timeout=600,
-                max_participants=plan["max_listeners"] + 10,
-                metadata=json.dumps({"targets": targets, "glossary": body.glossary, "session": s["id"]}),
+                max_participants=3 if personal else plan["max_listeners"] + 10,  # personal: owner + agent + reconnect slack
+                metadata=json.dumps(meta),
             )
         )
     finally:
         await lk.aclose()
 
-    host_identity = f"host-{secrets.token_hex(3)}"
     return {
         "session_id": s["id"],
+        "mode": body.mode,
         "room": s["room"],
-        "join_code": s["join_code"],
-        "join_url": f"{PUBLIC_WEB_URL}/#/j/{s['join_code']}",
+        "join_code": None if personal else s["join_code"],
+        "join_url": None if personal else f"{PUBLIC_WEB_URL}/#/j/{s['join_code']}",
         "livekit_url": LIVEKIT_URL,
         "src_lang": body.src_lang,
+        "remote_lang": body.remote_lang if personal else None,
         "targets": targets,
         "host_token": _token(
             host_identity, body.host_name, s["room"], role="speaker",

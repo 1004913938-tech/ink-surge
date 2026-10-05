@@ -10,7 +10,7 @@ export type TrStatus = "ok" | "pending" | "failed" | "late" | "skipped";
 
 export interface CaptionMsg {
   v: number;
-  kind: "interim" | "final" | "patch" | "reset";
+  kind: "interim" | "final" | "patch" | "reset" | "retract";
   sid: string;
   seq: number;
   t: number;
@@ -36,6 +36,7 @@ export interface Line {
 export class CaptionStore {
   private bySid = new Map<string, Line>();
   private order: string[] = []; // sids in first-seen order (cheap recency)
+  private retracted = new Set<string>(); // never resurrect a line the agent withdrew
   readonly maxLines: number;
 
   constructor(maxLines = 200) {
@@ -46,8 +47,16 @@ export class CaptionStore {
     if (msg.kind === "reset") {
       this.bySid.clear();
       this.order = [];
+      this.retracted.clear();
       return;
     }
+    if (msg.kind === "retract") {
+      // echo of the meeting audio picked up by the mic, or an utterance the STT dropped
+      this.retracted.add(msg.sid);
+      if (this.bySid.delete(msg.sid)) this.order = this.order.filter((s) => s !== msg.sid);
+      return;
+    }
+    if (this.retracted.has(msg.sid)) return;
     const existing = this.bySid.get(msg.sid);
     if (msg.kind === "patch") {
       if (!existing) return; // patch for a line we never saw (joined late): ignore
@@ -61,10 +70,17 @@ export class CaptionStore {
       // after final (stale) must not reopen a final line.
       if (existing.final && msg.kind === "interim") return;
       existing.text = msg.src.text;
-      existing.final = existing.final || msg.kind === "final";
+      existing.srcLang = msg.src.lang || existing.srcLang;
+      if (msg.kind === "final") {
+        // Diarized meeting audio: the interim line is unattributed ("会议声音"); its
+        // final names the real speaker and their seq. Position (t) stays put.
+        existing.final = true;
+        existing.speakerId = msg.spk.id;
+        existing.speakerName = msg.spk.name;
+        existing.seq = msg.seq;
+      }
       if (msg.tr && Object.keys(msg.tr).length) existing.tr = { ...existing.tr, ...msg.tr };
       if (msg.tr_status) existing.trStatus = msg.tr_status;
-      existing.t = msg.t;
       return;
     }
     this.bySid.set(msg.sid, {

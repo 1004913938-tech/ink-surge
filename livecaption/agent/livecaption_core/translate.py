@@ -203,7 +203,7 @@ class TranslationHub:
     async def _translate_with_policy(
         self, seg: Segment, targets: tuple[str, ...], context: tuple[str, ...]
     ) -> None:
-        key = (seg.text, seg.speaker.lang, targets)
+        key = (seg.text, seg.src_lang, targets)
         cached = self._cache.get(key)
         if cached is not None:
             self._cache.move_to_end(key)
@@ -249,7 +249,7 @@ class TranslationHub:
                     result = await asyncio.wait_for(
                         self._tr.translate(
                             seg.text,
-                            seg.speaker.lang,
+                            seg.src_lang,
                             targets,
                             glossary=self._glossary or None,
                             context=context,

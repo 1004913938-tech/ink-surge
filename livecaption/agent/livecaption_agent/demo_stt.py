@@ -1,8 +1,12 @@
 """Keyless STT for demos and integration tests (LC_STT=demo).
 
 It does not recognise speech. While audio frames keep arriving it "hears" a scripted
-Chinese sentence every few seconds: interims word by word, then a final. This lets the
-whole chain (LiveKit → agent → captions → browsers) be exercised without a Deepgram key.
+sentence every few seconds: interims word by word, then a final. This lets the whole
+chain (LiveKit → agent → captions → browsers) be exercised without a provider key.
+
+diarize=True simulates a meeting's system audio: six participants taking turns in
+Indonesian / English / Chinese, with speaker labels on finals only (like Deepgram) and
+the detected language on every event.
 """
 
 from __future__ import annotations
@@ -23,11 +27,22 @@ SCRIPT = [
     "有问题的同事可以随时打断我。",
 ]
 
+MEETING_SCRIPT = [
+    ("S0", "id", "Selamat pagi semuanya, terima kasih sudah bergabung."),
+    ("S1", "en", "Thanks. Can we start with the delivery schedule?"),
+    ("S2", "id", "Pengiriman pertama dijadwalkan minggu depan."),
+    ("S3", "zh", "我们这边的报关资料已经准备好了。"),
+    ("S4", "en", "What about the payment terms for the second order?"),
+    ("S5", "id", "Kami minta pembayaran tiga puluh persen di muka."),
+    ("S0", "id", "Baik, kita catat dulu dan konfirmasi besok."),
+]
+
 
 class DemoSTT(stt.STT):
-    def __init__(self, *, sentence_every_s: float = 4.0) -> None:
-        super().__init__(capabilities=stt.STTCapabilities(streaming=True, interim_results=True))
+    def __init__(self, *, sentence_every_s: float = 4.0, diarize: bool = False) -> None:
+        super().__init__(capabilities=stt.STTCapabilities(streaming=True, interim_results=True, diarization=diarize))
         self._every = sentence_every_s
+        self._diarize = diarize
 
     @property
     def model(self) -> str:
@@ -46,16 +61,22 @@ class DemoSTT(stt.STT):
         language: NotGivenOr[str] = NOT_GIVEN,
         conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS,
     ) -> "DemoStream":
-        return DemoStream(stt=self, conn_options=conn_options, every=self._every)
+        return DemoStream(stt=self, conn_options=conn_options, every=self._every, diarize=self._diarize)
 
 
 class DemoStream(stt.RecognizeStream):
-    def __init__(self, *, stt: DemoSTT, conn_options: APIConnectOptions, every: float) -> None:
+    def __init__(self, *, stt: DemoSTT, conn_options: APIConnectOptions, every: float, diarize: bool) -> None:
         super().__init__(stt=stt, conn_options=conn_options)
         self._every = every
+        self._diarize = diarize
+
+    def _script(self):
+        if self._diarize:
+            return itertools.cycle(MEETING_SCRIPT)
+        return ((None, "zh", s) for s in itertools.cycle(SCRIPT))
 
     async def _run(self) -> None:
-        script = itertools.cycle(SCRIPT)
+        script = self._script()
         audio_s = 0.0
         next_at = self._every
         async for item in self._input_ch:
@@ -64,21 +85,21 @@ class DemoStream(stt.RecognizeStream):
             if audio_s < next_at:
                 continue
             next_at += self._every
-            sentence = next(script)
-            # interims: grow the sentence in ~4 chunks, 150 ms apart
+            label, lang, sentence = next(script)
+            # interims: grow the sentence in ~4 chunks, 150 ms apart, no speaker yet
             step = max(1, len(sentence) // 4)
             for cut in range(step, len(sentence), step):
                 self._event_ch.send_nowait(
                     stt.SpeechEvent(
                         type=stt.SpeechEventType.INTERIM_TRANSCRIPT,
-                        alternatives=[stt.SpeechData(language="zh", text=sentence[:cut])],
+                        alternatives=[stt.SpeechData(language=lang, text=sentence[:cut])],
                     )
                 )
                 await asyncio.sleep(0.15)
             self._event_ch.send_nowait(
                 stt.SpeechEvent(
                     type=stt.SpeechEventType.FINAL_TRANSCRIPT,
-                    alternatives=[stt.SpeechData(language="zh", text=sentence, confidence=1.0,
-                                                 end_time=time.time())],
+                    alternatives=[stt.SpeechData(language=lang, text=sentence, confidence=1.0,
+                                                 speaker_id=label, end_time=time.time())],
                 )
             )

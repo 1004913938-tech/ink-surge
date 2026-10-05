@@ -1,4 +1,4 @@
-import { Room, RoomEvent } from "livekit-client";
+import { Room, RoomEvent, Track } from "livekit-client";
 import { useEffect, useRef, useState } from "react";
 
 import { CaptionStore, parseCaption } from "./captions";
@@ -64,6 +64,19 @@ export function useCaptionRoom(url: string | null, token: string | null, opts: {
   const setMic = async (on: boolean) => {
     await roomRef.current?.localParticipant.setMicrophoneEnabled(on);
   };
+  /** Personal mode: publish the meeting's captured system/tab audio for diarized captions. */
+  const publishMeetingAudio = async (track: MediaStreamTrack) => {
+    const room = roomRef.current;
+    if (!room) throw new Error("not connected");
+    await room.localParticipant.publishTrack(track, {
+      source: Track.Source.ScreenShareAudio,
+      name: "meeting-audio",
+      dtx: false, // keep sending during quiet stretches; the STT needs continuous audio
+    });
+  };
+  const stopMeetingAudio = async (track: MediaStreamTrack) => {
+    await roomRef.current?.localParticipant.unpublishTrack(track, true);
+  };
 
-  return { store: storeRef.current, state, error, setLangs, setMic };
+  return { store: storeRef.current, state, error, setLangs, setMic, publishMeetingAudio, stopMeetingAudio };
 }

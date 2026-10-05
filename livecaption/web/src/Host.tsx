@@ -24,7 +24,7 @@ export function Host() {
   );
 
   useEffect(() => {
-    if (session) QRCode.toDataURL(session.join_url, { width: 240, margin: 1 }).then(setQr);
+    if (session?.join_url) QRCode.toDataURL(session.join_url, { width: 240, margin: 1 }).then(setQr);
   }, [session]);
 
   const start = async () => {

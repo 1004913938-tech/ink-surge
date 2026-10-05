@@ -1,8 +1,13 @@
 """LiveKit Agents worker: one job per room.
 
-Per remote participant with lc.role=speaker: audio track -> STT stream -> CaptionSession.
+Every audio track published by a participant with lc.role=speaker gets its own pipe:
+audio -> STT stream -> CaptionSession.
+  * microphone track          -> one known speaker (the participant)
+  * screen-share audio track  -> the meeting's system audio: diarized into 说话人 1..N,
+                                 language auto-detected (personal mode, ARCHITECTURE.md §3a)
 Listeners' lc.langs attribute drives which target languages get translated.
-Captions go out as LiveKit text streams on topic `lc.caption` (room broadcast).
+Captions go out as LiveKit text streams on topic `lc.caption`; in personal mode only to
+the room owner.
 """
 
 from __future__ import annotations
@@ -10,11 +15,11 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import time
 
 import aiohttp
 from livekit import rtc
 from livekit.agents import AutoSubscribe, JobContext, WorkerOptions, cli, stt
+from livekit.agents.language import LanguageCode
 
 from livecaption_core import (
     Broadcaster,
@@ -24,38 +29,56 @@ from livecaption_core import (
     TranslationHub,
     TranslationHubConfig,
 )
-from livecaption_core.models import CAPTION_TOPIC
+from livecaption_core.models import AUTO_LANG, CAPTION_TOPIC
+from livecaption_core.tracks import TrackSpec, Word
 
 from .config import ATTR_LANG, ATTR_LANGS, ATTR_NAME, ATTR_ROLE, AgentConfig
 from .providers import make_stt, make_translator
 
 log = logging.getLogger("livecaption.worker")
 
+MEETING_AUDIO_NAME = "会议声音"
+
 
 class LiveKitSink:
-    def __init__(self, room: rtc.Room) -> None:
+    def __init__(self, room: rtc.Room, destinations: list[str] | None = None) -> None:
         self._room = room
+        self._destinations = destinations or None
 
     async def publish(self, payload: str) -> None:
         try:
-            await self._room.local_participant.send_text(payload, topic=CAPTION_TOPIC)
+            await self._room.local_participant.send_text(
+                payload, topic=CAPTION_TOPIC, destination_identities=self._destinations
+            )
         except Exception:  # a transient data-channel error must not kill the pipeline
             log.warning("send_text failed", exc_info=True)
 
 
-class SpeakerPipe:
-    """Audio track -> STT -> session, with automatic STT stream restart."""
+def base_lang(code: object) -> str | None:
+    """'id-ID' -> 'id', 'cmn' -> 'zh'. None for empty / 'multi'."""
+    s = str(code or "").strip()
+    if not s or s.lower() in ("multi", AUTO_LANG):
+        return None
+    try:
+        return LanguageCode(s).language
+    except Exception:
+        return s.split("-")[0].lower()
 
-    def __init__(self, cfg: AgentConfig, session: CaptionSession, speaker: SpeakerInfo, track: rtc.Track):
+
+class TrackPipe:
+    """One audio track -> STT -> session, with automatic STT stream restart."""
+
+    def __init__(self, cfg: AgentConfig, session: CaptionSession, spec: TrackSpec, track: rtc.Track):
         self._cfg = cfg
         self._session = session
-        self._speaker = speaker
+        self.spec = spec
         self._track = track
         self._task: asyncio.Task | None = None
         self._closed = False
 
     def start(self) -> None:
-        self._task = asyncio.create_task(self._run(), name=f"pipe-{self._speaker.id}")
+        self._session.add_track(self.spec)
+        self._task = asyncio.create_task(self._run(), name=f"pipe-{self.spec.track_id}")
 
     async def aclose(self) -> None:
         self._closed = True
@@ -65,7 +88,7 @@ class SpeakerPipe:
                 await self._task
             except (asyncio.CancelledError, Exception):
                 pass
-        await self._session.remove_speaker(self._speaker.id)
+        await self._session.remove_track(self.spec.track_id)
 
     async def _run(self) -> None:
         backoff = 0.5
@@ -76,12 +99,13 @@ class SpeakerPipe:
             except asyncio.CancelledError:
                 raise
             except Exception:
-                log.exception("STT pipe for %s crashed; restarting in %.1fs", self._speaker.id, backoff)
+                log.exception("STT pipe %s crashed; restarting in %.1fs", self.spec.track_id, backoff)
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 10)
 
     async def _run_once(self) -> None:
-        stt_impl = make_stt(self._cfg, self._speaker.lang)
+        tid = self.spec.track_id
+        stt_impl = make_stt(self._cfg, self.spec.owner.lang, diarize=self.spec.diarized)
         audio = rtc.AudioStream.from_track(
             track=self._track, sample_rate=self._cfg.stt_sample_rate, num_channels=1
         )
@@ -99,11 +123,15 @@ class SpeakerPipe:
             async for ev in stream:
                 if not ev.alternatives:
                     continue
-                text = ev.alternatives[0].text
+                alt = ev.alternatives[0]
+                lang = base_lang(alt.language) if self.spec.owner.lang == AUTO_LANG else None
                 if ev.type == stt.SpeechEventType.INTERIM_TRANSCRIPT:
-                    await self._session.on_interim(self._speaker.id, text)
+                    await self._session.on_track_interim(tid, alt.text, speaker_label=alt.speaker_id, lang=lang)
                 elif ev.type == stt.SpeechEventType.FINAL_TRANSCRIPT:
-                    await self._session.on_final(self._speaker.id, text)
+                    words = [Word(str(w), getattr(w, "speaker_id", None)) for w in (alt.words or [])]
+                    await self._session.on_track_final(
+                        tid, alt.text, speaker_label=alt.speaker_id, words=words or None, lang=lang
+                    )
         finally:
             pump.cancel()
             await audio.aclose()
@@ -119,8 +147,12 @@ class RoomCaptioner:
         meta = self._parse_metadata(ctx.room.metadata)
         glossary = meta.get("glossary", {}) or {}
         targets = frozenset(meta.get("targets") or cfg.base_targets)
+        self.personal = meta.get("mode") == "personal"
+        self._owner = meta.get("owner") or None
+        self._remote_lang = meta.get("remote_lang") or AUTO_LANG
 
-        self._bc = Broadcaster(LiveKitSink(self._room), interim_hz=cfg.interim_hz)
+        sink = LiveKitSink(self._room, [self._owner] if (self.personal and self._owner) else None)
+        self._bc = Broadcaster(sink, interim_hz=cfg.interim_hz)
         self._hub = TranslationHub(
             make_translator(cfg, glossary),
             TranslationHubConfig(
@@ -131,8 +163,7 @@ class RoomCaptioner:
             glossary=glossary,
         )
         self._session = CaptionSession(self._bc, self._hub, SessionConfig(base_targets=targets, glossary=glossary))
-        self._pipes: dict[str, SpeakerPipe] = {}
-        self._started_at = time.time()
+        self._pipes: dict[str, TrackPipe] = {}
 
     @staticmethod
     def _parse_metadata(raw: str | None) -> dict:
@@ -158,11 +189,19 @@ class RoomCaptioner:
                 if pub.track is not None and pub.kind == rtc.TrackKind.KIND_AUDIO:
                     self._on_track_subscribed(pub.track, pub, p)
 
-    def _speaker_info(self, p: rtc.RemoteParticipant) -> SpeakerInfo:
-        return SpeakerInfo(
-            id=p.identity,
-            name=p.attributes.get(ATTR_NAME) or p.name or p.identity,
-            lang=p.attributes.get(ATTR_LANG) or self._cfg.default_src_lang,
+    def _spec_for(self, pub: rtc.RemoteTrackPublication, p: rtc.RemoteParticipant) -> TrackSpec:
+        name = p.attributes.get(ATTR_NAME) or p.name or p.identity
+        if pub.source == rtc.TrackSource.SOURCE_SCREENSHARE_AUDIO:
+            return TrackSpec(
+                track_id=pub.sid,
+                owner=SpeakerInfo(id=f"{p.identity}:meeting", name=MEETING_AUDIO_NAME, lang=self._remote_lang),
+                diarized=True,
+            )
+        return TrackSpec(
+            track_id=pub.sid,
+            owner=SpeakerInfo(id=p.identity, name=name,
+                              lang=p.attributes.get(ATTR_LANG) or self._cfg.default_src_lang),
+            echo_guard=self.personal,
         )
 
     def _register_listener(self, p: rtc.RemoteParticipant) -> None:
@@ -175,32 +214,35 @@ class RoomCaptioner:
             return
         if p.attributes.get(ATTR_ROLE, "speaker") != "speaker":
             return  # listeners cannot publish anyway (token), belt and braces
-        if p.identity in self._pipes:
+        if self.personal and self._owner and p.identity != self._owner:
+            return  # a personal room only captions its owner's tracks
+        if pub.sid in self._pipes:
             return
-        info = self._speaker_info(p)
-        self._session.add_speaker(info)
-        pipe = SpeakerPipe(self._cfg, self._session, info, track)
-        self._pipes[p.identity] = pipe
+        spec = self._spec_for(pub, p)
+        pipe = TrackPipe(self._cfg, self._session, spec, track)
+        self._pipes[pub.sid] = pipe
         pipe.start()
-        log.info("speaker %s (%s) joined, lang=%s", info.id, info.name, info.lang)
+        log.info("track %s from %s: %s, lang=%s, diarized=%s",
+                 pub.sid, p.identity, spec.owner.name, spec.owner.lang, spec.diarized)
 
     def _on_track_unsubscribed(self, track: rtc.Track, pub: rtc.RemoteTrackPublication, p: rtc.RemoteParticipant) -> None:
         if track.kind == rtc.TrackKind.KIND_AUDIO:
-            self._drop_speaker(p.identity)
+            self._drop_pipe(pub.sid)
 
     def _on_participant_connected(self, p: rtc.RemoteParticipant) -> None:
         self._register_listener(p)
 
     def _on_participant_disconnected(self, p: rtc.RemoteParticipant) -> None:
         self._session.remove_listener(p.identity)
-        self._drop_speaker(p.identity)
+        for sid in [s for s, pipe in self._pipes.items() if pipe.spec.owner.id.split(":")[0] == p.identity]:
+            self._drop_pipe(sid)
 
     def _on_attributes_changed(self, changed: dict[str, str], p: rtc.RemoteParticipant) -> None:
         if ATTR_LANGS in changed:
             self._session.set_listener_langs(p.identity, set(changed[ATTR_LANGS].split(",")))
 
-    def _drop_speaker(self, identity: str) -> None:
-        pipe = self._pipes.pop(identity, None)
+    def _drop_pipe(self, track_sid: str) -> None:
+        pipe = self._pipes.pop(track_sid, None)
         if pipe is not None:
             asyncio.create_task(pipe.aclose())
 
@@ -221,7 +263,7 @@ class RoomCaptioner:
             await self._session.aclose()
 
     async def _meter_usage(self) -> None:
-        """Report one active minute per minute while any speaker is live (plan metering)."""
+        """Report one active minute per minute while any audio track is live (plan metering)."""
         if not self._cfg.api_url:
             return
         async with aiohttp.ClientSession() as http:

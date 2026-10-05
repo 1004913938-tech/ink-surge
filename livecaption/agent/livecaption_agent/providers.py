@@ -5,6 +5,7 @@ from __future__ import annotations
 from livekit.agents import stt
 
 from livecaption_core import FakeTranslator, Translator
+from livecaption_core.models import AUTO_LANG
 
 from .config import AgentConfig
 
@@ -12,21 +13,24 @@ from .config import AgentConfig
 _DEEPGRAM_LANG = {"zh": "zh-CN", "zh-TW": "zh-TW", "en": "en", "id": "id", "ja": "ja", "ko": "ko"}
 
 
-def make_stt(cfg: AgentConfig, lang: str) -> stt.STT:
+def make_stt(cfg: AgentConfig, lang: str, *, diarize: bool = False) -> stt.STT:
+    """`lang` is the spoken language or "auto" (detect per utterance). `diarize` asks the
+    provider to label speakers inside one stream (the meeting's system audio)."""
     if cfg.stt_provider == "deepgram":
         from livekit.plugins import deepgram
 
         return deepgram.STT(
             model="nova-3",
-            language=_DEEPGRAM_LANG.get(lang, lang),
+            language="multi" if lang == AUTO_LANG else _DEEPGRAM_LANG.get(lang, lang),
             interim_results=True,
             punctuate=True,
+            enable_diarization=diarize,
             sample_rate=cfg.stt_sample_rate,
         )
     if cfg.stt_provider == "demo":
         from .demo_stt import DemoSTT
 
-        return DemoSTT()
+        return DemoSTT(diarize=diarize)
     if cfg.stt_provider == "paraformer":
         raise NotImplementedError(
             "Alibaba Paraformer realtime adapter is reserved (see ARCHITECTURE.md §1); "

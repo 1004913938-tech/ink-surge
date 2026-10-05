@@ -49,3 +49,23 @@ test("parseCaption rejects garbage and wrong version", () => {
   assert.equal(parseCaption(JSON.stringify({ v: 2, kind: "final" })), null);
   assert.ok(parseCaption(JSON.stringify(msg({}))));
 });
+
+test("personal mode: unattributed interim becomes the named speaker's final in place", () => {
+  const s = new CaptionStore();
+  const meeting = { id: "u:meeting", name: "会议声音" };
+  s.apply(msg({ kind: "interim", sid: "x", seq: 0, t: 1, spk: meeting, src: { lang: "auto", text: "Selamat" } }));
+  s.apply(msg({ sid: "y", seq: 1, t: 2, spk: { id: "tr#S1", name: "说话人 2" }, src: { lang: "en", text: "Hi" } }));
+  s.apply(msg({ kind: "final", sid: "x", seq: 1, t: 3, spk: { id: "tr#S0", name: "说话人 1" }, src: { lang: "id", text: "Selamat pagi." } }));
+  const lines = s.lines();
+  assert.deepEqual(lines.map((l) => [l.sid, l.speakerName, l.srcLang]), [["x", "说话人 1", "id"], ["y", "说话人 2", "en"]]);
+  assert.equal(lines[0].final, true);
+});
+
+test("retract removes a line and blocks late messages for it", () => {
+  const s = new CaptionStore();
+  s.apply(msg({ kind: "interim", sid: "echo", t: 1 }));
+  s.apply({ v: 1, kind: "retract", sid: "echo", seq: 0, t: 2 });
+  s.apply(msg({ kind: "final", sid: "echo", t: 3 }));
+  s.apply(msg({ kind: "patch", sid: "echo", tr: { zh: "x" } }));
+  assert.equal(s.size(), 0);
+});

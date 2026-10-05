@@ -29,9 +29,15 @@ CREATE TABLE IF NOT EXISTS sessions (
   targets TEXT NOT NULL,
   created_at REAL NOT NULL,
   ended_at REAL,
-  minutes INTEGER NOT NULL DEFAULT 0
+  minutes INTEGER NOT NULL DEFAULT 0,
+  mode TEXT NOT NULL DEFAULT 'broadcast'
 );
 """
+
+# Columns added after first release: (table, column, DDL). Applied idempotently.
+MIGRATIONS = [
+    ("sessions", "mode", "ALTER TABLE sessions ADD COLUMN mode TEXT NOT NULL DEFAULT 'broadcast'"),
+]
 
 PLANS = {
     "free": {"minutes": 60, "max_listeners": 20, "max_langs": 2, "price_usd": 0},
@@ -45,6 +51,10 @@ class Database:
         self._path = path or os.getenv("LC_DB_PATH", "livecaption.db")
         with self.conn() as c:
             c.executescript(SCHEMA)
+            for table, column, ddl in MIGRATIONS:
+                cols = {r["name"] for r in c.execute(f"PRAGMA table_info({table})")}
+                if column not in cols:
+                    c.execute(ddl)
 
     @contextmanager
     def conn(self):
@@ -91,7 +101,9 @@ class Database:
 
     # ---- sessions ----------------------------------------------------------
 
-    def create_session(self, account_id: str, title: str, src_lang: str, targets: list[str]) -> dict:
+    def create_session(
+        self, account_id: str, title: str, src_lang: str, targets: list[str], mode: str = "broadcast"
+    ) -> dict:
         sid = "ses_" + secrets.token_hex(5)
         s = {
             "id": sid,
@@ -104,17 +116,20 @@ class Database:
             "created_at": time.time(),
             "ended_at": None,
             "minutes": 0,
+            "mode": mode,
         }
         with self.conn() as c:
             c.execute(
-                "INSERT INTO sessions VALUES (:id,:account_id,:room,:join_code,:title,:src_lang,:targets,:created_at,:ended_at,:minutes)",
+                "INSERT INTO sessions VALUES (:id,:account_id,:room,:join_code,:title,:src_lang,:targets,:created_at,:ended_at,:minutes,:mode)",
                 s,
             )
         return s
 
     def session_by_code(self, code: str) -> dict | None:
         with self.conn() as c:
-            row = c.execute("SELECT * FROM sessions WHERE join_code=? AND ended_at IS NULL", (code.upper(),)).fetchone()
+            row = c.execute(
+                "SELECT * FROM sessions WHERE join_code=? AND ended_at IS NULL AND mode='broadcast'", (code.upper(),)
+            ).fetchone()
         return dict(row) if row else None
 
     def session_by_id(self, sid: str) -> dict | None:

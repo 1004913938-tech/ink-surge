@@ -2,11 +2,13 @@ export const API_URL = (import.meta.env.VITE_API_URL as string | undefined) ?? "
 
 export interface HostSession {
   session_id: string;
+  mode: "broadcast" | "personal";
   room: string;
-  join_code: string;
-  join_url: string;
+  join_code: string | null; // null in personal mode
+  join_url: string | null;
   livekit_url: string;
   src_lang: string;
+  remote_lang: string | null;
   targets: string[];
   host_token: string;
 }
@@ -27,6 +29,7 @@ async function check<T>(r: Response): Promise<T> {
 
 export function createSession(apiKey: string, body: {
   title: string; host_name: string; src_lang: string; targets: string[]; glossary?: Record<string, string>;
+  mode?: "broadcast" | "personal"; remote_lang?: string;
 }): Promise<HostSession> {
   return fetch(`${API_URL}/api/sessions`, {
     method: "POST",

@@ -44,9 +44,13 @@ class Broadcaster:
 
     async def send(self, cap: Caption) -> None:
         if cap.kind != "interim":
-            # A final supersedes any pending interim for the same speaker.
+            # A final/retract supersedes any pending interim of the same line. Match by
+            # sid too: a diarized line's interim is keyed by the track placeholder while
+            # its final names the real speaker.
             if cap.spk is not None:
                 self._pending_interim.pop(cap.spk.id, None)
+            for key in [k for k, p in self._pending_interim.items() if p.sid == cap.sid]:
+                del self._pending_interim[key]
             await self._emit(cap)
             return
 

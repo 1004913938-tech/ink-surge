@@ -37,3 +37,14 @@ button:disabled { opacity: .5; cursor: default; } button.danger { background: va
 .langbar { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 12px; }
 .langbar button { background: #222733; color: var(--fg); padding: 6px 10px; font-size: 14px; } .langbar button.on { background: var(--accent); }
 @media (max-width: 600px) { .card.row { flex-direction: column; } .src { font-size: 17px; } .tr { font-size: 16px; } }
+
+/* personal mode */
+.meta { display: flex; gap: 8px; align-items: baseline; }
+.who { font-weight: 600; } .who.editable { cursor: pointer; text-decoration: underline dotted; }
+.srclang { color: var(--muted); font-size: 11px; border: 1px solid #2a2f3a; border-radius: 4px; padding: 0 4px; }
+.row-inline { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.row-inline .actions { margin: 0 0 0 auto; }
+button.ghost { background: #222733; }
+.captions.compact { gap: 6px; } .captions.compact .line { padding: 6px 10px; }
+.captions.compact .src { font-size: 15px; font-weight: 500; } .captions.compact .tr { font-size: 18px; font-weight: 600; margin-top: 2px; }
+.pip-body { margin: 0; padding: 8px; background: var(--bg); color: var(--fg); overflow: hidden; display: flex; flex-direction: column; justify-content: flex-end; height: 100vh; box-sizing: border-box; }

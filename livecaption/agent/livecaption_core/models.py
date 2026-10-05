@@ -5,11 +5,13 @@ import time
 from dataclasses import dataclass, field
 from typing import Literal
 
-Kind = Literal["interim", "final", "patch", "reset"]
+Kind = Literal["interim", "final", "patch", "reset", "retract"]
 TrStatus = Literal["ok", "pending", "failed", "late", "skipped"]
 
 PROTOCOL_VERSION = 1
 CAPTION_TOPIC = "lc.caption"
+AUTO_LANG = "auto"
+"""Source language placeholder: the STT detects it per utterance."""
 
 
 def new_segment_id() -> str:
@@ -20,7 +22,7 @@ def new_segment_id() -> str:
 class SpeakerInfo:
     id: str
     name: str
-    lang: str  # BCP-47-ish, e.g. "zh", "en", "id"
+    lang: str  # BCP-47-ish, e.g. "zh", "en", "id", or "auto"
 
 
 @dataclass
@@ -32,10 +34,16 @@ class Segment:
     seq: int
     text: str = ""
     final: bool = False
+    lang: str = ""
+    """Language of this utterance (STT-detected when the speaker's lang is auto)."""
     translations: dict[str, str] = field(default_factory=dict)
     tr_status: TrStatus = "pending"
     created_at: float = field(default_factory=time.time)
     finalized_at: float | None = None
+
+    @property
+    def src_lang(self) -> str:
+        return self.lang or self.speaker.lang
 
 
 @dataclass
@@ -60,7 +68,7 @@ class Caption:
             "seq": self.seq,
             "t": round(self.t, 3),
         }
-        if self.kind == "reset":
+        if self.kind in ("reset", "retract"):
             return d
         if self.spk is not None:
             d["spk"] = {"id": self.spk.id, "name": self.spk.name}
@@ -77,7 +85,7 @@ class Caption:
             sid=seg.sid,
             spk=seg.speaker,
             seq=seg.seq,
-            src_lang=seg.speaker.lang,
+            src_lang=seg.src_lang,
             src_text=seg.text,
             tr=dict(seg.translations),
             tr_status=seg.tr_status,

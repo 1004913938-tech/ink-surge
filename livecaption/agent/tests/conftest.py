@@ -20,9 +20,9 @@ def make_session(
     translator=None,
     hub_cfg: TranslationHubConfig | None = None,
     session_cfg: SessionConfig | None = None,
-    interim_hz: float = 1000.0,
+    interim_hz: float = 0.0,
 ):
-    """Wire a full in-memory session. High interim_hz disables throttling unless a test asks."""
+    """Wire a full in-memory session. interim_hz=0 disables throttling unless a test asks."""
     sink = MemorySink()
     bc = Broadcaster(sink, interim_hz=interim_hz)
     hub = TranslationHub(translator or FakeTranslator(), hub_cfg or TranslationHubConfig(reorder_window_s=0.2))

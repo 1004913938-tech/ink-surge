@@ -92,3 +92,15 @@ async def test_interim_throttle_coalesces_but_keeps_latest():
     await asyncio.sleep(0.15)
     assert sink.messages[-1]["kind"] == "final"
     await bc.aclose()
+
+
+async def test_final_cancels_pending_interim_of_same_line_under_other_speaker_key():
+    sink = MemorySink()
+    bc = Broadcaster(sink, interim_hz=5)  # 200 ms window
+    placeholder, real = speaker(9), speaker(1)
+    await bc.send(Caption(kind="interim", sid="L", spk=placeholder, seq=0, src_lang="id", src_text="a"))
+    await bc.send(Caption(kind="interim", sid="L", spk=placeholder, seq=0, src_lang="id", src_text="ab"))  # queued
+    await bc.send(Caption(kind="final", sid="L", spk=real, seq=1, src_lang="id", src_text="abc"))
+    await asyncio.sleep(0.3)
+    assert [m["kind"] for m in sink.messages] == ["interim", "final"]
+    await bc.aclose()
