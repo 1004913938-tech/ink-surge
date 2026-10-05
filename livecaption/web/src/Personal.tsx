@@ -31,6 +31,8 @@ export function Personal() {
   const [, bump] = useState(0);
   const namesRef = useRef<SpeakerNames | null>(null);
   const [cfg, setCfg] = useState<ServerConfig | null>(null);
+  const [size, setSize] = useState<"s" | "m" | "l">(() => (localStorage.getItem("lc.size") as "s" | "m" | "l") || "m");
+  const pickSize = (v: "s" | "m" | "l") => { setSize(v); try { localStorage.setItem("lc.size", v); } catch { /* ignore */ } };
   useEffect(() => {
     serverConfig().then((c) => {
       setCfg(c);
@@ -209,7 +211,12 @@ export function Personal() {
             </div>
           </div>
         )}
-        <div className="small">连接：{state}{error ? ` — ${error}` : ""} · 点说话人名字可以改名</div>
+        <div className="small">连接：{state}{error ? ` — ${error}` : ""} · 点说话人名字可以改名（两个编号改成同名即合并）</div>
+        <div className="sizebar">字号
+          {(["s", "m", "l"] as const).map((v) => (
+            <button key={v} className={size === v ? "on" : ""} onClick={() => pickSize(v)}>{{ s: "小", m: "中", l: "大" }[v]}</button>
+          ))}
+        </div>
         {(state === "disconnected" || state === "error") && (
           <div className="err">连接已断开，字幕已停止。<button onClick={restart}>重新开始</button></div>
         )}
@@ -221,10 +228,10 @@ export function Personal() {
         <div className="actions"><button className="danger" onClick={stop}>结束</button></div>
         {err && <p className="err">{err}</p>}
       </div>
-      <CaptionView lines={lines} langs={session.targets} nameOf={nameOf} onRename={rename} />
+      <CaptionView lines={lines} langs={session.targets} nameOf={nameOf} onRename={rename} translationFirst size={size} />
       {pipWin && (
         <PipPortal win={pipWin} onClose={closePip}>
-          <CaptionView lines={latest} langs={session.targets} nameOf={nameOf} compact />
+          <CaptionView lines={latest} langs={session.targets} nameOf={nameOf} compact translationFirst size={size} />
         </PipPortal>
       )}
     </div>

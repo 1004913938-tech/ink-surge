@@ -69,3 +69,12 @@ test("retract removes a line and blocks late messages for it", () => {
   s.apply(msg({ kind: "patch", sid: "echo", tr: { zh: "x" } }));
   assert.equal(s.size(), 0);
 });
+
+test("speaker colours: distinct by first appearance, placeholder grey", async () => {
+  const { speakerColor } = await import("../src/speakers");
+  const ids = ["t#1:S0", "t#1:S1", "t#1:S2", "t#1:S3", "t#1:S4", "t#1:S5"];
+  const colours = ids.map(speakerColor);
+  assert.equal(new Set(colours).size, 6);
+  assert.equal(speakerColor("t#1:S0"), colours[0]); // stable
+  assert.equal(speakerColor("host-1:meeting"), "#6b7280");
+});

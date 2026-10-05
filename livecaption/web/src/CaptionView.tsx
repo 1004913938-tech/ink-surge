@@ -8,7 +8,7 @@ import { speakerColor } from "./speakers";
  * A translation row is skipped when the line is already in that language.
  * Translation state is visible but unobtrusive (… pending, ⚠ failed/skipped).
  */
-export function CaptionView({ lines, langs, big, showSource = true, nameOf, onRename, compact }: {
+export function CaptionView({ lines, langs, big, showSource = true, nameOf, onRename, compact, translationFirst, size }: {
   lines: Line[];
   langs: string[];
   big?: boolean;
@@ -16,9 +16,13 @@ export function CaptionView({ lines, langs, big, showSource = true, nameOf, onRe
   nameOf?: (l: Line) => string;
   onRename?: (l: Line) => void;
   compact?: boolean;
+  /** Personal mode: the reader reads the translation; put it on top so their eyes don't jump. */
+  translationFirst?: boolean;
+  size?: "s" | "m" | "l";
 }) {
+  const cls = ["captions", big && "big", compact && "compact", translationFirst && "tr-first", size && `size-${size}`];
   return (
-    <div className={"captions" + (big ? " big" : "") + (compact ? " compact" : "")}>
+    <div className={cls.filter(Boolean).join(" ")}>
       {lines.map((l) => {
         const color = speakerColor(l.speakerId);
         const rows = langs.filter((lang) => lang !== l.srcLang);
@@ -35,7 +39,7 @@ export function CaptionView({ lines, langs, big, showSource = true, nameOf, onRe
               </span>
               {l.srcLang && l.srcLang !== "auto" && <span className="srclang">{LANG_LABEL[l.srcLang] ?? l.srcLang}</span>}
             </div>
-            {(showSource || rows.length === 0) && <div className="src">{l.text}</div>}
+            {(showSource || rows.length === 0) && <div className={"src" + (rows.length === 0 ? " only" : "")}>{l.text}</div>}
             {rows.map((lang) => {
               const txt = l.tr[lang];
               return (

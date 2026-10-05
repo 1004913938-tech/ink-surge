@@ -1,11 +1,19 @@
 /** Per-user speaker display: stable colours and local renames ("说话人 2" -> "Budi"). */
 
 const PALETTE = ["#4f8cff", "#22c55e", "#f59e0b", "#ec4899", "#a855f7", "#14b8a6", "#ef4444", "#84cc16"];
+const UNATTRIBUTED = "#6b7280";
+const assigned = new Map<string, string>();
 
+/** Colours by order of first appearance, so the first 8 speakers never share a colour.
+ *  The unattributed placeholder ("会议声音", id ending in ":meeting") stays grey. */
 export function speakerColor(id: string): string {
-  let h = 0;
-  for (let i = 0; i < id.length; i++) h = (h * 31 + id.charCodeAt(i)) >>> 0;
-  return PALETTE[h % PALETTE.length];
+  if (id.endsWith(":meeting")) return UNATTRIBUTED;
+  let c = assigned.get(id);
+  if (!c) {
+    c = PALETTE[assigned.size % PALETTE.length];
+    assigned.set(id, c);
+  }
+  return c;
 }
 
 export class SpeakerNames {

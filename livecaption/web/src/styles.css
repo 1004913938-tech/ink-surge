@@ -49,3 +49,12 @@ button.ghost { background: #222733; }
 .captions.compact .src { font-size: 15px; font-weight: 500; } .captions.compact .tr { font-size: 18px; font-weight: 600; margin-top: 2px; }
 .pip-body { margin: 0; padding: 8px; background: var(--bg); color: var(--fg); overflow: hidden; display: flex; flex-direction: column; justify-content: flex-end; height: 100vh; box-sizing: border-box; }
 .small.warn { color: var(--warn); }
+
+/* personal mode: translation on top, original muted below; reader font sizes */
+.captions.tr-first .line { display: flex; flex-direction: column; }
+.captions.tr-first .meta { order: 0; } .captions.tr-first .tr { order: 1; font-weight: 600; } .captions.tr-first .src { order: 2; font-size: 14px; font-weight: 400; color: var(--muted); margin-top: 2px; }
+.captions.size-s .tr { font-size: 15px; } .captions.size-m .tr { font-size: 18px; } .captions.size-l .tr { font-size: 24px; }
+.captions.size-l .src { font-size: 16px; }
+.sizebar { display: inline-flex; gap: 4px; } .sizebar button { padding: 4px 10px; font-size: 13px; background: #222733; } .sizebar button.on { background: var(--accent); }
+.captions.tr-first .src.only { order: 1; font-size: 18px; font-weight: 600; color: var(--fg); margin-top: 4px; }
+.captions.size-s .src.only { font-size: 15px; } .captions.size-l .src.only { font-size: 24px; }
