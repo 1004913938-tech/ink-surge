@@ -68,7 +68,7 @@ test("assembler: interim shows progress, is_final accumulates, speech_final comm
   asm.handle(interim("yourself"));
   assert.deepEqual(prog.at(-1), { stable: "Tell me about", interim: "yourself" });
   asm.handle(results([w("yourself", 0, "yourself.")], { speech_final: true }));
-  assert.deepEqual(lines, [{ id: 1, speaker: 0, text: "Tell me about yourself." }]);
+  assert.deepEqual(lines, [{ id: 1, speaker: 0, text: "Tell me about yourself.", cut: false }]);
   assert.deepEqual(prog.at(-1), { stable: "", interim: "" });
 });
 
@@ -128,7 +128,7 @@ test("assembler: ignores Metadata / SpeechStarted / garbage; flush commits lefto
   assert.equal(prog.length, 0);
   asm.handle(results([w("Okay", undefined)]));
   asm.flush();
-  assert.deepEqual(lines, [{ id: 1, speaker: undefined, text: "Okay" }]);
+  assert.deepEqual(lines, [{ id: 1, speaker: undefined, text: "Okay", cut: false }]);
   asm.flush();
   assert.equal(lines.length, 1);
 });
@@ -139,9 +139,35 @@ test("assembler: final with transcript but no word list still captured", () => {
   assert.equal(lines[0].text, "Good morning.");
 });
 
-test("closeReason: never-opened vs auth vs balance vs normal", () => {
+test("closeReason: never-opened vs auth vs balance vs undecodable audio vs normal", () => {
   assert.match(LC.closeReason(false, 1006, ""), /Key/);
-  assert.match(LC.closeReason(true, 1008, ""), /拒绝/);
+  assert.match(LC.closeReason(false, 1006, ""), /余额/);
+  assert.match(LC.closeReason(true, 1000, "Unauthorized"), /拒绝/);
   assert.match(LC.closeReason(true, 1011, "Insufficient credits"), /余额/);
+  assert.match(LC.closeReason(true, 1008, ""), /音频/, "1008 is DATA-0000 (undecodable audio), not a bad key");
   assert.equal(LC.closeReason(true, 1000, ""), "");
+});
+
+test("retryDelay: fast and capped once the key has worked; backs off when it never did", () => {
+  assert.deepEqual([0, 1, 2, 3, 10].map((f) => LC.retryDelay(f, true)), [500, 1000, 2000, 4000, 4000]);
+  assert.deepEqual([1, 2, 3, 9].map((f) => LC.retryDelay(f, false)), [2000, 4000, 30000, 30000]);
+});
+
+test("flush on a dropped connection keeps the visible interim text and marks the line cut", () => {
+  const { asm, lines, prog } = collect();
+  asm.handle(results([w("So", 0), w("how", 0), w("would", 0), w("you", 0)]));
+  asm.handle({ type: "Results", is_final: false, channel: { alternatives: [{ transcript: "handle a conflict", words: [w("handle", 0), w("a", 0), w("conflict", 0)] }] } });
+  asm.flush();
+  assert.deepEqual(lines, [{ id: 1, speaker: 0, text: "So how would you handle a conflict", cut: true }]);
+  assert.deepEqual(prog.at(-1), { stable: "", interim: "" });
+  // only interim text on screen (no final words yet)
+  asm.handle(interim("Why did you leave"));
+  asm.flush();
+  assert.equal(lines.at(-1).text, "Why did you leave");
+  assert.equal(lines.at(-1).cut, true);
+  // nothing pending: no line, and a normal commit is not "cut"
+  asm.flush();
+  asm.handle(results([w("Thanks.", 0)], { speech_final: true }));
+  assert.equal(lines.length, 3);
+  assert.equal(lines.at(-1).cut, false);
 });

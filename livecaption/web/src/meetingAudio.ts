@@ -69,7 +69,8 @@ export async function captureMeetingAudio(): Promise<MeetingCapture> {
       noiseSuppression: false,
       autoGainControl: false,
       suppressLocalAudioPlayback: false, // the user must still hear the meeting
-      restrictOwnAudio: true,            // never capture this page's own audio (Win11 / macOS 14.2+)
+      // No restrictOwnAudio: on Windows 11 it drops every Chrome tab's sound from "entire screen"
+      // capture (a web meeting client in another tab); this page plays no audio of its own.
     },
     systemAudio: "include",
     windowAudio: "window", // offer "share application audio" for the meeting app window

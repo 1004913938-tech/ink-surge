@@ -8,7 +8,8 @@
   LiveCaption Lite — one file, no server, no install.
   Meeting audio (getDisplayMedia) -> Deepgram real-time STT (browser WebSocket, your key)
   -> Chrome built-in on-device Translator API (free) -> captions only you see (+ floating window).
-  Open in desktop Chrome / Edge. Test hooks: ?dg=<ws url> overrides Deepgram, ?fakeAudio=1 uses a tone.
+  Open in desktop Chrome. Test hooks: ?dg=<ws url> overrides Deepgram, ?fakeAudio=1 uses a tone,
+  ?stall=<ms> and ?trTimeout=<ms> shorten the stall watchdog and the translation timeout.
 -->
 <style id="lc-style">
   :root { --bg:#0f1115; --fg:#f3f4f6; --muted:#9aa3b2; --card:#171a21; --line:#2a2f3a; --accent:#4f8cff; --ok:#22c55e; --warn:#f5a524; --bad:#ef4444; color-scheme: dark; }
@@ -24,6 +25,7 @@
   .grow { flex: 1; min-width: 0; }
   label { display:block; font-size: 13px; color: var(--muted); margin: 2px 0; }
   input, select { width: 100%; background:#0b0d12; color:var(--fg); border:1px solid var(--line); border-radius:8px; padding:8px 10px; font-size:15px; }
+  input:disabled, select:disabled { opacity: .6; }
   .row { display:flex; gap:10px; flex-wrap: wrap; } .row > div { flex: 1 1 160px; }
   button { background: var(--accent); color:#fff; border:0; border-radius:8px; padding:9px 14px; font-size:15px; cursor:pointer; }
   button:disabled { opacity:.45; cursor: default; } button.ghost { background:#222733; } button.danger { background: var(--bad); }
@@ -32,7 +34,7 @@
   .meter { width: 120px; height: 8px; background:#222733; border-radius: 4px; overflow:hidden; display:inline-block; vertical-align: middle; }
   .meter > i { display:block; height:100%; width:0; background: var(--ok); transition: width .1s; }
   .status { font-size: 13px; color: var(--muted); }
-  .dot { width:9px; height:9px; border-radius:50%; display:inline-block; background: var(--muted); margin-right: 6px; vertical-align: middle; }
+  .dot { width:9px; height:9px; border-radius:50%; display:inline-block; background: var(--muted); margin-right: 6px; vertical-align: middle; flex: none; }
   .dot.on { background: var(--ok); } .dot.wait { background: var(--warn); } .dot.err { background: var(--bad); }
   .captions { display:flex; flex-direction:column; gap:8px; }
   .line { background: var(--card); border-radius: 10px; padding: 8px 12px; border-left: 3px solid var(--accent); }
@@ -41,8 +43,19 @@
   .line .zh.pending { color: var(--muted); font-weight: 400; }
   .line .src { font-size: var(--src, 14px); color: var(--muted); margin-top: 2px; }
   .line.interim { border-left-style: dashed; opacity: .85; }
+  .line.gap { border-left-color: var(--warn); background: transparent; }
+  .line.gap .src { color: var(--warn); font-size: 13px; }
   .sizes button { padding: 4px 10px; font-size: 13px; background:#222733; } .sizes button.on { background: var(--accent); }
-  body.pip { padding: 8px; overflow: hidden; display:flex; flex-direction: column; justify-content: flex-end; height: 100vh; }
+  /* floating window: status bar, alarm banner, captions scrolled so the newest finished line stays readable */
+  body.pip { height: 100vh; overflow: hidden; display: flex; flex-direction: column; }
+  #pipBar { flex: none; display: flex; align-items: center; gap: 6px; padding: 3px 10px; font-size: 12px; color: var(--muted); border-bottom: 1px solid var(--line); }
+  #pipBar .meter { width: 60px; height: 5px; margin-left: auto; }
+  .banner { flex: none; display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 6px 10px; font-size: 14px; font-weight: 600; }
+  .banner.bad { background: var(--bad); color: #fff; } .banner.warn { background: var(--warn); color: #111; }
+  .banner button { padding: 3px 10px; font-size: 13px; background: rgba(0,0,0,.35); color: #fff; flex: none; }
+  #pipScroll { flex: 1; min-height: 0; overflow-y: auto; padding: 6px 8px; position: relative; }
+  #pipCaps { min-height: 100%; justify-content: flex-end; }
+  body.pip.stale #pipCaps { opacity: .4; }
   body.pip .line { padding: 6px 10px; }
   .hidden { display: none !important; }
 </style>
@@ -81,7 +94,7 @@
     <div class="step" id="step2">
       <div class="num">2</div>
       <div class="grow">
-        <div>准备翻译（Chrome 自带离线翻译，第一次会下载语言包，建议面试前做好）</div>
+        <div>准备翻译（Chrome 自带的离线翻译，免费、不上传。每次打开本页都点一下；第一次会下载约 76MB 语言包）</div>
         <div class="actions"><button id="prepBtn">准备翻译</button><span class="hint" id="prepMsg"></span></div>
       </div>
     </div>
@@ -95,6 +108,8 @@
           <button id="stopBtn" class="ghost hidden">停止</button>
           <span class="meter" title="会议音量"><i id="meter"></i></span>
           <span class="status"><span class="dot" id="dot"></span><span id="status">未开始</span></span>
+          <button id="retryBtn" class="ghost hidden">立即重连</button>
+          <span class="hint" id="elapsed"></span>
         </div>
         <div class="bad" id="err"></div>
         <div class="warn" id="warn"></div>
@@ -106,7 +121,7 @@
     <button id="pipBtn" class="ghost">悬浮字幕窗</button>
     <span class="sizes" id="sizes">字号 <button data-s="s">小</button><button data-s="m" class="on">中</button><button data-s="l">大</button></span>
     <button id="exportBtn" class="ghost">下载记录</button>
-    <button id="clearBtn" class="ghost">清屏</button>
+    <button id="clearBtn" class="ghost" title="只清屏幕，下载记录仍包含全部内容">清屏</button>
     <span class="warn" id="pipWarn"></span>
   </div>
 
@@ -159,22 +174,32 @@ var LC = (function () {
     };
   }
 
+  function toWords(ws, fallbackText) {
+    var out = [];
+    for (var i = 0; ws && i < ws.length; i++) {
+      var t = ws[i].punctuated_word || ws[i].word || "";
+      if (t) out.push({ text: t, speaker: ws[i].speaker });
+    }
+    if (!out.length && fallbackText) out.push({ text: fallbackText, speaker: undefined });
+    return out;
+  }
+
   /**
    * Turns Deepgram streaming messages into caption lines.
-   *  onLine({id, speaker, text})      a finished utterance (one per speaker run)
-   *  onProgress({stable, interim})    the utterance in progress (stable = already final words)
+   *  onLine({id, speaker, text, cut})  a finished utterance (one per speaker run); cut = ended by a dropped connection
+   *  onProgress({stable, interim})     the utterance in progress (stable = already final words)
    */
   function createAssembler(opt) {
     var lang = opt.lang || "en", maxWords = opt.maxWords || 40;
-    var words = [], interim = "", nextId = 1;
+    var words = [], interim = "", interimWords = [], nextId = 1;
     var sep = joiner(lang);
 
     function stableText() { return words.map(function (w) { return w.text; }).join(sep).trim(); }
     function progress() { opt.onProgress && opt.onProgress({ stable: stableText(), interim: interim }); }
-    function commit() {
+    function commit(cut) {
       var rs = runs(words, lang);
-      words = []; interim = "";
-      for (var i = 0; i < rs.length; i++) opt.onLine({ id: nextId++, speaker: rs[i].speaker, text: rs[i].text });
+      words = []; interim = ""; interimWords = [];
+      for (var i = 0; i < rs.length; i++) opt.onLine({ id: nextId++, speaker: rs[i].speaker, text: rs[i].text, cut: !!cut && i === rs.length - 1 });
       progress();
     }
 
@@ -185,17 +210,9 @@ var LC = (function () {
       var alt = msg.channel && msg.channel.alternatives && msg.channel.alternatives[0];
       if (!alt) return;
       var transcript = (alt.transcript || "").trim();
-      if (!msg.is_final) { interim = transcript; progress(); return; }
-      interim = "";
-      var ws = alt.words || [];
-      if (ws.length) {
-        for (var i = 0; i < ws.length; i++) {
-          var t = ws[i].punctuated_word || ws[i].word || "";
-          if (t) words.push({ text: t, speaker: ws[i].speaker });
-        }
-      } else if (transcript) {
-        words.push({ text: transcript, speaker: undefined });
-      }
+      if (!msg.is_final) { interim = transcript; interimWords = transcript ? toWords(alt.words, transcript) : []; progress(); return; }
+      interim = ""; interimWords = [];
+      words = words.concat(toWords(alt.words, transcript));
       // A short pause (speech_final) mid-sentence would cut the sentence and translate fragments:
       // commit at a sentence end; an unpunctuated pause waits for UtteranceEnd (1 s of silence).
       var last = words.length ? words[words.length - 1].text : "";
@@ -203,19 +220,40 @@ var LC = (function () {
       if ((ends && (msg.speech_final || words.length >= maxWords)) || words.length >= maxWords * 2) commit();
       else progress();
     }
-    return { handle: handle, flush: function () { if (words.length) commit(); } };
+    /** Connection lost or stopped: commit what is on screen, including the unfinished interim text. */
+    function flush() {
+      var cut = false;
+      if (interimWords.length) {
+        cut = true;
+        var spk = words.length ? words[words.length - 1].speaker : undefined;
+        words = words.concat(interimWords.map(function (w) { return { text: w.text, speaker: w.speaker === undefined ? spk : w.speaker }; }));
+      }
+      if (words.length) commit(cut);
+      else if (interim) { interim = ""; progress(); }
+    }
+    return { handle: handle, flush: flush };
+  }
+
+  /** Delay before the next connection attempt. Once the key has worked in this session a failure is
+   *  the network, so keep retrying fast; a key that never worked backs off (wrong key / no balance). */
+  function retryDelay(failures, everOpened) {
+    if (everOpened) return Math.min(4000, 500 * Math.pow(2, failures));
+    return failures >= 3 ? 30000 : Math.min(15000, 1000 * Math.pow(2, failures));
   }
 
   /** Close/handshake outcome -> user-facing reason. Browsers hide HTTP status of a failed
    *  WebSocket handshake, so "never opened" covers bad key, no balance and blocked network. */
   function closeReason(opened, code, reason) {
-    if (!opened) return "连不上 Deepgram：请检查 ① Key 是否正确 ② 账户余额 ③ 网络（必要时开 VPN）";
-    if (code === 1008 || /auth|unauthor/i.test(reason || "")) return "Deepgram 拒绝了 Key（无效或已删除）";
-    if (/balance|credit|insufficient|payment/i.test(reason || "")) return "Deepgram 余额不足，请充值";
+    reason = reason || "";
+    if (!opened) return "连不上 Deepgram：请检查 ① Key 是否正确 ② 账户余额 ③ 网络";
+    if (/balance|credit|insufficient|payment|quota/i.test(reason)) return "Deepgram 余额不足，请充值";
+    if (/auth|unauthor|forbidden|invalid.*key/i.test(reason)) return "Deepgram 拒绝了 Key（无效或已删除）";
+    if (code === 1008) return "Deepgram 无法识别音频格式（DATA-0000），正在重连";
     return "";
   }
 
-  return { listenUrl: listenUrl, runs: runs, speakerNamer: speakerNamer, createAssembler: createAssembler, closeReason: closeReason, DG_DEFAULT: DG_DEFAULT };
+  return { listenUrl: listenUrl, runs: runs, speakerNamer: speakerNamer, createAssembler: createAssembler,
+           retryDelay: retryDelay, closeReason: closeReason, DG_DEFAULT: DG_DEFAULT };
 })();
 if (typeof module !== "undefined") module.exports = LC;
 </script>
@@ -227,17 +265,25 @@ if (typeof module !== "undefined") module.exports = LC;
   var params = new URLSearchParams(location.search + "&" + location.hash.replace(/^#/, ""));
   var DG_BASE = params.get("dg") || LC.DG_DEFAULT;
   var FAKE_AUDIO = params.get("fakeAudio") === "1";
+  var STALL_MS = +params.get("stall") || 15000;        // loud audio but no reply from Deepgram this long -> reconnect
+  var TR_TIMEOUT = +params.get("trTimeout") || 10000;  // one translation may take at most this long
+  var LOUD = 0.1;                                      // meter level that counts as someone talking
 
   function store(k, v) { try { if (v === undefined) return localStorage.getItem(k); localStorage.setItem(k, v); } catch (e) { return null; } }
+  function pad(n) { return (n < 10 ? "0" : "") + n; }
 
   // ---------------------------------------------------------------- state
-  var lines = [];            // {id, speaker, src, zh, zhState: pending|ok|none|error, t}
-  var progress = null;       // {stable, interim, zh}
-  var translator = null;     // {translate(text): Promise<string>, kind}
-  var dg = null, capture = null, meterTimer = null, silentSince = 0, connGen = 0;
-  var pipWin = null;
+  var lines = [];       // every line of this page session (the export): {id, kind: text|gap, speaker, src, zh, zhState, cut, t, ver}
+  var shownFrom = 0;    // 清屏 hides earlier lines on screen; the export keeps them
+  var lineSeq = 0;
+  var progress = null;  // {stable, interim, zh}
+  var translator = null;
+  var dg = null, capture = null, connGen = 0, starting = false;
+  var pipWin = null, pipUserScrollAt = 0;
   var nameOf = LC.speakerNamer();
   var size = store("lcl.size") || "m";
+  var ui = { kind: "", status: "未开始", err: "", warn: "", since: Date.now(), running: false, everStarted: false, stopNote: "" };
+  var live = { startedAt: 0, lastLoudAt: 0 };
 
   // ---------------------------------------------------------------- setup UI
   $("key").value = store("lcl.key") || "";
@@ -248,7 +294,7 @@ if (typeof module !== "undefined") module.exports = LC;
     $(id).addEventListener("change", function () {
       store("lcl." + (id === "srcLang" ? "src" : id === "tgtLang" ? "tgt" : id), $(id).value);
       if (id === "srcLang" || id === "tgtLang") { translator = null; $("step2").classList.remove("done"); $("prepMsg").textContent = ""; prepareTranslator(false); }
-      render();
+      if (id !== "key") rebuildMain();
     });
   });
 
@@ -256,14 +302,21 @@ if (typeof module !== "undefined") module.exports = LC;
   var chromium = /(Chrome|Chromium|Edg)\/\d+/.test(ua) && !/Firefox/.test(ua);
   var isMac = /Mac OS X|Macintosh/.test(ua);
   $("captureHint").textContent = !chromium
-    ? "请用电脑版 Chrome 或 Edge 打开本页（Safari / Firefox 拿不到会议声音）。"
+    ? "请用电脑版 Chrome 打开本页（Safari / Firefox 拿不到会议声音）。"
     : isMac
       ? "弹窗里选「整个屏幕」并打开「同时共享系统音频」（需要 macOS 14.2+），或选会议所在的浏览器标签页并打开「共享标签页音频」。"
-      : "弹窗里选「整个屏幕」并打开左下角「同时共享系统音频」；用飞书网页版开会时，也可以选会议标签页并打开「共享标签页音频」。";
+      : "弹窗里选「整个屏幕」，打开底部的「同时共享系统音频」开关，再点「共享」；之后屏幕下方的提示条点「隐藏」（不要点「停止共享」）。用飞书网页版开会时，也可以选会议所在的标签页并打开「共享标签页音频」。";
 
-  function setStatus(kind, text) { $("dot").className = "dot " + kind; $("status").textContent = text; }
-  function setErr(t) { $("err").textContent = t || ""; }
-  function setWarn(t) { $("warn").textContent = t || ""; }
+  function setStatus(kind, text) {
+    ui.kind = kind; ui.status = text; ui.since = Date.now();
+    $("dot").className = "dot " + kind; $("status").textContent = text;
+    $("retryBtn").classList.toggle("hidden", !(ui.running && kind !== "on"));
+    if (ui.running && kind !== "on") setTimeout(render, 3100); // the floating window's banner shows after a 3 s grace
+    render();
+  }
+  function setErr(t) { ui.err = t || ""; $("err").textContent = ui.err; render(); }
+  function setWarn(t) { ui.warn = t || ""; $("warn").textContent = ui.warn; render(); }
+  function minutes() { return Math.floor((Date.now() - live.startedAt) / 60000) + " 分钟"; }
 
   // ---------------------------------------------------------------- translation
   function translatorFactory() { return self.Translator; }
@@ -284,11 +337,11 @@ if (typeof module !== "undefined") module.exports = LC;
     function msg(t) { if (($("srcLang").value + ">" + $("tgtLang").value) === pair) $("prepMsg").textContent = t; }
     function armStall() {
       clearTimeout(stall);
-      stall = setTimeout(function () { msg($("prepMsg").textContent + "（很慢：语言包从 Google 下载，请检查网络或开 VPN，下载完前只显示原文）"); }, 45000);
+      stall = setTimeout(function () { msg($("prepMsg").textContent + "（很慢：语言包从 Google 下载，请检查网络，下载完前只显示原文）"); }, 45000);
     }
     var p = T.availability(o).then(function (a) {
       if (a === "unavailable") { msg("Chrome 不支持这个翻译方向（" + src + "→" + tgt + "），只显示原文。"); return null; }
-      if (a !== "available" && !fromClick) { msg("第一次使用要下载语言包：请点「准备翻译」。"); return null; } // download needs a click
+      if (a !== "available" && !fromClick) { msg("请点「准备翻译」（下载过的话几秒就好）。"); return null; } // Chrome needs a click here
       msg(a === "available" ? "正在启动翻译…" : "正在下载语言包…");
       armStall();
       return T.create(Object.assign({}, o, {
@@ -308,29 +361,46 @@ if (typeof module !== "undefined") module.exports = LC;
       });
     }).catch(function (e) {
       clearTimeout(stall);
-      msg("翻译启动失败：" + (e && e.message || e) + "。仍可开始，只显示原文。");
+      msg(e && e.name === "NotAllowedError" ? "请点「准备翻译」按钮（Chrome 要求先点一下）。不点也能开始，只显示原文。"
+        : "翻译启动失败：" + (e && e.message || e) + "。仍可开始，只显示原文。");
       return null;
     }).then(function (r) { if (preparing && preparing.promise === p) preparing = null; return r; });
     preparing = { pair: pair, click: fromClick, promise: p };
     return p;
   }
 
-  // translations run one at a time, in order
-  var queue = Promise.resolve();
-  function translateLine(line) {
-    if (!translator) { line.zhState = "none"; render(); return; }
-    queue = queue.then(function () {
-      return translator.translate(line.src).then(function (zh) { line.zh = zh; line.zhState = "ok"; },
-                                                 function () { line.zhState = "error"; });
-    }).then(render);
+  function withTimeout(p, ms) {
+    return new Promise(function (resolve, reject) {
+      var t = setTimeout(function () { reject(new Error("timeout")); }, ms);
+      p.then(function (v) { clearTimeout(t); resolve(v); }, function (e) { clearTimeout(t); reject(e); });
+    });
   }
+  function translateWith(tr, text) { return withTimeout(Promise.resolve().then(function () { return tr.translate(text); }), TR_TIMEOUT); }
+
+  // finished lines are translated one at a time, in order; one bad call never blocks the rest
+  var queue = Promise.resolve(), trFails = 0;
+  function translateLine(line) {
+    if (!translator) { line.zhState = "none"; touch(line); return; }
+    queue = queue.then(function () {
+      var tr = translator; // read when the job runs: the language pair may have changed
+      if (!tr) { line.zhState = "none"; return; }
+      return translateWith(tr, line.src).then(function (zh) { line.zh = zh; line.zhState = "ok"; trFails = 0; }, function () {
+        line.zhState = "error";
+        if (++trFails >= 3 && translator === tr) { trFails = 0; translator = null; prepareTranslator(false); } // rebuild a stuck translator
+      });
+    }).catch(function () { if (line.zhState === "pending") line.zhState = "error"; })
+      .then(function () { touch(line); });
+  }
+  function touch(line) { line.ver++; render(); }
+
   var progSeq = 0, progTimer = null;
   function translateProgress() {
     clearTimeout(progTimer);
     progTimer = setTimeout(function () {
-      if (!translator || !progress || !progress.stable) return;
+      var tr = translator;
+      if (!tr || !progress || !progress.stable) return;
       var seq = ++progSeq, text = progress.stable;
-      translator.translate(text).then(function (zh) {
+      translateWith(tr, text).then(function (zh) {
         if (seq === progSeq && progress && progress.stable === text) { progress.zh = zh; render(); }
       }, function () {});
     }, 300);
@@ -341,10 +411,13 @@ if (typeof module !== "undefined") module.exports = LC;
     // Deepgram numbers speakers from 0 on every connection: namespace by connection so a
     // reconnect never pins a new voice on an old label
     var spk = l.speaker === undefined || l.speaker === null ? null : connGen + ":" + l.speaker;
-    var line = { id: l.id, speaker: spk, src: l.text, zh: "", zhState: "pending", t: new Date() };
+    var line = { id: ++lineSeq, kind: "text", speaker: spk, src: l.text, zh: "", zhState: "pending", cut: !!l.cut, t: new Date(), ver: 0 };
     lines.push(line);
-    if (lines.length > 300) lines.shift();
     translateLine(line);
+    render();
+  }
+  function addGap(seconds) {
+    lines.push({ id: ++lineSeq, kind: "gap", src: "⚠ 连接中断约 " + seconds + " 秒：这段时间对方说的话可能没有字幕，必要时请对方重复。", t: new Date(), ver: 0 });
     render();
   }
   function onProgress(p) {
@@ -354,12 +427,27 @@ if (typeof module !== "undefined") module.exports = LC;
     render();
   }
 
+  function whoLabel(speaker) {
+    if ($("diarize").value !== "1") return "";
+    var n = nameOf(speaker);
+    return n ? "说话人 " + n : "";
+  }
+  function tail(s, n) { return s.length > n ? "…" + s.slice(s.length - n) : s; }
+  function lineOpts(l) {
+    if (l.kind === "gap") return { gap: true, src: l.src };
+    return { who: whoLabel(l.speaker), src: l.src + (l.cut ? " …（中断）" : ""), zh: l.zh,
+             zhPlaceholder: l.zhState === "pending" ? "…" : l.zhState === "error" ? "（翻译失败）" : "" };
+  }
+  function interimOpts(short) {
+    var src = (progress.stable + " " + progress.interim).trim(), zh = progress.zh || "";
+    if (short) { src = tail(src, 160); zh = tail(zh, 80); } // a long sentence in progress must not push the last question out
+    return { interim: true, src: src, zh: zh };
+  }
   function lineNode(doc, opts) {
     var div = doc.createElement("div");
-    div.className = "line" + (opts.interim ? " interim" : "");
+    div.className = "line" + (opts.interim ? " interim" : "") + (opts.gap ? " gap" : "");
     if (opts.who) { var w = doc.createElement("div"); w.className = "who"; w.textContent = opts.who; div.appendChild(w); }
-    var src = $("srcLang").value, tgt = $("tgtLang").value;
-    if (src !== tgt) {
+    if (!opts.gap && $("srcLang").value !== $("tgtLang").value) {
       var z = doc.createElement("div");
       z.className = "zh" + (opts.zh ? "" : " pending");
       z.textContent = opts.zh || opts.zhPlaceholder || "";
@@ -368,27 +456,58 @@ if (typeof module !== "undefined") module.exports = LC;
     var s = doc.createElement("div"); s.className = "src"; s.textContent = opts.src; div.appendChild(s);
     return div;
   }
-  function whoLabel(speaker) {
-    if ($("diarize").value !== "1") return "";
-    var n = nameOf(speaker);
-    return n ? "说话人 " + n : "";
-  }
-  function fill(doc, container, max) {
-    container.textContent = "";
-    var list = lines.slice(-max);
-    for (var i = 0; i < list.length; i++) {
-      var l = list[i];
-      container.appendChild(lineNode(doc, {
-        who: whoLabel(l.speaker), src: l.src, zh: l.zh,
-        zhPlaceholder: l.zhState === "pending" ? "…" : l.zhState === "error" ? "（翻译失败）" : "",
-      }));
+
+  // main page: updated in place, so scrolling up to re-read a question is not disturbed
+  var mainNodes = new Map(), interimNode = null;
+  function rebuildMain() { $("captions").textContent = ""; mainNodes.clear(); interimNode = null; render(); }
+  function renderMain() {
+    var box = $("captions"), se = document.scrollingElement || document.documentElement;
+    var atBottom = se.scrollHeight - (se.scrollTop + window.innerHeight) < 120;
+    for (var i = shownFrom; i < lines.length; i++) {
+      var l = lines[i], have = mainNodes.get(l.id);
+      if (have && have.ver === l.ver) continue;
+      var node = lineNode(document, lineOpts(l));
+      if (have) have.node.replaceWith(node); else box.insertBefore(node, interimNode);
+      mainNodes.set(l.id, { node: node, ver: l.ver });
     }
     if (progress && (progress.stable || progress.interim)) {
-      container.appendChild(lineNode(doc, {
-        interim: true, src: (progress.stable + " " + progress.interim).trim(), zh: progress.zh,
-      }));
+      var n = lineNode(document, interimOpts(false));
+      if (interimNode) interimNode.replaceWith(n); else box.appendChild(n);
+      interimNode = n;
+    } else if (interimNode) { interimNode.remove(); interimNode = null; }
+    if (atBottom) se.scrollTop = se.scrollHeight;
+  }
+
+  // floating window: status + alarm banner, so a stop or an outage never looks like a quiet interviewer
+  function renderPip() {
+    if (!pipWin || pipWin.closed) return;
+    var d = pipWin.document, now = Date.now();
+    d.getElementById("pipDot").className = "dot " + (ui.running ? ui.kind : "");
+    d.getElementById("pipStatus").textContent = ui.running ? ui.status + (ui.kind === "on" ? " · " + minutes() : "") : (ui.everStarted ? "已停止" : "未开始");
+    var text = "", cls = "", retry = false;
+    if (ui.everStarted && !ui.running) { text = "字幕已停止" + (ui.stopNote ? "（" + ui.stopNote + "）" : "") + " — 回到 Chrome 点「选择会议声音并开始」"; cls = "bad"; }
+    else if (ui.running && ui.err) { text = ui.err; cls = "bad"; retry = ui.kind !== "on"; }
+    else if (ui.running && ui.kind !== "on" && now - ui.since >= 3000) { text = "识别服务" + ui.status; cls = "warn"; retry = true; }
+    d.getElementById("pipBanner").className = "banner " + cls + (text ? "" : " hidden");
+    d.getElementById("pipBannerText").textContent = text;
+    d.getElementById("pipRetry").classList.toggle("hidden", !retry);
+    d.body.classList.toggle("stale", !!text);
+
+    var caps = d.getElementById("pipCaps"), sc = d.getElementById("pipScroll"), lastFinal = null;
+    caps.textContent = "";
+    for (var i = Math.max(shownFrom, lines.length - 8); i < lines.length; i++) {
+      var node = lineNode(d, lineOpts(lines[i]));
+      caps.appendChild(node);
+      if (lines[i].kind === "text") lastFinal = node;
+    }
+    if (progress && (progress.stable || progress.interim)) caps.appendChild(lineNode(d, interimOpts(true)));
+    // keep the newest finished line readable from its first word; the user's own scrolling wins for 8 s
+    if (now - pipUserScrollAt > 8000) {
+      var bottom = sc.scrollHeight - sc.clientHeight;
+      sc.scrollTop = lastFinal ? Math.min(bottom, lastFinal.offsetTop - 4) : bottom;
     }
   }
+
   // Coalesce with a microtask, not requestAnimationFrame: when Feishu covers this window Chrome
   // treats the page as hidden and stops rAF, which would freeze the floating window too.
   var renderQueued = false;
@@ -397,9 +516,11 @@ if (typeof module !== "undefined") module.exports = LC;
     renderQueued = true;
     Promise.resolve().then(function () {
       renderQueued = false;
-      fill(document, $("captions"), 40);
-      $("captions").lastElementChild && $("captions").lastElementChild.scrollIntoView({ block: "nearest" });
-      if (pipWin && !pipWin.closed) fill(pipWin.document, pipWin.document.getElementById("pipCaps"), 3);
+      renderMain();
+      try { renderPip(); } catch (e) { /* floating window closing */ }
+      document.title = ui.running ? (ui.kind === "on" ? "● 字幕中 · LiveCaption" : "⚠ 字幕重连中 · LiveCaption")
+        : ui.everStarted ? "⛔ 字幕已停止 · LiveCaption" : "LiveCaption 轻量版";
+      $("elapsed").textContent = ui.running && live.startedAt ? "已收听 " + minutes() : "";
     });
   }
 
@@ -412,6 +533,7 @@ if (typeof module !== "undefined") module.exports = LC;
       d.documentElement.style.setProperty("--src", src);
     });
     Array.prototype.forEach.call($("sizes").querySelectorAll("button"), function (b) { b.classList.toggle("on", b.dataset.s === s); });
+    render();
   }
   $("sizes").addEventListener("click", function (e) { if (e.target.dataset && e.target.dataset.s) applySize(e.target.dataset.s); });
   applySize(size);
@@ -425,17 +547,19 @@ if (typeof module !== "undefined") module.exports = LC;
 
   function captureMeeting() {
     if (FAKE_AUDIO) return Promise.resolve(fakeTrack());
+    // No restrictOwnAudio: on Windows 11 it removes every Chrome tab's sound from "entire screen"
+    // capture (Feishu web, a rehearsal video); this page plays nothing of its own.
     return navigator.mediaDevices.getDisplayMedia({
       video: { frameRate: 1, width: { max: 640 } },
-      audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false, suppressLocalAudioPlayback: false, restrictOwnAudio: true },
+      audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false, suppressLocalAudioPlayback: false },
       systemAudio: "include", windowAudio: "window", selfBrowserSurface: "exclude", surfaceSwitching: "include", monitorTypeSurfaces: "include",
     }).then(function (stream) {
       var audio = stream.getAudioTracks()[0];
-      var stopAll = function () { stream.getTracks().forEach(function (t) { t.stop(); }); };
-      if (!audio) { stopAll(); throw new Error("没有选到声音：请重新选择，并打开弹窗里的「共享音频」开关。"); }
-      if (audio.readyState !== "live") { stopAll(); throw new Error("系统没有允许录制声音（Mac：系统设置 → 隐私与安全性 → 录屏与系统录音 → 允许 Chrome）。"); }
+      var stopTracks = function () { stream.getTracks().forEach(function (t) { t.stop(); }); };
+      if (!audio) { stopTracks(); throw new Error("没有选到声音：请重新选择「整个屏幕」，并打开弹窗底部的「同时共享系统音频」开关。"); }
+      if (audio.readyState !== "live") { stopTracks(); throw new Error("系统没有允许录制声音（Mac：系统设置 → 隐私与安全性 → 录屏与系统录音 → 允许 Chrome）。"); }
       // keep the 1 fps video alive (stopping it can end the audio); it is never sent anywhere
-      return { audio: audio, stop: stopAll, stream: stream };
+      return { audio: audio, stop: stopTracks };
     });
   }
 
@@ -443,126 +567,211 @@ if (typeof module !== "undefined") module.exports = LC;
     try {
       var ctx = new AudioContext(), src = ctx.createMediaStreamSource(new MediaStream([track])), an = ctx.createAnalyser();
       an.fftSize = 512; src.connect(an); // not connected to speakers: no echo
-      var buf = new Uint8Array(an.fftSize); silentSince = Date.now();
-      meterTimer = setInterval(function () {
+      if (ctx.state === "suspended") ctx.resume();
+      var buf = new Uint8Array(an.fftSize), silentSince = Date.now(), warned = false;
+      var sample = function () {
         an.getByteTimeDomainData(buf);
         var peak = 0; for (var i = 0; i < buf.length; i++) peak = Math.max(peak, Math.abs(buf[i] - 128));
-        var level = Math.min(1, peak / 64);
-        $("meter").style.width = Math.round(level * 100) + "%";
-        if (level > 0.03) { silentSince = Date.now(); if ($("warn").dataset.silence) { setWarn(""); delete $("warn").dataset.silence; } }
-        else if (Date.now() - silentSince > 20000 && !$("warn").dataset.silence) {
-          $("warn").dataset.silence = "1";
-          setWarn("20 秒没听到会议声音：确认选择时打开了「共享系统音频 / 标签页音频」，以及会议里有人在说话。");
+        var level = Math.min(1, peak / 64), now = Date.now(), width = Math.round(level * 100) + "%";
+        if (level > LOUD) live.lastLoudAt = now;
+        $("meter").style.width = width;
+        var pm = pipWin && !pipWin.closed && pipWin.document.getElementById("pipMeter");
+        if (pm) pm.style.width = width;
+        if (level > 0.03) { silentSince = now; if (warned) { warned = false; setWarn(""); } }
+        else if (now - silentSince > 20000 && !warned) {
+          warned = true;
+          setWarn("20 秒没听到会议声音：确认选择时打开了「共享系统音频 / 标签页音频」、飞书扬声器是系统默认设备，以及会议里有人在说话。");
         }
-      }, 150);
-      return function () { clearInterval(meterTimer); ctx.close(); $("meter").style.width = "0"; };
-    } catch (e) { return function () {}; }
+      };
+      var timer = setInterval(sample, 150);
+      return { sample: sample, stop: function () { clearInterval(timer); ctx.close(); $("meter").style.width = "0"; } };
+    } catch (e) { return { sample: function () {}, stop: function () {} }; }
   }
 
   // ---------------------------------------------------------------- Deepgram stream
   function DGStream(o) {
-    var ws = null, rec = null, ka = null, stopped = false, failures = 0, retryTimer = null;
+    var ws = null, rec = null, conn = null, stopped = false, failures = 0, everOpened = false;
+    var retryTimer = null, downSince = 0, failingSince = 0;
     var mime = ["audio/webm;codecs=opus", "audio/webm", "audio/ogg;codecs=opus"].filter(function (m) { return window.MediaRecorder && MediaRecorder.isTypeSupported(m); })[0];
 
-    function stopRecorder() { if (rec && rec.state !== "inactive") { try { rec.stop(); } catch (e) {} } rec = null; }
-    function startRecorder() {
+    function stopRecorder() { var r = rec; rec = null; if (r && r.state !== "inactive") { try { r.stop(); } catch (e) {} } }
+    function startRecorder(sock, c) {
       // a fresh recorder per connection: each WebSocket must start with a container header
-      rec = new MediaRecorder(new MediaStream([o.track]), mime ? { mimeType: mime } : undefined);
-      rec.ondataavailable = function (e) { if (e.data && e.data.size && ws && ws.readyState === 1) ws.send(e.data); };
-      rec.start(250);
+      var r = new MediaRecorder(new MediaStream([o.track]), mime ? { mimeType: mime } : undefined);
+      r.ondataavailable = function (e) {
+        if (e.data && e.data.size && sock.readyState === 1) sock.send(e.data);
+        // media events keep firing 4x/s while Chrome is hidden (timers are throttled), so the
+        // meter and the stall check run here: loud audio going out but no reply -> reconnect
+        o.onTick();
+        var now = Date.now();
+        if (!stopped && c.opened && now - c.lastMsgAt > STALL_MS && o.lastLoudAt() - c.lastMsgAt > STALL_MS / 3) drop(c, "stall");
+      };
+      r.start(250);
+      rec = r;
     }
     function connect() {
-      var opened = false;
-      o.onState("wait", failures ? "重新连接识别服务…" : "正在连接识别服务…");
-      try { ws = new WebSocket(o.url, ["token", o.key]); }
+      retryTimer = null;
+      if (stopped) return;
+      var c = conn = { opened: false, openedAt: 0, lastMsgAt: 0, results: 0, dead: false, ka: null, hs: null, sock: null };
+      o.onState("wait", everOpened || failures ? "正在重新连接识别服务…" : "正在连接识别服务…");
+      try { c.sock = ws = new WebSocket(o.url, ["token", o.key]); }
       catch (e) { o.onError("连接地址无效：" + e.message); return; }
-      ws.onopen = function () {
-        opened = true; failures = 0; o.onError(""); o.onOpen();
+      var sock = c.sock;
+      c.hs = setTimeout(function () { if (!c.opened) drop(c, "handshake"); }, 10000);
+      sock.onopen = function () {
+        if (c.dead) return;
+        clearTimeout(c.hs);
+        c.opened = true; c.openedAt = c.lastMsgAt = Date.now();
+        everOpened = true; failingSince = 0;
+        o.onError("");
+        o.onOpen({ gapFrom: downSince });
+        downSince = 0;
         o.onState("on", "正在收听");
-        startRecorder();
-        ka = setInterval(function () { if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: "KeepAlive" })); }, 8000);
+        startRecorder(sock, c);
+        c.ka = setInterval(function () { if (sock.readyState === 1) sock.send(JSON.stringify({ type: "KeepAlive" })); }, 5000);
       };
-      ws.onmessage = function (e) {
-        if (typeof e.data !== "string") return;
+      sock.onmessage = function (e) {
+        if (c.dead || typeof e.data !== "string") return;
+        c.lastMsgAt = Date.now();
         var msg; try { msg = JSON.parse(e.data); } catch (x) { return; }
+        if (msg.type === "Results") c.results++;
+        if (msg.type === "Error") o.onError("Deepgram 报错：" + (msg.description || msg.message || msg.variant || "未知错误"));
         o.onMessage(msg);
       };
-      ws.onclose = function (e) {
-        clearInterval(ka); stopRecorder(); o.onFlush();
-        if (stopped) return;
-        if (!opened) failures++;
-        var why = LC.closeReason(opened, e.code, e.reason);
-        if (why) o.onError(why);
-        var delay = failures >= 3 ? 30000 : Math.min(15000, 1000 * Math.pow(2, failures));
-        o.onState(failures >= 3 ? "err" : "wait", (failures >= 3 ? "连接失败，" : "连接断开，") + Math.round(delay / 1000) + " 秒后重试");
-        retryTimer = setTimeout(connect, delay);
-      };
+      sock.onclose = function (e) { finish(c, e.code, e.reason); };
     }
+    function drop(c, why) {
+      if (c.dead) return;
+      try { c.sock.close(); } catch (e) {}
+      finish(c, 0, why);
+    }
+    function finish(c, code, reason) {
+      if (c.dead) return;
+      c.dead = true; clearTimeout(c.hs); clearInterval(c.ka);
+      if (c === conn) stopRecorder();
+      o.onFlush();
+      if (stopped || c !== conn) return;
+      var now = Date.now();
+      if (c.opened && !downSince) downSince = reason === "stall" ? c.lastMsgAt : now;
+      // opened but closed within 5 s without a single result (e.g. audio rejected): a failure, not a success
+      var useless = c.opened && c.results === 0 && now - c.openedAt < 5000;
+      if (!c.opened || useless) { failures++; if (!failingSince) failingSince = now; } else failures = 0;
+      var why = LC.closeReason(c.opened, code, reason);
+      if (reason === "stall") why = "识别服务没有响应，正在重新连接…";
+      else if (everOpened && !c.opened) why = now - failingSince > 30000
+        ? "连不上 Deepgram 已超过 30 秒：检查网络；也可能是余额用完（console.deepgram.com 查看）"
+        : "网络中断，正在自动重连…";
+      if (why) o.onError(why);
+      var delay = LC.retryDelay(failures, everOpened) + Math.random() * 300;
+      o.onState(!everOpened && failures >= 3 ? "err" : "wait",
+        (c.opened ? "连接断开" : "连接失败") + "，" + Math.max(1, Math.round(delay / 1000)) + " 秒后重试");
+      retryTimer = setTimeout(connect, delay);
+    }
+    function retryNow() {
+      if (stopped || !retryTimer) return;
+      clearTimeout(retryTimer);
+      connect();
+    }
+    window.addEventListener("online", retryNow);
     connect();
     return {
+      retryNow: retryNow,
       stop: function () {
-        stopped = true; clearTimeout(retryTimer); clearInterval(ka);
-        try { if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: "CloseStream" })); } catch (e) {}
-        stopRecorder();
-        try { ws && ws.close(); } catch (e) {}
+        stopped = true; clearTimeout(retryTimer); retryTimer = null;
+        window.removeEventListener("online", retryNow);
+        var c = conn;
+        if (!c || c.dead) return;
+        if (!c.opened) { drop(c, "stop"); return; }
+        // send the last audio, then CloseStream; Deepgram answers with its final results and closes
+        var r = rec, sock = c.sock;
+        var closeStream = function () { try { if (sock.readyState === 1) sock.send(JSON.stringify({ type: "CloseStream" })); } catch (e) {} };
+        rec = null;
+        if (r && r.state !== "inactive") { r.addEventListener("stop", closeStream); try { r.stop(); } catch (e) { closeStream(); } }
+        else closeStream();
+        setTimeout(function () { drop(c, "stop"); }, 1500);
       },
     };
   }
 
   // ---------------------------------------------------------------- start / stop
-  var stopMeter = function () {};
+  var meter = { sample: function () {}, stop: function () {} };
   $("prepBtn").addEventListener("click", function () { prepareTranslator(true); });
 
+  function setRunning(on) {
+    ui.running = on;
+    if (on) { ui.everStarted = true; ui.stopNote = ""; }
+    ["key", "srcLang", "tgtLang", "diarize"].forEach(function (id) { $(id).disabled = on; });
+    $("startBtn").classList.toggle("hidden", on); $("stopBtn").classList.toggle("hidden", !on);
+    $("step3").classList.toggle("done", on);
+  }
+
   $("startBtn").addEventListener("click", function () {
+    if (starting || dg) return;
     setErr(""); setWarn("");
     var key = $("key").value.trim();
     if (!key) { setErr("请先在第 1 步填写 Deepgram Key。"); return; }
     store("lcl.key", key);
-    if (!chromium && !FAKE_AUDIO) { setErr("请用电脑版 Chrome 或 Edge 打开本页。"); return; }
+    if (!chromium && !FAKE_AUDIO) { setErr("请用电脑版 Chrome 打开本页。"); return; }
+    starting = true; $("startBtn").disabled = true;
     prepareTranslator(true); // this click also allows the language-pack download if step 2 was skipped
     captureMeeting().then(function (c) {
       capture = c;
       var lang = $("srcLang").value;
       var asm = LC.createAssembler({ lang: lang, onLine: onLine, onProgress: onProgress });
+      meter = startMeter(c.audio);
+      live.startedAt = Date.now();
+      setRunning(true);
       dg = DGStream({
         url: LC.listenUrl(DG_BASE, { lang: lang, diarize: $("diarize").value === "1" }),
         key: key, track: c.audio,
-        onOpen: function () { connGen++; }, onMessage: asm.handle, onFlush: asm.flush,
+        onOpen: function (info) {
+          connGen++;
+          if (info.gapFrom && live.lastLoudAt > info.gapFrom) addGap(Math.max(1, Math.round((Date.now() - info.gapFrom) / 1000)));
+        },
+        onMessage: asm.handle, onFlush: asm.flush,
+        onTick: function () { meter.sample(); },
+        lastLoudAt: function () { return live.lastLoudAt; },
         onState: setStatus, onError: setErr,
       });
-      stopMeter = startMeter(c.audio);
-      c.audio.addEventListener("ended", stopAll); // user clicked "stop sharing"
-      $("startBtn").classList.add("hidden"); $("stopBtn").classList.remove("hidden");
-      $("step3").classList.add("done");
+      c.audio.addEventListener("ended", function () { stopAll("你点了「停止共享」"); });
     }, function (e) {
-      setErr(e && e.name === "NotAllowedError" ? "你取消了共享。再点一次，选好画面并打开「共享音频」开关。" : (e && e.message) || String(e));
-    });
+      setErr(e && e.name === "NotAllowedError" ? "你取消了共享。再点一次，选「整个屏幕」并打开「同时共享系统音频」开关。" : (e && e.message) || String(e));
+    }).then(function () { starting = false; $("startBtn").disabled = false; });
   });
 
-  function stopAll() {
+  function stopAll(note) {
     if (dg) { dg.stop(); dg = null; }
     if (capture) { capture.stop(); capture = null; }
-    stopMeter(); stopMeter = function () {};
+    meter.stop(); meter = { sample: function () {}, stop: function () {} };
+    setRunning(false);
+    ui.stopNote = note || "";
     setStatus("", "已停止");
     progress = null; render();
-    $("startBtn").classList.remove("hidden"); $("stopBtn").classList.add("hidden");
-    $("step3").classList.remove("done");
   }
-  $("stopBtn").addEventListener("click", stopAll);
+  $("stopBtn").addEventListener("click", function () { stopAll(""); });
+  $("retryBtn").addEventListener("click", function () { if (dg) dg.retryNow(); });
+  window.addEventListener("beforeunload", function (e) { if (ui.running) { e.preventDefault(); e.returnValue = ""; } });
 
   // ---------------------------------------------------------------- floating window
   $("pipBtn").addEventListener("click", function () {
     var api = window.documentPictureInPicture;
-    if (!api) { $("pipWarn").textContent = "当前浏览器不支持悬浮窗（需要电脑版 Chrome / Edge 116+）。"; return; }
+    if (!api) { $("pipWarn").textContent = "当前浏览器不支持悬浮窗（需要电脑版 Chrome 116+）。"; return; }
     if (pipWin && !pipWin.closed) return;
-    api.requestWindow({ width: 640, height: 220 }).then(function (w) {
+    api.requestWindow({ width: 640, height: 360 }).then(function (w) {
       pipWin = w;
-      var st = w.document.createElement("style"); st.textContent = $("lc-style").textContent; w.document.head.appendChild(st);
-      w.document.title = "字幕";
-      w.document.body.className = "pip";
-      var c = w.document.createElement("div"); c.className = "captions"; c.id = "pipCaps"; w.document.body.appendChild(c);
+      var d = w.document;
+      var st = d.createElement("style"); st.textContent = $("lc-style").textContent; d.head.appendChild(st);
+      d.title = "字幕";
+      d.body.className = "pip";
+      d.body.innerHTML = '<div id="pipBar"><span class="dot" id="pipDot"></span><span id="pipStatus"></span><span class="meter"><i id="pipMeter"></i></span></div>' +
+        '<div id="pipBanner" class="banner hidden"><span id="pipBannerText"></span><button id="pipRetry" class="hidden">立即重连</button></div>' +
+        '<div id="pipScroll"><div class="captions" id="pipCaps"></div></div>';
+      d.getElementById("pipRetry").addEventListener("click", function () { if (dg) dg.retryNow(); });
+      ["wheel", "touchmove", "keydown", "mousedown"].forEach(function (ev) {
+        d.getElementById("pipScroll").addEventListener(ev, function () { pipUserScrollAt = Date.now(); }, { passive: true });
+      });
       applySize(size);
-      $("pipWarn").textContent = "⚠ 面试中如果要「共享屏幕」，先关掉悬浮窗，否则对方会看到字幕。";
+      $("pipWarn").textContent = "悬浮窗可以拖动边缘放大。⚠ 面试中要「共享屏幕」时先关掉悬浮窗（或只共享飞书窗口），否则对方会看到字幕。";
       w.addEventListener("pagehide", function () { pipWin = null; $("pipWarn").textContent = ""; });
       render();
     }, function (e) { $("pipWarn").textContent = "悬浮窗打开失败：" + (e && e.message || e); });
@@ -570,21 +779,23 @@ if (typeof module !== "undefined") module.exports = LC;
 
   // ---------------------------------------------------------------- export / clear
   $("exportBtn").addEventListener("click", function () {
-    var pad = function (n) { return (n < 10 ? "0" : "") + n; };
     var text = lines.map(function (l) {
+      var ts = "[" + pad(l.t.getHours()) + ":" + pad(l.t.getMinutes()) + ":" + pad(l.t.getSeconds()) + "]";
+      if (l.kind === "gap") return ts + " " + l.src + "\n";
       var who = whoLabel(l.speaker);
-      return "[" + pad(l.t.getHours()) + ":" + pad(l.t.getMinutes()) + ":" + pad(l.t.getSeconds()) + "]" + (who ? " " + who : "") + "\n" + l.src + (l.zh ? "\n" + l.zh : "") + "\n";
+      return ts + (who ? " " + who : "") + "\n" + l.src + (l.cut ? " …（中断）" : "") + (l.zh ? "\n" + l.zh : "") + "\n";
     }).join("\n");
-    var a = document.createElement("a");
+    var n = new Date(), a = document.createElement("a");
     a.href = URL.createObjectURL(new Blob([text], { type: "text/plain;charset=utf-8" }));
-    a.download = "会议字幕-" + new Date().toISOString().slice(0, 16).replace(/[:T]/g, "-") + ".txt";
+    // ASCII name: Chromium can fall back to "download" (no .txt) for CJK file names
+    a.download = "captions-" + n.getFullYear() + "-" + pad(n.getMonth() + 1) + "-" + pad(n.getDate()) + "-" + pad(n.getHours()) + pad(n.getMinutes()) + ".txt";
     a.click(); setTimeout(function () { URL.revokeObjectURL(a.href); }, 1000);
   });
-  $("clearBtn").addEventListener("click", function () { lines = []; progress = null; render(); });
+  $("clearBtn").addEventListener("click", function () { shownFrom = lines.length; progress = null; rebuildMain(); });
 
   // translator ready without a click if the language pack is already installed
   prepareTranslator(false);
-  window.__lcl = { lines: function () { return lines; }, progress: function () { return progress; } }; // for tests
+  window.__lcl = { lines: function () { return lines; }, progress: function () { return progress; }, ui: function () { return ui; }, capture: function () { return capture; } }; // for tests
 })();
 </script>
 </body>
