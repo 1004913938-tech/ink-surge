@@ -196,8 +196,11 @@ var LC = (function () {
       } else if (transcript) {
         words.push({ text: transcript, speaker: undefined });
       }
+      // A short pause (speech_final) mid-sentence would cut the sentence and translate fragments:
+      // commit at a sentence end; an unpunctuated pause waits for UtteranceEnd (1 s of silence).
       var last = words.length ? words[words.length - 1].text : "";
-      if (msg.speech_final || (words.length >= maxWords && /[.?!。？！]$/.test(last))) commit();
+      var ends = /[.?!。？！]["')\]]?$/.test(last);
+      if ((ends && (msg.speech_final || words.length >= maxWords)) || words.length >= maxWords * 2) commit();
       else progress();
     }
     return { handle: handle, flush: function () { if (words.length) commit(); } };

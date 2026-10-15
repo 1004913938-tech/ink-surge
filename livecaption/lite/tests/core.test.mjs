@@ -97,6 +97,27 @@ test("assembler: long monologue is cut at a sentence end after maxWords", () => 
   assert.equal(lines[0].text, "one two three four five six seven.");
 });
 
+test("assembler: a mid-sentence pause does not cut the sentence", () => {
+  const { asm, lines, prog } = collect();
+  asm.handle(results([w("Can", 0), w("you", 0), w("walk", 0), w("me", 0), w("through", 0)], { speech_final: true }));
+  assert.equal(lines.length, 0, "no sentence end: keep the words, show them as in progress");
+  assert.equal(prog.at(-1).stable, "Can you walk me through");
+  asm.handle(results([w("your", 0), w("last", 0), w("project?", 0)], { speech_final: true }));
+  assert.deepEqual(lines.map((l) => l.text), ["Can you walk me through your last project?"]);
+  // an unpunctuated pause still ends at UtteranceEnd
+  asm.handle(results([w("Okay", 0), w("so", 0)], { speech_final: true }));
+  asm.handle({ type: "UtteranceEnd", channel: [0, 1], last_word_end: 9 });
+  assert.equal(lines.at(-1).text, "Okay so");
+});
+
+test("assembler: hard cap without punctuation", () => {
+  const { asm, lines } = collect({ maxWords: 3 });
+  asm.handle(results(["a", "b", "c", "d", "e"].map((x) => w(x, 0))));
+  assert.equal(lines.length, 0);
+  asm.handle(results([w("f", 0)]));
+  assert.equal(lines[0].text, "a b c d e f");
+});
+
 test("assembler: ignores Metadata / SpeechStarted / garbage; flush commits leftovers", () => {
   const { asm, lines, prog } = collect();
   asm.handle({ type: "Metadata", request_id: "x" });
