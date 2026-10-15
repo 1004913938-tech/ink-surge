@@ -67,9 +67,22 @@ const SCRIPTS = {
     return "closed";
   },
   "blipkey#2": async (ws) => { ws.send(res([w("Welcome", 0), w("back.", 0)], true, true)); },
+  // first connection closes; the next handshake hangs until the user clicks 立即重连
+  "hangkey#1": async (ws) => { ws.send(res([w("Before", 0), w("hang.", 0)], true, true)); await sleep(300); ws.close(1011, "mock"); return "closed"; },
+  "hangkey#2": async (ws) => { ws.send(res([w("After", 0), w("retry.", 0)], true, true)); },
+  // a reply, then no messages (the network died under the socket) and a late reset before the stall watchdog
+  "gapkey#1": async (ws) => { ws.send(res([w("Before", 0), w("the", 0), w("drop.", 0)], true, true)); setTimeout(() => ws.terminate(), 2500); return "silent"; },
+  "gapkey#2": async (ws) => { ws.send(res([w("Back", 0), w("again.", 0)], true, true)); },
+  // a non-fatal Error message, then results keep coming
+  "errkey#1": async (ws) => {
+    ws.send(JSON.stringify({ type: "Error", variant: "mock", description: "mock hiccup" }));
+    await sleep(1200);
+    ws.send(res([w("Still", 0), w("fine.", 0)], true, true));
+  },
+  "quietkey#1": async () => {},
 };
-const ACCEPT = /^(goodkey|filekey|nolkey|hidkey|stallkey|blipkey)$/;
-const conns = [], attempts = {}, rejectedAt = [];
+const ACCEPT = /^(goodkey|filekey|nolkey|hidkey|stallkey|blipkey|hangkey|gapkey|errkey|quietkey)$/;
+const conns = [], attempts = {}, rejectedAt = [], hung = [];
 let rejected = 0;
 const http = createServer((req, resp) => {
   if (req.url.startsWith("/index.html")) { resp.writeHead(200, { "content-type": "text/html; charset=utf-8" }); resp.end(readFileSync(INDEX)); }
@@ -80,6 +93,7 @@ http.on("upgrade", (req, sock, head) => {
   const protos = (req.headers["sec-websocket-protocol"] || "").split(",").map((s) => s.trim());
   const key = protos[0] === "token" ? protos[1] : null;
   const a = attempts[key] = (attempts[key] || 0) + 1;
+  if (key === "hangkey" && a === 2) { hung.push({ sock, t: Date.now() }); return; } // never answer this handshake
   if (!key || !ACCEPT.test(key) || (key === "blipkey" && a >= 2 && a <= 4)) {
     rejected++; rejectedAt.push({ key, t: Date.now() });
     sock.end(`HTTP/1.1 ${key === "blipkey" ? "503 Service Unavailable" : "401 Unauthorized"}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n`);
@@ -228,6 +242,17 @@ async function openPip(page) {
   await sleep(3000);
   check("bad key -> retries with backoff", rejected >= 2, `rejected=${rejected}`);
   await page.click("#stopBtn");
+  const before = rejected + conns.length;
+  await page.fill("#key", "abc，def-ghi xyz");                 // full-width comma: copied from a chat app
+  await page.click("#startBtn");
+  const err2 = await page.textContent("#err");
+  check("malformed key -> format error, key not echoed, no connection", /格式不对/.test(err2) && !/abc/.test(err2) && rejected + conns.length === before, err2);
+  await page.fill("#key", "  Token good\u3000key\u00a0 ");      // "Token " prefix, full-width space, NBSP
+  const goodBefore = conns.filter((c) => c.key === "goodkey").length;
+  await page.click("#startBtn");
+  const normalised = await until(page, (n) => document.getElementById("key").value === "goodkey" && document.getElementById("status").textContent === "\u6b63\u5728\u6536\u542c", null, 5000);
+  check("key normalisation strips 'Token ' and spaces", normalised && conns.filter((c) => c.key === "goodkey").length === goodBefore + 1);
+  await page.click("#stopBtn");
   await page.context().close();
 }
 
@@ -261,6 +286,7 @@ async function openPip(page) {
   await page.fill("#key", "nolkey");
   await page.click("#startBtn");
   check("without a translator the English still shows", await until(page, () => /No translator here\./.test(document.querySelector("#captions .line:not(.interim) .src")?.textContent || ""), null, 8000));
+  check("…and says the translation is not ready", /翻译未就绪/.test(await page.textContent("#captions .line:not(.interim) .zh")));
   await page.click("#stopBtn");
   await page.context().close();
 }
@@ -322,6 +348,75 @@ async function openPip(page) {
   await page.context().close();
 }
 
+// ---- H: connected but the captured audio is silent (headset switched device): yellow, non-dimming notice in PiP
+{
+  const page = await newPage();
+  await page.goto(pageUrl("&silence=1500").replace("fakeAudio=1", "fakeAudio=silent"));
+  await page.fill("#key", "quietkey");
+  const pip = await openPip(page);
+  await page.click("#startBtn");
+  await sleep(2500);
+  if (pip) {
+    const st = await page.evaluate(() => { const d = window.documentPictureInPicture.window.document;
+      return { banner: d.getElementById("pipBanner").className + "|" + d.getElementById("pipBannerText").textContent, stale: d.body.classList.contains("stale"), dot: d.getElementById("pipDot").className }; });
+    check("silent capture -> yellow notice in floating window, captions not dimmed", /warn/.test(st.banner) && /没有会议声音/.test(st.banner) && !st.stale && /wait/.test(st.dot), JSON.stringify(st));
+  }
+  check("silent capture -> tab title says so", /没有会议声音/.test(await page.title()), await page.title());
+  await page.evaluate(() => window.__lcl.setFakeLevel(1));
+  await sleep(600);
+  if (pip) check("notice clears when audio comes back", (await pipText(page, "pipBanner")) === "");
+  await page.click("#stopBtn");
+  await page.context().close();
+}
+
+// ---- I: handshake hangs after a drop; 立即重连 abandons it and connects at once
+{
+  const page = await newPage();
+  await page.goto(pageUrl());
+  await page.fill("#key", "hangkey");
+  await page.click("#startBtn");
+  await until(page, () => window.__lcl.lines().some((l) => l.src === "Before hang."), null, 8000);
+  await until(page, () => !document.getElementById("retryBtn").classList.contains("hidden"), null, 5000);
+  await sleep(1500); // the second handshake is hanging now
+  const t0 = Date.now();
+  await page.click("#retryBtn");
+  const ok = await until(page, () => window.__lcl.lines().some((l) => l.src === "After retry."), null, 5000);
+  check("立即重连 during a hung handshake reconnects at once", ok && hung.length === 1 && Date.now() - t0 < 3000, `${Date.now() - t0} ms`);
+  await page.click("#stopBtn");
+  await page.context().close();
+}
+
+// ---- J: speech, then the socket dies quietly and resets later: the gap marker still covers the lost speech
+{
+  const page = await newPage();
+  await page.goto(pageUrl());
+  await page.fill("#key", "gapkey");
+  await page.click("#startBtn");
+  await until(page, () => window.__lcl.lines().some((l) => l.src === "Before the drop."), null, 8000);
+  await sleep(1000);
+  await page.evaluate(() => window.__lcl.setFakeLevel(0)); // the question ended before the reset arrived
+  const back = await until(page, () => window.__lcl.lines().some((l) => l.src === "Back again."), null, 10000);
+  const kinds = await page.evaluate(() => window.__lcl.lines().map((l) => l.kind));
+  check("late reset after speech -> gap marker", back && kinds.join(",") === "text,gap,text", kinds.join(","));
+  await page.click("#stopBtn");
+  await page.context().close();
+}
+
+// ---- K: a Deepgram Error message the stream survives is shown, then cleared when results flow again
+{
+  const page = await newPage();
+  await page.goto(pageUrl());
+  await page.fill("#key", "errkey");
+  await page.click("#startBtn");
+  const shownErr = await until(page, () => /mock hiccup/.test(document.getElementById("err").textContent), null, 5000);
+  const cleared = await until(page, () => window.__lcl.lines().some((l) => l.src === "Still fine.") && document.getElementById("err").textContent === "", null, 5000);
+  check("non-fatal Deepgram Error shown, then cleared", shownErr && cleared);
+  await page.click("#stopBtn");
+  check("stop clears stale error text", (await page.textContent("#err")) === "");
+  await page.context().close();
+}
+
+hung.forEach((h) => h.sock.destroy());
 check("no uncaught page errors", errors.length === 0, errors.join(" | "));
 await browser.close();
 http.close();

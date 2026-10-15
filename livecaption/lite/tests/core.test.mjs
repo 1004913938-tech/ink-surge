@@ -36,6 +36,7 @@ test("listenUrl: Deepgram params, language mapping, optional diarize, base overr
   assert.equal(p.utterance_end_ms, "1000");
   assert.equal(p.vad_events, "true");
   assert.equal(p.diarize, "true");
+  assert.equal(p.mip_opt_out, "true", "keep the interviewer's voice out of Deepgram model training");
   assert.ok(!("encoding" in p), "container audio (webm/opus) must not send encoding/sample_rate");
   const z = new URL(LC.listenUrl("ws://localhost:9/v1/listen", { lang: "zh", diarize: false }));
   assert.equal(z.host, "localhost:9");
