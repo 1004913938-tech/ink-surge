@@ -1,0 +1,588 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>LiveCaption 轻量版</title>
+<!--
+  LiveCaption Lite — one file, no server, no install.
+  Meeting audio (getDisplayMedia) -> Deepgram real-time STT (browser WebSocket, your key)
+  -> Chrome built-in on-device Translator API (free) -> captions only you see (+ floating window).
+  Open in desktop Chrome / Edge. Test hooks: ?dg=<ws url> overrides Deepgram, ?fakeAudio=1 uses a tone.
+-->
+<style id="lc-style">
+  :root { --bg:#0f1115; --fg:#f3f4f6; --muted:#9aa3b2; --card:#171a21; --line:#2a2f3a; --accent:#4f8cff; --ok:#22c55e; --warn:#f5a524; --bad:#ef4444; color-scheme: dark; }
+  * { box-sizing: border-box; }
+  html, body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.5 system-ui,-apple-system,"PingFang SC","Microsoft YaHei","Noto Sans CJK SC",sans-serif; }
+  .page { max-width: 860px; margin: 0 auto; padding: 16px; }
+  h1 { font-size: 21px; margin: 6px 0 14px; } h1 small { color: var(--muted); font-size: 13px; font-weight: normal; margin-left: 6px; }
+  .card { background: var(--card); border-radius: 12px; padding: 14px 16px; margin-bottom: 12px; }
+  .step { display:flex; gap:10px; align-items:flex-start; padding: 8px 0; border-top: 1px solid var(--line); }
+  .step:first-child { border-top: 0; }
+  .num { flex: 0 0 24px; height: 24px; border-radius: 50%; background: #222733; color: var(--muted); display:flex; align-items:center; justify-content:center; font-size: 13px; }
+  .step.done .num { background: var(--ok); color: #fff; }
+  .grow { flex: 1; min-width: 0; }
+  label { display:block; font-size: 13px; color: var(--muted); margin: 2px 0; }
+  input, select { width: 100%; background:#0b0d12; color:var(--fg); border:1px solid var(--line); border-radius:8px; padding:8px 10px; font-size:15px; }
+  .row { display:flex; gap:10px; flex-wrap: wrap; } .row > div { flex: 1 1 160px; }
+  button { background: var(--accent); color:#fff; border:0; border-radius:8px; padding:9px 14px; font-size:15px; cursor:pointer; }
+  button:disabled { opacity:.45; cursor: default; } button.ghost { background:#222733; } button.danger { background: var(--bad); }
+  .actions { display:flex; gap:8px; flex-wrap:wrap; margin-top: 8px; align-items: center; }
+  .hint { color: var(--muted); font-size: 13px; } .warn { color: var(--warn); font-size: 13px; } .bad { color: var(--bad); font-size: 14px; }
+  .meter { width: 120px; height: 8px; background:#222733; border-radius: 4px; overflow:hidden; display:inline-block; vertical-align: middle; }
+  .meter > i { display:block; height:100%; width:0; background: var(--ok); transition: width .1s; }
+  .status { font-size: 13px; color: var(--muted); }
+  .dot { width:9px; height:9px; border-radius:50%; display:inline-block; background: var(--muted); margin-right: 6px; vertical-align: middle; }
+  .dot.on { background: var(--ok); } .dot.wait { background: var(--warn); } .dot.err { background: var(--bad); }
+  .captions { display:flex; flex-direction:column; gap:8px; }
+  .line { background: var(--card); border-radius: 10px; padding: 8px 12px; border-left: 3px solid var(--accent); }
+  .line .who { font-size: 12px; color: var(--muted); }
+  .line .zh { font-size: var(--zh, 20px); font-weight: 600; }
+  .line .zh.pending { color: var(--muted); font-weight: 400; }
+  .line .src { font-size: var(--src, 14px); color: var(--muted); margin-top: 2px; }
+  .line.interim { border-left-style: dashed; opacity: .85; }
+  .sizes button { padding: 4px 10px; font-size: 13px; background:#222733; } .sizes button.on { background: var(--accent); }
+  body.pip { padding: 8px; overflow: hidden; display:flex; flex-direction: column; justify-content: flex-end; height: 100vh; }
+  body.pip .line { padding: 6px 10px; }
+  .hidden { display: none !important; }
+</style>
+</head>
+<body>
+<div class="page" id="app">
+  <h1>LiveCaption 轻量版 <small>会议声音 → 实时中文字幕 · 只有你看得到</small></h1>
+
+  <div class="card" id="setup">
+    <div class="step" id="step1">
+      <div class="num">1</div>
+      <div class="grow">
+        <div class="row">
+          <div><label>Deepgram API Key（只保存在本机浏览器里）</label><input id="key" type="password" autocomplete="off" placeholder="粘贴 Deepgram Key" /></div>
+        </div>
+        <div class="row" style="margin-top:6px">
+          <div><label>对方说的语言</label>
+            <select id="srcLang">
+              <option value="en">English 英语</option>
+              <option value="id">Bahasa Indonesia 印尼语</option>
+              <option value="zh">中文</option>
+              <option value="ja">日本語</option>
+              <option value="ko">한국어</option>
+            </select></div>
+          <div><label>翻译成</label>
+            <select id="tgtLang">
+              <option value="zh">中文</option>
+              <option value="en">English</option>
+              <option value="id">Bahasa Indonesia</option>
+            </select></div>
+          <div><label>区分说话人</label>
+            <select id="diarize"><option value="0">否（一位面试官）</option><option value="1">是（多位面试官）</option></select></div>
+        </div>
+      </div>
+    </div>
+    <div class="step" id="step2">
+      <div class="num">2</div>
+      <div class="grow">
+        <div>准备翻译（Chrome 自带离线翻译，第一次会下载语言包，建议面试前做好）</div>
+        <div class="actions"><button id="prepBtn">准备翻译</button><span class="hint" id="prepMsg"></span></div>
+      </div>
+    </div>
+    <div class="step" id="step3">
+      <div class="num">3</div>
+      <div class="grow">
+        <div>进入飞书会议后，点下面按钮，选择会议的声音</div>
+        <div class="hint" id="captureHint"></div>
+        <div class="actions">
+          <button id="startBtn">选择会议声音并开始</button>
+          <button id="stopBtn" class="ghost hidden">停止</button>
+          <span class="meter" title="会议音量"><i id="meter"></i></span>
+          <span class="status"><span class="dot" id="dot"></span><span id="status">未开始</span></span>
+        </div>
+        <div class="bad" id="err"></div>
+        <div class="warn" id="warn"></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="card actions" id="tools">
+    <button id="pipBtn" class="ghost">悬浮字幕窗</button>
+    <span class="sizes" id="sizes">字号 <button data-s="s">小</button><button data-s="m" class="on">中</button><button data-s="l">大</button></span>
+    <button id="exportBtn" class="ghost">下载记录</button>
+    <button id="clearBtn" class="ghost">清屏</button>
+    <span class="warn" id="pipWarn"></span>
+  </div>
+
+  <div class="captions" id="captions"></div>
+</div>
+
+<script id="lc-core">
+/* ---- Pure logic (no DOM). Unit-tested in tests/core.test.mjs by extracting this block. ---- */
+var LC = (function () {
+  var DG_DEFAULT = "wss://api.deepgram.com/v1/listen";
+  var DG_LANG = { en: "en", id: "id", zh: "zh-CN", ja: "ja", ko: "ko" };
+  var NO_SPACE = { zh: 1, ja: 1, ko: 0, th: 1 };
+
+  function listenUrl(base, opt) {
+    var p = [
+      ["model", "nova-3"],
+      ["language", DG_LANG[opt.lang] || opt.lang],
+      ["interim_results", "true"],
+      ["smart_format", "true"],
+      ["punctuate", "true"],
+      ["endpointing", "300"],
+      ["utterance_end_ms", "1000"],
+      ["vad_events", "true"],
+    ];
+    if (opt.diarize) p.push(["diarize", "true"]);
+    return (base || DG_DEFAULT) + "?" + p.map(function (kv) { return kv[0] + "=" + encodeURIComponent(kv[1]); }).join("&");
+  }
+
+  function joiner(lang) { return NO_SPACE[lang] ? "" : " "; }
+
+  /** Groups consecutive words by speaker -> [{speaker, text}] */
+  function runs(words, lang) {
+    var out = [], sep = joiner(lang);
+    for (var i = 0; i < words.length; i++) {
+      var w = words[i];
+      if (out.length && out[out.length - 1].speaker === w.speaker) out[out.length - 1].parts.push(w.text);
+      else out.push({ speaker: w.speaker, parts: [w.text] });
+    }
+    return out.map(function (r) { return { speaker: r.speaker, text: r.parts.join(sep).trim() }; })
+              .filter(function (r) { return r.text; });
+  }
+
+  /** Stable display names: first new voice -> 1, next -> 2 … */
+  function speakerNamer() {
+    var map = {}, n = 0;
+    return function (raw) {
+      if (raw === undefined || raw === null) return null;
+      if (!(raw in map)) map[raw] = ++n;
+      return map[raw];
+    };
+  }
+
+  /**
+   * Turns Deepgram streaming messages into caption lines.
+   *  onLine({id, speaker, text})      a finished utterance (one per speaker run)
+   *  onProgress({stable, interim})    the utterance in progress (stable = already final words)
+   */
+  function createAssembler(opt) {
+    var lang = opt.lang || "en", maxWords = opt.maxWords || 40;
+    var words = [], interim = "", nextId = 1;
+    var sep = joiner(lang);
+
+    function stableText() { return words.map(function (w) { return w.text; }).join(sep).trim(); }
+    function progress() { opt.onProgress && opt.onProgress({ stable: stableText(), interim: interim }); }
+    function commit() {
+      var rs = runs(words, lang);
+      words = []; interim = "";
+      for (var i = 0; i < rs.length; i++) opt.onLine({ id: nextId++, speaker: rs[i].speaker, text: rs[i].text });
+      progress();
+    }
+
+    function handle(msg) {
+      if (!msg || typeof msg !== "object") return;
+      if (msg.type === "UtteranceEnd") { if (words.length) commit(); return; }
+      if (msg.type && msg.type !== "Results") return;
+      var alt = msg.channel && msg.channel.alternatives && msg.channel.alternatives[0];
+      if (!alt) return;
+      var transcript = (alt.transcript || "").trim();
+      if (!msg.is_final) { interim = transcript; progress(); return; }
+      interim = "";
+      var ws = alt.words || [];
+      if (ws.length) {
+        for (var i = 0; i < ws.length; i++) {
+          var t = ws[i].punctuated_word || ws[i].word || "";
+          if (t) words.push({ text: t, speaker: ws[i].speaker });
+        }
+      } else if (transcript) {
+        words.push({ text: transcript, speaker: undefined });
+      }
+      var last = words.length ? words[words.length - 1].text : "";
+      if (msg.speech_final || (words.length >= maxWords && /[.?!。？！]$/.test(last))) commit();
+      else progress();
+    }
+    return { handle: handle, flush: function () { if (words.length) commit(); } };
+  }
+
+  /** Close/handshake outcome -> user-facing reason. Browsers hide HTTP status of a failed
+   *  WebSocket handshake, so "never opened" covers bad key, no balance and blocked network. */
+  function closeReason(opened, code, reason) {
+    if (!opened) return "连不上 Deepgram：请检查 ① Key 是否正确 ② 账户余额 ③ 网络（必要时开 VPN）";
+    if (code === 1008 || /auth|unauthor/i.test(reason || "")) return "Deepgram 拒绝了 Key（无效或已删除）";
+    if (/balance|credit|insufficient|payment/i.test(reason || "")) return "Deepgram 余额不足，请充值";
+    return "";
+  }
+
+  return { listenUrl: listenUrl, runs: runs, speakerNamer: speakerNamer, createAssembler: createAssembler, closeReason: closeReason, DG_DEFAULT: DG_DEFAULT };
+})();
+if (typeof module !== "undefined") module.exports = LC;
+</script>
+
+<script id="lc-app">
+(function () {
+  "use strict";
+  var $ = function (id) { return document.getElementById(id); };
+  var params = new URLSearchParams(location.search + "&" + location.hash.replace(/^#/, ""));
+  var DG_BASE = params.get("dg") || LC.DG_DEFAULT;
+  var FAKE_AUDIO = params.get("fakeAudio") === "1";
+
+  function store(k, v) { try { if (v === undefined) return localStorage.getItem(k); localStorage.setItem(k, v); } catch (e) { return null; } }
+
+  // ---------------------------------------------------------------- state
+  var lines = [];            // {id, speaker, src, zh, zhState: pending|ok|none|error, t}
+  var progress = null;       // {stable, interim, zh}
+  var translator = null;     // {translate(text): Promise<string>, kind}
+  var dg = null, capture = null, meterTimer = null, silentSince = 0, connGen = 0;
+  var pipWin = null;
+  var nameOf = LC.speakerNamer();
+  var size = store("lcl.size") || "m";
+
+  // ---------------------------------------------------------------- setup UI
+  $("key").value = store("lcl.key") || "";
+  $("srcLang").value = store("lcl.src") || "en";
+  $("tgtLang").value = store("lcl.tgt") || "zh";
+  $("diarize").value = store("lcl.diarize") || "0";
+  ["key", "srcLang", "tgtLang", "diarize"].forEach(function (id) {
+    $(id).addEventListener("change", function () {
+      store("lcl." + (id === "srcLang" ? "src" : id === "tgtLang" ? "tgt" : id), $(id).value);
+      if (id === "srcLang" || id === "tgtLang") { translator = null; $("step2").classList.remove("done"); $("prepMsg").textContent = ""; prepareTranslator(false); }
+      render();
+    });
+  });
+
+  var ua = navigator.userAgent;
+  var chromium = /(Chrome|Chromium|Edg)\/\d+/.test(ua) && !/Firefox/.test(ua);
+  var isMac = /Mac OS X|Macintosh/.test(ua);
+  $("captureHint").textContent = !chromium
+    ? "请用电脑版 Chrome 或 Edge 打开本页（Safari / Firefox 拿不到会议声音）。"
+    : isMac
+      ? "弹窗里选「整个屏幕」并打开「同时共享系统音频」（需要 macOS 14.2+），或选会议所在的浏览器标签页并打开「共享标签页音频」。"
+      : "弹窗里选「整个屏幕」并打开左下角「同时共享系统音频」；用飞书网页版开会时，也可以选会议标签页并打开「共享标签页音频」。";
+
+  function setStatus(kind, text) { $("dot").className = "dot " + kind; $("status").textContent = text; }
+  function setErr(t) { $("err").textContent = t || ""; }
+  function setWarn(t) { $("warn").textContent = t || ""; }
+
+  // ---------------------------------------------------------------- translation
+  function translatorFactory() { return self.Translator; }
+
+  var preparing = null; // {pair, click, promise}: one create() at a time
+  function prepareTranslator(fromClick) {
+    var src = $("srcLang").value, tgt = $("tgtLang").value, pair = src + ">" + tgt;
+    if (translator && translator.pair === pair) return Promise.resolve(translator);
+    if (src === tgt) { translator = { pair: pair, kind: "same", translate: function (t) { return Promise.resolve(t); } }; return Promise.resolve(translator); }
+    if (preparing && preparing.pair === pair && (preparing.click || !fromClick)) return preparing.promise;
+    var T = translatorFactory();
+    if (!T) {
+      $("prepMsg").textContent = "这个浏览器没有内置翻译（需要电脑版 Chrome 138 以上）。仍可开始，但只显示原文。";
+      return Promise.resolve(null);
+    }
+    var o = { sourceLanguage: src, targetLanguage: tgt };
+    var stall = null;
+    function msg(t) { if (($("srcLang").value + ">" + $("tgtLang").value) === pair) $("prepMsg").textContent = t; }
+    function armStall() {
+      clearTimeout(stall);
+      stall = setTimeout(function () { msg($("prepMsg").textContent + "（很慢：语言包从 Google 下载，请检查网络或开 VPN，下载完前只显示原文）"); }, 45000);
+    }
+    var p = T.availability(o).then(function (a) {
+      if (a === "unavailable") { msg("Chrome 不支持这个翻译方向（" + src + "→" + tgt + "），只显示原文。"); return null; }
+      if (a !== "available" && !fromClick) { msg("第一次使用要下载语言包：请点「准备翻译」。"); return null; } // download needs a click
+      msg(a === "available" ? "正在启动翻译…" : "正在下载语言包…");
+      armStall();
+      return T.create(Object.assign({}, o, {
+        monitor: function (m) {
+          m.addEventListener("downloadprogress", function (e) {
+            armStall();
+            msg("正在下载语言包… " + Math.round((e.loaded || 0) * 100) + "%");
+          });
+        },
+      })).then(function (t) {
+        clearTimeout(stall);
+        if (($("srcLang").value + ">" + $("tgtLang").value) !== pair) return null; // languages changed meanwhile
+        translator = { pair: pair, kind: "chrome", translate: function (text) { return t.translate(text); } };
+        msg("翻译已就绪（本机离线翻译，不上传）");
+        $("step2").classList.add("done");
+        return translator;
+      });
+    }).catch(function (e) {
+      clearTimeout(stall);
+      msg("翻译启动失败：" + (e && e.message || e) + "。仍可开始，只显示原文。");
+      return null;
+    }).then(function (r) { if (preparing && preparing.promise === p) preparing = null; return r; });
+    preparing = { pair: pair, click: fromClick, promise: p };
+    return p;
+  }
+
+  // translations run one at a time, in order
+  var queue = Promise.resolve();
+  function translateLine(line) {
+    if (!translator) { line.zhState = "none"; render(); return; }
+    queue = queue.then(function () {
+      return translator.translate(line.src).then(function (zh) { line.zh = zh; line.zhState = "ok"; },
+                                                 function () { line.zhState = "error"; });
+    }).then(render);
+  }
+  var progSeq = 0, progTimer = null;
+  function translateProgress() {
+    clearTimeout(progTimer);
+    progTimer = setTimeout(function () {
+      if (!translator || !progress || !progress.stable) return;
+      var seq = ++progSeq, text = progress.stable;
+      translator.translate(text).then(function (zh) {
+        if (seq === progSeq && progress && progress.stable === text) { progress.zh = zh; render(); }
+      }, function () {});
+    }, 300);
+  }
+
+  // ---------------------------------------------------------------- captions
+  function onLine(l) {
+    // Deepgram numbers speakers from 0 on every connection: namespace by connection so a
+    // reconnect never pins a new voice on an old label
+    var spk = l.speaker === undefined || l.speaker === null ? null : connGen + ":" + l.speaker;
+    var line = { id: l.id, speaker: spk, src: l.text, zh: "", zhState: "pending", t: new Date() };
+    lines.push(line);
+    if (lines.length > 300) lines.shift();
+    translateLine(line);
+    render();
+  }
+  function onProgress(p) {
+    var keepZh = progress && progress.stable === p.stable ? progress.zh : (progress && p.stable.indexOf(progress.stable) === 0 ? progress.zh : "");
+    progress = { stable: p.stable, interim: p.interim, zh: keepZh };
+    translateProgress();
+    render();
+  }
+
+  function lineNode(doc, opts) {
+    var div = doc.createElement("div");
+    div.className = "line" + (opts.interim ? " interim" : "");
+    if (opts.who) { var w = doc.createElement("div"); w.className = "who"; w.textContent = opts.who; div.appendChild(w); }
+    var src = $("srcLang").value, tgt = $("tgtLang").value;
+    if (src !== tgt) {
+      var z = doc.createElement("div");
+      z.className = "zh" + (opts.zh ? "" : " pending");
+      z.textContent = opts.zh || opts.zhPlaceholder || "";
+      if (z.textContent) div.appendChild(z);
+    }
+    var s = doc.createElement("div"); s.className = "src"; s.textContent = opts.src; div.appendChild(s);
+    return div;
+  }
+  function whoLabel(speaker) {
+    if ($("diarize").value !== "1") return "";
+    var n = nameOf(speaker);
+    return n ? "说话人 " + n : "";
+  }
+  function fill(doc, container, max) {
+    container.textContent = "";
+    var list = lines.slice(-max);
+    for (var i = 0; i < list.length; i++) {
+      var l = list[i];
+      container.appendChild(lineNode(doc, {
+        who: whoLabel(l.speaker), src: l.src, zh: l.zh,
+        zhPlaceholder: l.zhState === "pending" ? "…" : l.zhState === "error" ? "（翻译失败）" : "",
+      }));
+    }
+    if (progress && (progress.stable || progress.interim)) {
+      container.appendChild(lineNode(doc, {
+        interim: true, src: (progress.stable + " " + progress.interim).trim(), zh: progress.zh,
+      }));
+    }
+  }
+  // Coalesce with a microtask, not requestAnimationFrame: when Feishu covers this window Chrome
+  // treats the page as hidden and stops rAF, which would freeze the floating window too.
+  var renderQueued = false;
+  function render() {
+    if (renderQueued) return;
+    renderQueued = true;
+    Promise.resolve().then(function () {
+      renderQueued = false;
+      fill(document, $("captions"), 40);
+      $("captions").lastElementChild && $("captions").lastElementChild.scrollIntoView({ block: "nearest" });
+      if (pipWin && !pipWin.closed) fill(pipWin.document, pipWin.document.getElementById("pipCaps"), 3);
+    });
+  }
+
+  function applySize(s) {
+    size = s; store("lcl.size", s);
+    var zh = { s: "16px", m: "20px", l: "28px" }[s], src = { s: "12px", m: "14px", l: "17px" }[s];
+    [document, pipWin && pipWin.document].forEach(function (d) {
+      if (!d) return;
+      d.documentElement.style.setProperty("--zh", zh);
+      d.documentElement.style.setProperty("--src", src);
+    });
+    Array.prototype.forEach.call($("sizes").querySelectorAll("button"), function (b) { b.classList.toggle("on", b.dataset.s === s); });
+  }
+  $("sizes").addEventListener("click", function (e) { if (e.target.dataset && e.target.dataset.s) applySize(e.target.dataset.s); });
+  applySize(size);
+
+  // ---------------------------------------------------------------- audio capture
+  function fakeTrack() {
+    var ctx = new AudioContext(), osc = ctx.createOscillator(), dst = ctx.createMediaStreamDestination();
+    osc.frequency.value = 220; osc.connect(dst); osc.start();
+    return { audio: dst.stream.getAudioTracks()[0], stop: function () { osc.stop(); ctx.close(); } };
+  }
+
+  function captureMeeting() {
+    if (FAKE_AUDIO) return Promise.resolve(fakeTrack());
+    return navigator.mediaDevices.getDisplayMedia({
+      video: { frameRate: 1, width: { max: 640 } },
+      audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false, suppressLocalAudioPlayback: false, restrictOwnAudio: true },
+      systemAudio: "include", windowAudio: "window", selfBrowserSurface: "exclude", surfaceSwitching: "include", monitorTypeSurfaces: "include",
+    }).then(function (stream) {
+      var audio = stream.getAudioTracks()[0];
+      var stopAll = function () { stream.getTracks().forEach(function (t) { t.stop(); }); };
+      if (!audio) { stopAll(); throw new Error("没有选到声音：请重新选择，并打开弹窗里的「共享音频」开关。"); }
+      if (audio.readyState !== "live") { stopAll(); throw new Error("系统没有允许录制声音（Mac：系统设置 → 隐私与安全性 → 录屏与系统录音 → 允许 Chrome）。"); }
+      // keep the 1 fps video alive (stopping it can end the audio); it is never sent anywhere
+      return { audio: audio, stop: stopAll, stream: stream };
+    });
+  }
+
+  function startMeter(track) {
+    try {
+      var ctx = new AudioContext(), src = ctx.createMediaStreamSource(new MediaStream([track])), an = ctx.createAnalyser();
+      an.fftSize = 512; src.connect(an); // not connected to speakers: no echo
+      var buf = new Uint8Array(an.fftSize); silentSince = Date.now();
+      meterTimer = setInterval(function () {
+        an.getByteTimeDomainData(buf);
+        var peak = 0; for (var i = 0; i < buf.length; i++) peak = Math.max(peak, Math.abs(buf[i] - 128));
+        var level = Math.min(1, peak / 64);
+        $("meter").style.width = Math.round(level * 100) + "%";
+        if (level > 0.03) { silentSince = Date.now(); if ($("warn").dataset.silence) { setWarn(""); delete $("warn").dataset.silence; } }
+        else if (Date.now() - silentSince > 20000 && !$("warn").dataset.silence) {
+          $("warn").dataset.silence = "1";
+          setWarn("20 秒没听到会议声音：确认选择时打开了「共享系统音频 / 标签页音频」，以及会议里有人在说话。");
+        }
+      }, 150);
+      return function () { clearInterval(meterTimer); ctx.close(); $("meter").style.width = "0"; };
+    } catch (e) { return function () {}; }
+  }
+
+  // ---------------------------------------------------------------- Deepgram stream
+  function DGStream(o) {
+    var ws = null, rec = null, ka = null, stopped = false, failures = 0, retryTimer = null;
+    var mime = ["audio/webm;codecs=opus", "audio/webm", "audio/ogg;codecs=opus"].filter(function (m) { return window.MediaRecorder && MediaRecorder.isTypeSupported(m); })[0];
+
+    function stopRecorder() { if (rec && rec.state !== "inactive") { try { rec.stop(); } catch (e) {} } rec = null; }
+    function startRecorder() {
+      // a fresh recorder per connection: each WebSocket must start with a container header
+      rec = new MediaRecorder(new MediaStream([o.track]), mime ? { mimeType: mime } : undefined);
+      rec.ondataavailable = function (e) { if (e.data && e.data.size && ws && ws.readyState === 1) ws.send(e.data); };
+      rec.start(250);
+    }
+    function connect() {
+      var opened = false;
+      o.onState("wait", failures ? "重新连接识别服务…" : "正在连接识别服务…");
+      try { ws = new WebSocket(o.url, ["token", o.key]); }
+      catch (e) { o.onError("连接地址无效：" + e.message); return; }
+      ws.onopen = function () {
+        opened = true; failures = 0; o.onError(""); o.onOpen();
+        o.onState("on", "正在收听");
+        startRecorder();
+        ka = setInterval(function () { if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: "KeepAlive" })); }, 8000);
+      };
+      ws.onmessage = function (e) {
+        if (typeof e.data !== "string") return;
+        var msg; try { msg = JSON.parse(e.data); } catch (x) { return; }
+        o.onMessage(msg);
+      };
+      ws.onclose = function (e) {
+        clearInterval(ka); stopRecorder(); o.onFlush();
+        if (stopped) return;
+        if (!opened) failures++;
+        var why = LC.closeReason(opened, e.code, e.reason);
+        if (why) o.onError(why);
+        var delay = failures >= 3 ? 30000 : Math.min(15000, 1000 * Math.pow(2, failures));
+        o.onState(failures >= 3 ? "err" : "wait", (failures >= 3 ? "连接失败，" : "连接断开，") + Math.round(delay / 1000) + " 秒后重试");
+        retryTimer = setTimeout(connect, delay);
+      };
+    }
+    connect();
+    return {
+      stop: function () {
+        stopped = true; clearTimeout(retryTimer); clearInterval(ka);
+        try { if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: "CloseStream" })); } catch (e) {}
+        stopRecorder();
+        try { ws && ws.close(); } catch (e) {}
+      },
+    };
+  }
+
+  // ---------------------------------------------------------------- start / stop
+  var stopMeter = function () {};
+  $("prepBtn").addEventListener("click", function () { prepareTranslator(true); });
+
+  $("startBtn").addEventListener("click", function () {
+    setErr(""); setWarn("");
+    var key = $("key").value.trim();
+    if (!key) { setErr("请先在第 1 步填写 Deepgram Key。"); return; }
+    store("lcl.key", key);
+    if (!chromium && !FAKE_AUDIO) { setErr("请用电脑版 Chrome 或 Edge 打开本页。"); return; }
+    prepareTranslator(true); // this click also allows the language-pack download if step 2 was skipped
+    captureMeeting().then(function (c) {
+      capture = c;
+      var lang = $("srcLang").value;
+      var asm = LC.createAssembler({ lang: lang, onLine: onLine, onProgress: onProgress });
+      dg = DGStream({
+        url: LC.listenUrl(DG_BASE, { lang: lang, diarize: $("diarize").value === "1" }),
+        key: key, track: c.audio,
+        onOpen: function () { connGen++; }, onMessage: asm.handle, onFlush: asm.flush,
+        onState: setStatus, onError: setErr,
+      });
+      stopMeter = startMeter(c.audio);
+      c.audio.addEventListener("ended", stopAll); // user clicked "stop sharing"
+      $("startBtn").classList.add("hidden"); $("stopBtn").classList.remove("hidden");
+      $("step3").classList.add("done");
+    }, function (e) {
+      setErr(e && e.name === "NotAllowedError" ? "你取消了共享。再点一次，选好画面并打开「共享音频」开关。" : (e && e.message) || String(e));
+    });
+  });
+
+  function stopAll() {
+    if (dg) { dg.stop(); dg = null; }
+    if (capture) { capture.stop(); capture = null; }
+    stopMeter(); stopMeter = function () {};
+    setStatus("", "已停止");
+    progress = null; render();
+    $("startBtn").classList.remove("hidden"); $("stopBtn").classList.add("hidden");
+    $("step3").classList.remove("done");
+  }
+  $("stopBtn").addEventListener("click", stopAll);
+
+  // ---------------------------------------------------------------- floating window
+  $("pipBtn").addEventListener("click", function () {
+    var api = window.documentPictureInPicture;
+    if (!api) { $("pipWarn").textContent = "当前浏览器不支持悬浮窗（需要电脑版 Chrome / Edge 116+）。"; return; }
+    if (pipWin && !pipWin.closed) return;
+    api.requestWindow({ width: 640, height: 220 }).then(function (w) {
+      pipWin = w;
+      var st = w.document.createElement("style"); st.textContent = $("lc-style").textContent; w.document.head.appendChild(st);
+      w.document.title = "字幕";
+      w.document.body.className = "pip";
+      var c = w.document.createElement("div"); c.className = "captions"; c.id = "pipCaps"; w.document.body.appendChild(c);
+      applySize(size);
+      $("pipWarn").textContent = "⚠ 面试中如果要「共享屏幕」，先关掉悬浮窗，否则对方会看到字幕。";
+      w.addEventListener("pagehide", function () { pipWin = null; $("pipWarn").textContent = ""; });
+      render();
+    }, function (e) { $("pipWarn").textContent = "悬浮窗打开失败：" + (e && e.message || e); });
+  });
+
+  // ---------------------------------------------------------------- export / clear
+  $("exportBtn").addEventListener("click", function () {
+    var pad = function (n) { return (n < 10 ? "0" : "") + n; };
+    var text = lines.map(function (l) {
+      var who = whoLabel(l.speaker);
+      return "[" + pad(l.t.getHours()) + ":" + pad(l.t.getMinutes()) + ":" + pad(l.t.getSeconds()) + "]" + (who ? " " + who : "") + "\n" + l.src + (l.zh ? "\n" + l.zh : "") + "\n";
+    }).join("\n");
+    var a = document.createElement("a");
+    a.href = URL.createObjectURL(new Blob([text], { type: "text/plain;charset=utf-8" }));
+    a.download = "会议字幕-" + new Date().toISOString().slice(0, 16).replace(/[:T]/g, "-") + ".txt";
+    a.click(); setTimeout(function () { URL.revokeObjectURL(a.href); }, 1000);
+  });
+  $("clearBtn").addEventListener("click", function () { lines = []; progress = null; render(); });
+
+  // translator ready without a click if the language pack is already installed
+  prepareTranslator(false);
+  window.__lcl = { lines: function () { return lines; }, progress: function () { return progress; } }; // for tests
+})();
+</script>
+</body>
+</html>
