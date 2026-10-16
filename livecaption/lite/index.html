@@ -308,7 +308,7 @@ if (typeof module !== "undefined") module.exports = LC;
     ? "请用电脑版 Chrome 打开本页（Safari / Firefox 拿不到会议声音）。"
     : isMac
       ? "弹窗里选「整个屏幕」并打开「同时分享系统音频」（需要 macOS 14.2+），或选会议所在的浏览器标签页并打开「分享标签页中的音频」。"
-      : "弹窗里选「整个屏幕」，打开底部的「同时分享系统音频」开关（英文版：Also share system audio），再点「分享」；之后屏幕下方的提示条点「隐藏」（不要点「停止共享」）。用飞书网页版开会时，也可以选会议所在的标签页并打开「分享标签页中的音频」。";
+      : "弹窗里选「整个屏幕」→ 点一下屏幕缩略图 → 打开底部的「带系统音频分享」开关（有的版本叫「同时分享系统音频」，英文版 Also share system audio）→ 点「带音频分享」；之后屏幕下方的提示条点「隐藏」（不要点「停止共享」）。用飞书网页版开会时，也可以选会议所在的标签页并打开「带标签页音频分享」。";
 
   function setStatus(kind, text) {
     ui.kind = kind; ui.status = text; ui.since = Date.now();
@@ -566,7 +566,7 @@ if (typeof module !== "undefined") module.exports = LC;
     }).then(function (stream) {
       var audio = stream.getAudioTracks()[0];
       var stopTracks = function () { stream.getTracks().forEach(function (t) { t.stop(); }); };
-      if (!audio) { stopTracks(); throw new Error("没有选到声音：请重新选择「整个屏幕」，并打开弹窗底部的「同时分享系统音频」开关。"); }
+      if (!audio) { stopTracks(); throw new Error("没有选到声音：请重新选择「整个屏幕」，并打开弹窗底部的「带系统音频分享」开关。"); }
       if (audio.readyState !== "live") { stopTracks(); throw new Error("系统没有允许录制声音（Mac：系统设置 → 隐私与安全性 → 录屏与系统录音 → 允许 Chrome）。"); }
       // keep the 1 fps video alive (stopping it can end the audio); it is never sent anywhere
       return { audio: audio, stop: stopTracks };
@@ -762,7 +762,7 @@ if (typeof module !== "undefined") module.exports = LC;
       });
       c.audio.addEventListener("ended", function () { stopAll("你点了「停止共享」"); });
     }, function (e) {
-      setErr(e && e.name === "NotAllowedError" ? "你取消了共享。再点一次，选「整个屏幕」并打开「同时分享系统音频」开关。" : (e && e.message) || String(e));
+      setErr(e && e.name === "NotAllowedError" ? "你取消了共享。再点一次，选「整个屏幕」、点屏幕缩略图并打开「带系统音频分享」开关。" : (e && e.message) || String(e));
     }).then(function () { starting = false; $("startBtn").disabled = false; });
   });
 
