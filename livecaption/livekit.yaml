@@ -1,0 +1,19 @@
+# LiveKit server config for local / single-node deployment.
+# Production: put a TLS terminator in front (Caddy/nginx), set `rtc.use_external_ip: true`
+# and open the UDP range on the firewall. See https://docs.livekit.io/home/self-hosting/
+port: 7880
+rtc:
+  tcp_port: 7881
+  port_range_start: 50000
+  port_range_end: 50200
+  use_external_ip: false
+redis:
+  address: redis:6379
+keys:
+  # must match LIVEKIT_API_KEY / LIVEKIT_API_SECRET given to api + agent
+  devkey: secretsecretsecretsecretsecret12
+room:
+  auto_create: true
+  empty_timeout: 600
+logging:
+  level: info
