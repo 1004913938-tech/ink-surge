@@ -10,9 +10,10 @@
   Hosted: https://1004913938-tech.github.io/ink-surge/zhiyin/ (copied there by .github/workflows/pages.yml).
   Meeting audio (getDisplayMedia) -> Deepgram real-time STT (browser WebSocket, your key)
   -> Chrome built-in on-device Translator API (free) -> captions only you see (+ floating window).
-  授权码 mode: when the zhiyin-server meta tag above has a URL (pages.yml fills it in at build time), friends can
-  use an access code bought from the owner instead of their own key; the ZhiYin server (livecaption/server)
-  relays the audio to Deepgram with the owner's key and meters the minutes. An empty meta hides that mode.
+  授权码 mode: when the zhiyin-server meta tag above has a URL (pages.yml fills it in at build time), the page
+  takes an access code bought from the owner; the ZhiYin server (livecaption/server) relays the audio to Deepgram
+  with the owner's key and meters the minutes. Such a page offers only that mode; the owner's own-key mode is
+  at ?mykey (not a secret: it only ever uses the viewer's own Deepgram key). An empty meta: own key only.
   Open in desktop Chrome. Test hooks: ?dg=<ws url> overrides Deepgram and ?server=<http url> the ZhiYin server
   (both honoured only for 127.0.0.1 / localhost), ?fakeAudio=1 uses a tone, ?fakeAudio=silent a silent one,
   ?stall=<ms> / ?trTimeout=<ms> / ?silence=<ms> shorten the stall watchdog, the translation timeout and the
@@ -66,7 +67,7 @@
   #pipCaps { min-height: 100%; justify-content: flex-end; }
   body.pip.stale #pipCaps { opacity: .4; }
   body.pip .line { padding: 6px 10px; }
-  /* 授权码 mode (only shown when a ZhiYin server is configured) */
+  /* 授权码 mode (when a ZhiYin server is configured); the choice of modes only at ?mykey */
   .modes { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }
   .modes label { display: flex; align-items: center; gap: 7px; margin: 0; padding: 7px 12px; border: 1px solid var(--line); border-radius: 8px; color: var(--fg); font-size: 14px; cursor: pointer; }
   .modes label:has(input:checked) { border-color: var(--accent); background: rgba(79,140,255,.14); }
@@ -105,7 +106,7 @@
         </div>
         <div id="codePane" class="hidden">
           <div class="row">
-            <div><label for="code">授权码</label><input id="code" autocomplete="off" spellcheck="false" placeholder="XXXX-XXXX-XXXX-XXXX" /></div>
+            <div><label for="code">授权码（向店主购买）</label><input id="code" autocomplete="off" spellcheck="false" placeholder="XXXX-XXXX-XXXX-XXXX" /></div>
           </div>
           <div class="actions">
             <button class="ghost" id="regBtn">还没有授权码？申请</button>
@@ -518,12 +519,14 @@ if (typeof module !== "undefined") module.exports = LC;
   });
 
   // ---------------------------------------------------------------- 授权码 mode (only when a ZhiYin server is configured)
+  // With a server the page is 授权码 only, whatever this browser used before; the owner's own key is at ?mykey.
+  var KEY_OK = !ZY || params.has("mykey");
   function modeRadios() { return Array.prototype.slice.call(document.querySelectorAll('input[name="mode"]')); }
   var storedMode = store("lcl.mode");
-  var mode = !ZY ? "key" : storedMode === "key" || storedMode === "code" ? storedMode : store("lcl.key") ? "key" : "code";
+  var mode = !ZY ? "key" : !KEY_OK ? "code" : storedMode === "key" || storedMode === "code" ? storedMode : store("lcl.key") ? "key" : "code";
   function applyMode(m) {
-    mode = ZY && m === "code" ? "code" : "key";
-    $("modeBox").classList.toggle("hidden", !ZY);
+    mode = ZY && (m === "code" || !KEY_OK) ? "code" : "key";
+    $("modeBox").classList.toggle("hidden", !ZY || !KEY_OK);
     $("codePane").classList.toggle("hidden", mode !== "code");
     $("keyPane").classList.toggle("hidden", mode === "code");
     modeRadios().forEach(function (r) { r.checked = r.value === mode; });
@@ -598,7 +601,7 @@ if (typeof module !== "undefined") module.exports = LC;
   $("code").value = LC.fmtCode(LC.normCode(store("lcl.code") || "") || "");
   showRegRef();
   if (ZY) loadConfig().then(function (c) {
-    if (!c) codeInfo("授权码服务暂时连不上", true); // own-key mode still works
+    if (!c) codeInfo("授权码服务暂时连不上", true); // own-key mode (?mykey) still works
     else if (LC.pickCode($("code").value) && !meCode) refreshMe();
   });
 

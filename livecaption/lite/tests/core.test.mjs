@@ -227,7 +227,7 @@ test("normCode: identical to the server's implementation on random input", { ski
 const PAGE = "https://1004913938-tech.github.io/ink-surge/zhiyin/";
 test("pickCode: the code alone, or the first code in the owner's whole message", () => {
   const msg = "你的知音字幕授权码：7K3M-9QX2-HJ4T-WZ8P\n额度：600 分钟，有效期至 2027-01-14（先到为准）\n" +
-    `用电脑版 Chrome 打开 ${PAGE} → 第 1 步选「用授权码」→ 粘贴 → 开始。同一授权码同时只能在一个页面使用。`;
+    `用电脑版 Chrome 打开 ${PAGE} → 第 1 步粘贴授权码 → 开始。同一授权码同时只能在一个页面使用。`;
   assert.equal(LC.pickCode(msg), "7K3M9QX2HJ4TWZ8P");
   assert.equal(LC.pickCode(msg.replace(/\n/g, "")), "7K3M9QX2HJ4TWZ8P", "an <input> drops the line breaks of a paste");
   assert.equal(LC.pickCode(msg.split("\n")[0]), "7K3M9QX2HJ4TWZ8P", "first line only");

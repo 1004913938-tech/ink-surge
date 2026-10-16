@@ -254,5 +254,5 @@ export function codeMessage(o: { code: string; left_ms: number | null; expires_a
   const until = o.expires_at == null ? "长期有效" : "有效期至 " + wibDate(o.expires_at);
   const both = o.left_ms != null && o.expires_at != null ? "（先到为准）" : "";
   return `${head}${o.code}\n${o.reissue ? "剩余额度" : "额度"}：${amount}，${until}${both}\n` +
-    `用电脑版 Chrome 打开 ${o.pageUrl} → 第 1 步选「用授权码」→ 粘贴 → 开始。同一授权码同时只能在一个页面使用。`;
+    `用电脑版 Chrome 打开 ${o.pageUrl} → 第 1 步粘贴授权码 → 开始。同一授权码同时只能在一个页面使用。`;
 }

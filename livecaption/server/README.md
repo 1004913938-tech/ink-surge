@@ -76,7 +76,7 @@
    - **服务器**：`https://zhiyin-api.xxxx.workers.dev`
    - **店主后台**：`https://zhiyin-api.xxxx.workers.dev/admin` ← **把这个地址加入浏览器书签**
 4. 这次运行最后会自动重新发布字幕页面。再等 2–3 分钟，打开 https://1004913938-tech.github.io/ink-surge/zhiyin/ ，
-   第 1 步出现「用授权码（向店主购买）」就说明全部通了。
+   第 1 步变成「授权码（向店主购买）」输入框（不再有 Deepgram Key 框）就说明全部通了。
 
 没成功时：
 
@@ -87,7 +87,7 @@
 | 红色 ✗，红在 **Check repository secrets** 或 **Ensure workers.dev subdomain** | 点进这次运行，**Summary** 和红色错误里会用中文写明是哪个 secret 不对（`CLOUDFLARE_API_TOKEN` 无效或权限不够 / `CLOUDFLARE_ACCOUNT_ID` 不对 / 两者不属于同一个账户）。按提示重新复制、更新那个 secret，再 Run workflow。复制时多带的空格、换行，或者把整个网址当成 Account ID 粘进去，都会自动纠正，不用担心 |
 | 红色 ✗，红在 **Deploy Worker** | 再点一次 **Re-run jobs**（第一次部署偶尔要跑两次）；还是红就把这一步的错误截图发给懂技术的朋友 |
 | Summary 有地址，但打开后台显示打不开 | 新地址第一次要几分钟才生效，过 5–10 分钟再试 |
-| 字幕页面没有「用授权码」选项 | Actions → **Deploy GitHub Pages** → **Run workflow**，等它变绿后刷新字幕页面 |
+| 字幕页面第 1 步还是 Deepgram Key 框，没有授权码框 | Actions → **Deploy GitHub Pages** → **Run workflow**，等它变绿后刷新字幕页面 |
 
 ### 7. 打开后台，填付款方式和套餐
 
@@ -113,7 +113,7 @@
 ### 8. 自己先试一次（5 分钟）
 
 1. **用户** → **＋ 手动新建** → 称呼填「测试」，分钟数填 `2`，天数留空 → 发码 → **复制消息**。
-2. 用电脑版 Chrome 打开字幕页面 → 第 1 步选「用授权码」→ 粘贴（整条消息也可以，页面会自动只留下授权码）→ 开始，放一段英文视频。
+2. 用电脑版 Chrome 打开字幕页面 → 第 1 步粘贴授权码（整条消息也可以，页面会自动只留下授权码）→ 开始，放一段英文视频。
 3. 大约 2 分钟时字幕应该自动停止，并显示「授权码的时长已用完或已到期，请联系店主续费」。
 4. 再给这个码 **充值** 5 分钟，在两个标签页里同时用这个码开始：先开的那个应该停止，显示「已在另一个页面或设备上开始使用」。
 5. 试完把这个测试码 **删除**。
@@ -204,7 +204,7 @@
 | 改了套餐，朋友看不到 | 最多等 30 秒，让朋友刷新字幕页面 |
 | 不想再接受网页申请 | **设置** → 取消「开放网页申请」→ 保存。之后只能「手动新建」 |
 | 朋友在中国大陆打不开 | `workers.dev` 和 `github.io` 在大陆能不能稳定访问还没有验证过。需要的话可以换成自己的域名（需要懂技术的人帮忙：仓库变量 `ZHIYIN_SERVER_URL`，并把字幕页面所在网址加进 `wrangler.jsonc` 的 `ALLOWED_ORIGINS`） |
-| 朋友想用自己的 Deepgram Key | 字幕页面第 1 步选「用自己的 Deepgram Key」即可，不经过你的服务器，也不计你的时长 |
+| 我自己想用自己的 Deepgram Key | 打开 `https://1004913938-tech.github.io/ink-surge/zhiyin/?mykey`，第 1 步会多出「用自己的 Deepgram Key」：不经过你的服务器，也不计时长。朋友的页面（不带 `?mykey`）只有授权码。这个地址不算秘密，但别人用它也只能填他自己的 Key，不花你的钱 |
 | 想换 Deepgram Key / 后台密码 | GitHub 里更新对应的 secret → Actions → **Deploy ZhiYin server** → **Run workflow** |
 
 ---

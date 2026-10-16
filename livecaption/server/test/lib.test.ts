@@ -249,7 +249,7 @@ test("message text (WeChat-ready)", () => {
   const url = "https://1004913938-tech.github.io/ink-surge/zhiyin/";
   assert.equal(codeMessage({ code: "ABCD-EFGH-JKMN-PQRS", left_ms: 600 * 60_000, expires_at: exp, pageUrl: url }),
     "你的知音字幕授权码：ABCD-EFGH-JKMN-PQRS\n额度：600 分钟，有效期至 2027-01-14（先到为准）\n" +
-    `用电脑版 Chrome 打开 ${url} → 第 1 步选「用授权码」→ 粘贴 → 开始。同一授权码同时只能在一个页面使用。`);
+    `用电脑版 Chrome 打开 ${url} → 第 1 步粘贴授权码 → 开始。同一授权码同时只能在一个页面使用。`);
   assert.match(codeMessage({ code: "X", left_ms: 90 * 60_000, expires_at: null, pageUrl: url }), /\n额度：90 分钟，长期有效\n/);
   assert.match(codeMessage({ code: "X", left_ms: null, expires_at: exp, pageUrl: url }), /\n额度：不限分钟，有效期至 2027-01-14\n/);
   assert.match(codeMessage({ code: "X", left_ms: null, expires_at: null, pageUrl: url }), /\n额度：不限分钟，长期有效\n/);
