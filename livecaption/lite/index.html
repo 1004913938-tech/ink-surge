@@ -3,15 +3,20 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta name="zhiyin-server" content="" />
 <title>知音字幕 ZhiYin</title>
 <!--
-  知音字幕 ZhiYin (LiveCaption Lite) — one file, no server, no install.
+  知音字幕 ZhiYin (LiveCaption Lite) — one file, no install.
   Hosted: https://1004913938-tech.github.io/ink-surge/zhiyin/ (copied there by .github/workflows/pages.yml).
   Meeting audio (getDisplayMedia) -> Deepgram real-time STT (browser WebSocket, your key)
   -> Chrome built-in on-device Translator API (free) -> captions only you see (+ floating window).
-  Open in desktop Chrome. Test hooks: ?dg=<ws url> overrides Deepgram, ?fakeAudio=1 uses a tone,
-  ?fakeAudio=silent a silent one, ?stall=<ms> / ?trTimeout=<ms> / ?silence=<ms> shorten the stall watchdog,
-  the translation timeout and the no-audio warning.
+  授权码 mode: when the zhiyin-server meta tag above has a URL (pages.yml fills it in at build time), friends can
+  use an access code bought from the owner instead of their own key; the ZhiYin server (livecaption/server)
+  relays the audio to Deepgram with the owner's key and meters the minutes. An empty meta hides that mode.
+  Open in desktop Chrome. Test hooks: ?dg=<ws url> overrides Deepgram and ?server=<http url> the ZhiYin server
+  (both honoured only for 127.0.0.1 / localhost), ?fakeAudio=1 uses a tone, ?fakeAudio=silent a silent one,
+  ?stall=<ms> / ?trTimeout=<ms> / ?silence=<ms> shorten the stall watchdog, the translation timeout and the
+  no-audio warning, ?relayBackoff=<ms> the 30 s / 60 s wait after the server says busy / paused.
 -->
 <style id="lc-style">
   :root { --bg:#0f1115; --fg:#f3f4f6; --muted:#9aa3b2; --card:#171a21; --line:#2a2f3a; --accent:#4f8cff; --ok:#22c55e; --warn:#f5a524; --bad:#ef4444; color-scheme: dark; }
@@ -61,6 +66,27 @@
   #pipCaps { min-height: 100%; justify-content: flex-end; }
   body.pip.stale #pipCaps { opacity: .4; }
   body.pip .line { padding: 6px 10px; }
+  /* 授权码 mode (only shown when a ZhiYin server is configured) */
+  .modes { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }
+  .modes label { display: flex; align-items: center; gap: 7px; margin: 0; padding: 7px 12px; border: 1px solid var(--line); border-radius: 8px; color: var(--fg); font-size: 14px; cursor: pointer; }
+  .modes label:has(input:checked) { border-color: var(--accent); background: rgba(79,140,255,.14); }
+  .modes label:has(input:disabled) { opacity: .6; cursor: default; }
+  .modes input { width: auto; margin: 0; accent-color: var(--accent); }
+  #code { font-family: ui-monospace, Menlo, Consolas, monospace; letter-spacing: 1px; }
+  #codeInfo.err { color: var(--bad); }
+  #regInfo { margin-top: 4px; }
+  dialog { background: var(--card); color: var(--fg); border: 1px solid var(--line); border-radius: 12px; padding: 18px 20px; width: min(460px, calc(100vw - 32px)); }
+  dialog::backdrop { background: rgba(0,0,0,.6); }
+  dialog h2 { font-size: 18px; margin: 0 0 4px; }
+  dialog form > label, dialog form > div > label { margin-top: 10px; }
+  dialog .actions { justify-content: flex-end; margin-top: 14px; }
+  dialog .bad { margin-top: 8px; }
+  .hp { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); opacity: 0; pointer-events: none; }
+  .refbox { display: flex; align-items: center; gap: 10px; margin: 10px 0 4px; flex-wrap: wrap; }
+  #regRef { font: 600 26px/1.2 ui-monospace, Menlo, Consolas, monospace; letter-spacing: 1px; }
+  .refbox button { padding: 4px 10px; font-size: 13px; }
+  .pay { white-space: pre-wrap; overflow-wrap: anywhere; background: #0b0d12; border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; margin: 10px 0; font-size: 15px; max-height: 40vh; overflow-y: auto; }
+  .note { color: var(--warn); font-size: 14px; font-weight: 600; }
   .hidden { display: none !important; }
 </style>
 </head>
@@ -72,13 +98,29 @@
     <div class="step" id="step1">
       <div class="num">1</div>
       <div class="grow">
-        <div class="row">
-          <div><label>Deepgram API Key（只保存在本机浏览器里）</label><input id="key" type="password" autocomplete="off" placeholder="粘贴 Deepgram Key" /></div>
+        <div id="modeBox" class="modes hidden">
+          <label><input type="radio" name="mode" value="code" /> 用授权码（向店主购买）</label>
+          <label><input type="radio" name="mode" value="key" /> 用自己的 Deepgram Key</label>
         </div>
-        <div class="actions">
-          <a class="btn" id="dgSignup" href="https://console.deepgram.com/signup" target="_blank" rel="noopener">还没有 Key？注册 Deepgram</a>
-          <a class="btn" id="dgConsole" href="https://console.deepgram.com/" target="_blank" rel="noopener">打开 Deepgram 后台（Key / 用量 / 余额）</a>
-          <span class="hint" id="usage"></span>
+        <div id="codePane" class="hidden">
+          <div class="row">
+            <div><label for="code">授权码</label><input id="code" autocomplete="off" spellcheck="false" placeholder="XXXX-XXXX-XXXX-XXXX" /></div>
+          </div>
+          <div class="actions">
+            <button class="ghost" id="regBtn">还没有授权码？申请</button>
+            <span class="hint" id="codeInfo"></span>
+          </div>
+          <div class="hint" id="regInfo"></div>
+        </div>
+        <div id="keyPane">
+          <div class="row">
+            <div><label>Deepgram API Key（只保存在本机浏览器里）</label><input id="key" type="password" autocomplete="off" placeholder="粘贴 Deepgram Key" /></div>
+          </div>
+          <div class="actions">
+            <a class="btn" id="dgSignup" href="https://console.deepgram.com/signup" target="_blank" rel="noopener">还没有 Key？注册 Deepgram</a>
+            <a class="btn" id="dgConsole" href="https://console.deepgram.com/" target="_blank" rel="noopener">打开 Deepgram 后台（Key / 用量 / 余额）</a>
+            <span class="hint" id="usage"></span>
+          </div>
         </div>
         <div class="row" style="margin-top:6px">
           <div><label>对方说的语言</label>
@@ -122,9 +164,39 @@
         </div>
         <div class="bad" id="err"></div>
         <div class="warn" id="warn"></div>
+        <div class="warn" id="quotaWarn"></div>
       </div>
     </div>
   </div>
+
+  <dialog id="regDlg" aria-labelledby="regTitle">
+    <div id="regFormView">
+      <h2 id="regTitle">申请授权码</h2>
+      <div class="hint">填好后提交，按提示付款；店主确认收款后，会把授权码发给你。</div>
+      <form id="regForm" novalidate autocomplete="off">
+        <label for="regName">称呼</label><input id="regName" maxlength="40" />
+        <label for="regContact">联系方式（微信号/手机/邮箱）</label><input id="regContact" maxlength="80" />
+        <div id="regPlanRow"><label for="regPlan">套餐</label><select id="regPlan"></select></div>
+        <label for="regNote">备注（付款人姓名等）</label><input id="regNote" maxlength="200" />
+        <div class="hp" aria-hidden="true"><label for="regWebsite">Website</label><input id="regWebsite" name="website" tabindex="-1" autocomplete="off" /></div>
+        <div class="bad" id="regErr" role="alert"></div>
+        <div class="actions"><button type="button" class="ghost" id="regCancel">取消</button><button type="submit" id="regSubmit">提交</button></div>
+      </form>
+    </div>
+    <div id="regMsgView" class="hidden">
+      <h2>申请授权码</h2>
+      <div id="regMsg"></div>
+      <div class="actions"><button type="button" class="ghost" id="regMsgClose">关闭</button></div>
+    </div>
+    <div id="regDoneView" class="hidden">
+      <h2>申请已提交</h2>
+      <div class="refbox"><span class="hint">申请编号</span><b id="regRef"></b><button type="button" class="ghost" id="regCopy">复制</button></div>
+      <div class="hint" id="regPlanOut"></div>
+      <div class="pay" id="regPay"></div>
+      <div class="note">付款时请备注申请编号；店主确认后会把授权码发给你</div>
+      <div class="actions"><button type="button" id="regClose">关闭</button></div>
+    </div>
+  </dialog>
 
   <div class="card actions" id="tools">
     <button id="pipBtn" class="ghost">悬浮字幕窗</button>
@@ -262,8 +334,112 @@ var LC = (function () {
     return "";
   }
 
+  /* ---- 授权码 mode: the page talks to the ZhiYin server, which relays to Deepgram with the owner's key ---- */
+  var LOCAL_SERVER = /^https?:\/\/(127\.0\.0\.1|localhost)(:\d+)?$/;
+  var LOCAL_DG = /^wss?:\/\/(127\.0\.0\.1|localhost)(:\d+)?(\/[^\s?#]*)?$/;
+
+  /** The server from the zhiyin-server meta tag (filled in at build time), or a ?server= test override that is
+   *  honoured for localhost only: a phishing link must not be able to send a friend's stored code elsewhere. */
+  function serverFrom(meta, override) {
+    if (override && LOCAL_SERVER.test(override)) return override;
+    meta = String(meta || "").trim().replace(/\/+$/, "");
+    return /^https:\/\/[A-Za-z0-9.-]+(:\d+)?$/.test(meta) || LOCAL_SERVER.test(meta) ? meta : "";
+  }
+  /** ?dg= test override, same rule: localhost only, otherwise a link could send a friend's own key elsewhere. */
+  function dgFrom(override) { return override && LOCAL_DG.test(override) ? override : DG_DEFAULT; }
+
+  /** Same algorithm and test vectors as normCode in the server (livecaption/server/src/lib.ts): any case,
+   *  spaces (also full-width / NBSP) and dashes (also en/em dash, minus sign, full-width hyphen); O->0, I/L->1.
+   *  Returns the 16-char canonical code or null. */
+  function normCode(s) {
+    var c = String(s || "").toUpperCase().replace(/[\s\u3000\-\u2010-\u2015\u2212\uff0d]+/g, "").replace(/O/g, "0").replace(/[IL]/g, "1");
+    return /^[0-9A-HJKMNP-TV-Z]{16}$/.test(c) ? c : null;
+  }
+  function fmtCode(c) { return c ? c.match(/.{4}/g).join("-") : ""; }
+
+  /** The server picks every Deepgram parameter; the page may only choose the language and diarization. */
+  function relayUrl(server, opt) {
+    return server.replace(/^http/, "ws") + "/v1/listen?lang=" + encodeURIComponent(opt.lang) + "&diarize=" + (opt.diarize ? "1" : "0");
+  }
+
+  var RELAY_STOP = {
+    4400: "页面版本过旧，请刷新本页后再开始",
+    4401: "授权码无效或已停用：请检查授权码，或联系店主",
+    4402: "授权码的时长已用完或已到期，请联系店主续费",
+    4409: "这个授权码已在另一个页面或设备上开始使用，这里已停止",
+  };
+  var RELAY_WAIT = { 4429: [30000, "服务器繁忙，稍后自动重试"], 4503: [60000, "识别服务暂停，请联系店主（稍后自动重试）"] };
+  /** Close from the ZhiYin server -> {stop: no reconnect, msg, delay: wait instead of the normal backoff}.
+   *  The server accepts every socket and refuses with a 4xxx close code, because a browser cannot read
+   *  the HTTP status of a failed handshake; a socket that never opened is the network or the server. */
+  function relayClose(opened, code) {
+    if (!opened) return { stop: false, msg: "连不上知音服务器：请检查网络，稍后再试", delay: 0 };
+    if (RELAY_STOP[code]) return { stop: true, msg: RELAY_STOP[code], delay: 0 };
+    if (RELAY_WAIT[code]) return { stop: false, msg: RELAY_WAIT[code][1], delay: RELAY_WAIT[code][0] };
+    if (code === 1008) return { stop: false, msg: "识别服务无法识别音频格式，正在重连", delay: 0 };
+    return { stop: false, msg: "", delay: 0 };
+  }
+
+  function pad2(n) { return (n < 10 ? "0" : "") + n; }
+  function fmtDate(t, withTime) {
+    var d = new Date(t);
+    return d.getFullYear() + "-" + pad2(d.getMonth() + 1) + "-" + pad2(d.getDate()) + (withTime ? " " + pad2(d.getHours()) + ":" + pad2(d.getMinutes()) : "");
+  }
+  /** "剩余 9 小时 12 分 · 有效期至 2027-01-14". ms = what the server allows (the smaller of minutes left and
+   *  time to the expiry date), null = unlimited; expiresAt = epoch ms or null. Dates in local time. */
+  function fmtLeft(ms, expiresAt, now) {
+    now = now || Date.now();
+    var hasMs = ms !== null && ms !== undefined, hasExp = expiresAt !== null && expiresAt !== undefined;
+    if (!hasMs && !hasExp) return "不限时长";
+    if (hasMs && ms <= 0) return "时长已用完或已到期";
+    var parts = [], expLeft = hasExp ? expiresAt - now : Infinity, min = hasMs ? Math.floor(ms / 60000) : 0;
+    // the expiry date is the limit and more than a day away: "剩余 700 小时" would say less than the date does
+    if (!hasMs || (hasExp && ms >= expLeft - 60000 && expLeft > 86400000)) parts.push("期内不限时长");
+    else parts.push("剩余" + (min < 1 ? "不到 1 分钟" : min < 60 ? " " + min + " 分钟" : " " + Math.floor(min / 60) + " 小时 " + (min % 60) + " 分"));
+    if (hasExp) parts.push("有效期至 " + fmtDate(expiresAt, expLeft < 2 * 86400000));
+    return parts.join(" · ");
+  }
+  /** GET /api/me body -> {text, bad} for the line under the code input. */
+  function meInfo(me, now) {
+    if (!me || typeof me !== "object") return { text: "授权码服务暂时连不上", bad: true };
+    if (me.status && me.status !== "active") return { text: "授权码已停用，请联系店主", bad: true };
+    if (typeof me.remaining_ms === "number" && me.remaining_ms <= 0) return { text: "授权码的时长已用完或已到期，请联系店主续费", bad: true };
+    return { text: fmtLeft(me.remaining_ms, me.expires_at, now), bad: false };
+  }
+
+  function given(v) { return v !== null && v !== undefined && String(v).trim() !== ""; }
+  /** Plan from /api/config -> "包月 · 600 分钟（30 天内有效） · ¥50" (the price is shown as the owner typed it). */
+  function planLabel(p) {
+    if (!p) return "";
+    var m = p.minutes, d = p.days, parts = [String(p.name || "套餐")];
+    parts.push(given(m) && given(d) ? m + " 分钟（" + d + " 天内有效）" : given(m) ? m + " 分钟（长期有效）" : given(d) ? d + " 天内不限时长" : "不限时长");
+    if (given(p.price)) parts.push(String(p.price).trim());
+    return parts.join(" · ");
+  }
+  /** Registration form check, same limits as the server (characters = code points): first bad field or "". */
+  function regCheck(f) {
+    var len = function (s) { return Array.from(s || "").length; };
+    if (!len(f.name) || len(f.name) > 40) return "name";
+    if (len(f.contact) < 3 || len(f.contact) > 80) return "contact";
+    if (len(f.note) > 200) return "note";
+    return "";
+  }
+  var REG_FIELD = { name: "称呼（1–40 个字）", contact: "联系方式（3–80 个字）", plan_id: "套餐", note: "备注（最多 200 个字）" };
+  /** POST /api/register failure (status 0 = no answer) -> message for the dialog. */
+  function regError(status, body) {
+    body = body || {};
+    if (!status) return "连不上授权码服务，请检查网络后再试";
+    if (status === 400) return REG_FIELD[body.field] ? "请检查" + REG_FIELD[body.field] : "填写的内容有误，请检查后再提交";
+    if (status === 403) return "店主暂时关闭了在线申请，请直接联系店主";
+    if (status === 429) return "提交太频繁，请 1 小时后再试";
+    if (status === 503) return "待处理的申请太多，请稍后再试，或直接联系店主";
+    return "提交失败（错误 " + status + "），请稍后再试";
+  }
+
   return { listenUrl: listenUrl, runs: runs, speakerNamer: speakerNamer, createAssembler: createAssembler,
-           retryDelay: retryDelay, closeReason: closeReason, DG_DEFAULT: DG_DEFAULT };
+           retryDelay: retryDelay, closeReason: closeReason, DG_DEFAULT: DG_DEFAULT,
+           serverFrom: serverFrom, dgFrom: dgFrom, normCode: normCode, fmtCode: fmtCode, relayUrl: relayUrl,
+           relayClose: relayClose, fmtLeft: fmtLeft, meInfo: meInfo, planLabel: planLabel, regCheck: regCheck, regError: regError };
 })();
 if (typeof module !== "undefined") module.exports = LC;
 </script>
@@ -273,7 +449,11 @@ if (typeof module !== "undefined") module.exports = LC;
   "use strict";
   var $ = function (id) { return document.getElementById(id); };
   var params = new URLSearchParams(location.search + "&" + location.hash.replace(/^#/, ""));
-  var DG_BASE = params.get("dg") || LC.DG_DEFAULT;
+  var DG_BASE = LC.dgFrom(params.get("dg"));            // test override: localhost only
+  var zyMeta = document.querySelector('meta[name="zhiyin-server"]');
+  var ZY = LC.serverFrom(zyMeta && zyMeta.content, params.get("server")); // "" = no 授权码 mode
+  // test hook, local servers only: replaces the 30 s / 60 s wait after 4429 / 4503
+  var RELAY_BACKOFF = /^https?:\/\/(127\.0\.0\.1|localhost)[:\/]?/.test(ZY) && +params.get("relayBackoff") || 0;
   var FAKE_AUDIO = !!params.get("fakeAudio"), fakeGain = null;
   var STALL_MS = +params.get("stall") || 15000;        // loud audio but no reply from Deepgram this long -> reconnect
   var SILENCE_MS = +params.get("silence") || 20000;    // no meeting audio this long -> warning
@@ -293,7 +473,8 @@ if (typeof module !== "undefined") module.exports = LC;
   var pipWin = null, pipUserScrollAt = 0;
   var nameOf = LC.speakerNamer();
   var size = store("lcl.size") || "m";
-  var ui = { kind: "", status: "未开始", err: "", warn: "", since: Date.now(), running: false, everStarted: false, stopNote: "" };
+  var ui = { kind: "", status: "未开始", err: "", warn: "", since: Date.now(), running: false, everStarted: false, stopNote: "",
+             quotaWarn: "", stopFatal: "" }; // 授权码 mode: minutes running low / why the server ended the session
   var live = { startedAt: 0, lastLoudAt: 0 };
 
   // ---------------------------------------------------------------- local usage estimate (this browser only)
@@ -324,6 +505,139 @@ if (typeof module !== "undefined") module.exports = LC;
     });
   });
 
+  // ---------------------------------------------------------------- 授权码 mode (only when a ZhiYin server is configured)
+  function modeRadios() { return Array.prototype.slice.call(document.querySelectorAll('input[name="mode"]')); }
+  var storedMode = store("lcl.mode");
+  var mode = !ZY ? "key" : storedMode === "key" || storedMode === "code" ? storedMode : store("lcl.key") ? "key" : "code";
+  function applyMode(m) {
+    mode = ZY && m === "code" ? "code" : "key";
+    $("modeBox").classList.toggle("hidden", !ZY);
+    $("codePane").classList.toggle("hidden", mode !== "code");
+    $("keyPane").classList.toggle("hidden", mode === "code");
+    modeRadios().forEach(function (r) { r.checked = r.value === mode; });
+  }
+  applyMode(mode);
+  $("modeBox").addEventListener("change", function (e) {
+    if (e.target.name !== "mode") return;
+    applyMode(e.target.value); store("lcl.mode", mode); setErr("");
+    if (mode === "code" && LC.normCode($("code").value) && LC.normCode($("code").value) !== meCode) refreshMe();
+  });
+
+  // every call to the server: JSON both ways, 10 s timeout, network failure -> status 0
+  function api(path, opt) {
+    var ctl = window.AbortController ? new AbortController() : null;
+    var t = ctl && setTimeout(function () { ctl.abort(); }, 10000);
+    return fetch(ZY + path, Object.assign({ cache: "no-store", signal: ctl && ctl.signal }, opt)).then(function (r) {
+      return r.json().catch(function () { return {}; }).then(function (b) { return { status: r.status, body: b && typeof b === "object" ? b : {} }; });
+    }).catch(function () { return { status: 0, body: {} }; }).then(function (x) { clearTimeout(t); return x; });
+  }
+  function codeInfo(t, bad) { $("codeInfo").textContent = t || ""; $("codeInfo").classList.toggle("err", !!bad); }
+  function showRegRef() { var r = store("lcl.regRef"); $("regInfo").textContent = r ? "你的申请编号 " + r + "（待店主确认）" : ""; }
+  function onQuota(q) {
+    codeInfo(LC.fmtLeft(q.remaining_ms, q.expires_at, Date.now()));
+    var left = q.remaining_ms;
+    setQuotaWarn(typeof left === "number" && left < 600000 ? "授权码剩余约 " + Math.max(1, Math.ceil(left / 60000)) + " 分钟" : "");
+  }
+
+  var meSeq = 0, meCode = "", codeTimer = null;
+  function refreshMe(typed) {
+    var c = LC.normCode($("code").value);
+    if (!ZY || !c) return;
+    meCode = c;
+    var seq = ++meSeq;
+    api("/api/me", { headers: { Authorization: "Bearer " + c } }).then(function (x) {
+      if (seq !== meSeq || ui.running) return; // while running, the stream's own quota notes are fresher
+      if (x.status === 200) {
+        var i = LC.meInfo(x.body, Date.now()); codeInfo(i.text, i.bad);
+        if (typed && store("lcl.regRef")) { store("lcl.regRef", ""); showRegRef(); } // a new code arrived: the application is done
+      }
+      else if (x.status === 401) codeInfo("授权码无效：请检查是否抄错，或联系店主", true);
+      else if (x.status === 429) codeInfo("输错次数太多，请 10 分钟后再试", true);
+      else codeInfo("授权码服务暂时连不上", true);
+    });
+  }
+  // typing: look the code up once it is complete; leaving the field: also tidy it and point out a bad format
+  function onCodeEdit(e) {
+    clearTimeout(codeTimer);
+    var raw = $("code").value, c = LC.normCode(raw), done = !!(e && e.type === "change");
+    if (!raw.trim()) { store("lcl.code", ""); meCode = ""; meSeq++; codeInfo(""); return; }
+    if (!c) { meCode = ""; meSeq++; codeInfo(done ? "授权码格式不对：应是 16 位字母和数字（XXXX-XXXX-XXXX-XXXX）" : "", done); return; }
+    store("lcl.code", c);
+    if (done) $("code").value = LC.fmtCode(c);
+    if (c !== meCode) refreshMe(true);
+  }
+  $("code").addEventListener("input", function () { clearTimeout(codeTimer); codeTimer = setTimeout(onCodeEdit, 400); });
+  $("code").addEventListener("change", onCodeEdit);
+
+  var cfg = null; // GET /api/config: {service, version, registration_open, pay_text, plans}
+  function loadConfig() {
+    return api("/api/config").then(function (x) {
+      if (x.status === 200 && x.body.service === "zhiyin") { cfg = x.body; return cfg; }
+      return null;
+    });
+  }
+  $("code").value = LC.fmtCode(LC.normCode(store("lcl.code") || "") || "");
+  showRegRef();
+  if (ZY) loadConfig().then(function (c) {
+    if (!c) codeInfo("授权码服务暂时连不上", true); // own-key mode still works
+    else if (LC.normCode($("code").value) && !meCode) refreshMe();
+  });
+
+  // registration: name + contact + plan -> a reference (R…) the friend writes in the payment memo
+  var dlg = $("regDlg");
+  function regView(id) { ["regFormView", "regMsgView", "regDoneView"].forEach(function (v) { $(v).classList.toggle("hidden", v !== id); }); }
+  function plansOf(c) { return c && Array.isArray(c.plans) ? c.plans : []; }
+  $("regBtn").addEventListener("click", function () {
+    var btn = $("regBtn");
+    if (btn.disabled) return;
+    if (cfg) { openReg(cfg); loadConfig(); return; } // open at once; fresh plans for next time
+    btn.disabled = true;
+    loadConfig().then(function (c) { btn.disabled = false; openReg(c); });
+  });
+  function openReg(c) {
+    $("regErr").textContent = "";
+    if (!c) { $("regMsg").textContent = "连不上授权码服务，请检查网络，稍后再试。"; regView("regMsgView"); }
+    else if (c.registration_open === false) { $("regMsg").textContent = "店主暂时没有开放在线申请，请直接联系店主。"; regView("regMsgView"); }
+    else {
+      var sel = $("regPlan"), keep = sel.value, plans = plansOf(c);
+      sel.textContent = "";
+      plans.forEach(function (p) { var o = document.createElement("option"); o.value = p.id; o.textContent = LC.planLabel(p); sel.appendChild(o); });
+      if (keep && plans.some(function (p) { return String(p.id) === keep; })) sel.value = keep;
+      $("regPlanRow").classList.toggle("hidden", !plans.length);
+      regView("regFormView");
+    }
+    if (!dlg.open) dlg.showModal();
+    if (c && c.registration_open !== false) $("regName").focus();
+  }
+  $("regForm").addEventListener("submit", function (e) {
+    e.preventDefault();
+    var plans = plansOf(cfg);
+    var f = { name: $("regName").value.trim(), contact: $("regContact").value.trim(), plan_id: plans.length ? $("regPlan").value : null,
+              note: $("regNote").value.trim(), website: $("regWebsite").value };
+    var bad = LC.regCheck(f);
+    if (bad) { $("regErr").textContent = LC.regError(400, { field: bad }); $(bad === "name" ? "regName" : bad === "contact" ? "regContact" : "regNote").focus(); return; }
+    $("regSubmit").disabled = true; $("regErr").textContent = "";
+    api("/api/register", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(f) }).then(function (x) {
+      $("regSubmit").disabled = false;
+      if (x.status !== 201 || !x.body.ref) { $("regErr").textContent = LC.regError(x.status, x.body); return; }
+      var ref = String(x.body.ref), plan = x.body.plan;
+      if (!plan || typeof plan !== "object") plan = plans.filter(function (p) { return String(p.id) === String(plan || f.plan_id); })[0];
+      var pay = typeof x.body.pay_text === "string" ? x.body.pay_text : cfg && cfg.pay_text;
+      store("lcl.regRef", ref); showRegRef();
+      // owner-typed text: textContent only (pre-wrap keeps its line breaks), never HTML
+      $("regRef").textContent = ref;
+      $("regPlanOut").textContent = plan ? "套餐：" + LC.planLabel(plan) : "";
+      $("regPay").textContent = String(pay || "").trim() || "店主还没有填写付款方式，请直接联系店主。";
+      $("regCopy").textContent = "复制";
+      regView("regDoneView");
+    });
+  });
+  $("regCopy").addEventListener("click", function () {
+    var b = $("regCopy");
+    if (navigator.clipboard) navigator.clipboard.writeText($("regRef").textContent).then(function () { b.textContent = "已复制"; }, function () {});
+  });
+  ["regCancel", "regMsgClose", "regClose"].forEach(function (id) { $(id).addEventListener("click", function () { dlg.close(); }); });
+
   var ua = navigator.userAgent;
   var chromium = /(Chrome|Chromium|Edg)\/\d+/.test(ua) && !/Firefox/.test(ua);
   var isMac = /Mac OS X|Macintosh/.test(ua);
@@ -342,6 +656,8 @@ if (typeof module !== "undefined") module.exports = LC;
   }
   function setErr(t) { ui.err = t || ""; $("err").textContent = ui.err; render(); }
   function setWarn(t) { ui.warn = t || ""; $("warn").textContent = ui.warn; render(); }
+  // separate from setWarn: that one is the no-audio warning, which the floating window treats as "silent capture"
+  function setQuotaWarn(t) { ui.quotaWarn = t || ""; $("quotaWarn").textContent = ui.quotaWarn; render(); }
   function minutes() { return Math.floor((Date.now() - live.startedAt) / 60000) + " 分钟"; }
 
   // ---------------------------------------------------------------- translation
@@ -515,10 +831,13 @@ if (typeof module !== "undefined") module.exports = LC;
     d.getElementById("pipDot").className = "dot " + (ui.running ? (quiet ? "wait" : ui.kind) : "");
     d.getElementById("pipStatus").textContent = ui.running ? ui.status + (ui.kind === "on" ? " · " + minutes() : "") : (ui.everStarted ? "已停止" : "未开始");
     var text = "", cls = "", retry = false, stale = true;
-    if (ui.everStarted && !ui.running) { text = "字幕已停止" + (ui.stopNote ? "（" + ui.stopNote + "）" : "") + " — 回到 Chrome 点「选择会议声音并开始」"; cls = "bad"; }
+    if (ui.everStarted && !ui.running) {
+      text = ui.stopFatal ? "字幕已停止：" + ui.stopFatal : "字幕已停止" + (ui.stopNote ? "（" + ui.stopNote + "）" : "") + " — 回到 Chrome 点「选择会议声音并开始」"; cls = "bad";
+    }
     else if (ui.running && ui.err) { text = ui.err; cls = "bad"; retry = ui.kind !== "on"; }
     else if (ui.running && ui.kind !== "on" && now - ui.since >= 3000) { text = ui.status; cls = "warn"; retry = true; }
     else if (quiet) { text = "20 秒没有会议声音（你在回答时正常）。对方说话时音量条不动 → 检查会议软件的扬声器 / 耳机"; cls = "warn"; stale = false; }
+    else if (ui.running && ui.quotaWarn) { text = ui.quotaWarn; cls = "warn"; stale = false; }
     d.getElementById("pipBanner").className = "banner " + cls + (text ? "" : " hidden");
     d.getElementById("pipBannerText").textContent = text;
     d.getElementById("pipRetry").classList.toggle("hidden", !retry);
@@ -648,9 +967,10 @@ if (typeof module !== "undefined") module.exports = LC;
       if (stopped) return;
       var c = conn = { opened: false, openedAt: 0, lastMsgAt: 0, results: 0, dead: false, ka: null, hs: null, sock: null };
       o.onState("wait", everOpened || failures ? "正在重新连接识别服务…" : "正在连接识别服务…");
+      // auth rides in the subprotocol: ["token", key] for Deepgram, ["zhiyin.v1", code] for the ZhiYin server.
       // the error text would contain the key: never show it
-      try { c.sock = ws = new WebSocket(o.url, ["token", o.key]); }
-      catch (e) { o.onState("err", "无法连接"); o.onError("Key 格式不对或连接地址无效：请重新复制 Deepgram Key"); return; }
+      try { c.sock = ws = new WebSocket(o.url, o.protocols); }
+      catch (e) { o.onState("err", "无法连接"); o.onError(o.relay ? "授权码格式不对或服务器地址无效" : "Key 格式不对或连接地址无效：请重新复制 Deepgram Key"); return; }
       var sock = c.sock;
       c.hs = setTimeout(function () { if (!c.opened) drop(c, "handshake"); }, 10000);
       sock.onopen = function () {
@@ -667,15 +987,19 @@ if (typeof module !== "undefined") module.exports = LC;
       };
       sock.onmessage = function (e) {
         if (c.dead || typeof e.data !== "string") return;
+        var msg = null; try { msg = JSON.parse(e.data); } catch (x) {}
+        // the ZhiYin server's own quota note (every 15 s) is no sign of life from Deepgram:
+        // handled before lastMsgAt, so it can never hide a stalled recognizer from the watchdog
+        if (o.onQuota && msg && msg.type === "ZhiYinQuota") { o.onQuota(msg); return; }
         c.lastMsgAt = Date.now();
-        var msg; try { msg = JSON.parse(e.data); } catch (x) { return; }
+        if (!msg) return;
         if (msg.type === "Results") {
           c.results++;
           if (c.errShown) { c.errShown = false; o.onError(""); } // an Error the stream survived: results flow again
         }
         if (msg.type === "Error" && !stopped) {
           c.errShown = true;
-          o.onError("Deepgram 报错：" + (msg.description || msg.message || msg.variant || "未知错误"));
+          o.onError((o.relay ? "识别服务报错：" : "Deepgram 报错：") + (msg.description || msg.message || msg.variant || "未知错误"));
         }
         o.onMessage(msg);
       };
@@ -692,19 +1016,27 @@ if (typeof module !== "undefined") module.exports = LC;
       if (c === conn) stopRecorder();
       o.onFlush();
       if (stopped || c !== conn) return;
+      // 授权码 mode: the server's close code says stop (used up, revoked, replaced) or wait (busy, paused)
+      var rc = o.relay ? LC.relayClose(c.opened, code) : null;
+      if (rc && rc.stop) {
+        stopped = true; clearTimeout(retryTimer); retryTimer = null;
+        window.removeEventListener("online", retryNow);
+        o.onFatal(rc.msg);
+        return;
+      }
       var now = Date.now();
       // the outage began at the last reply: audio sent after it got no transcript
       if (c.opened && !downSince) downSince = c.lastMsgAt || now;
       // opened but closed within 5 s without a single result (e.g. audio rejected): a failure, not a success
       var useless = c.opened && c.results === 0 && now - c.openedAt < 5000;
       if (!c.opened || useless) { failures++; if (!failingSince) failingSince = now; } else failures = 0;
-      var why = LC.closeReason(c.opened, code, reason);
+      var why = rc ? rc.msg : LC.closeReason(c.opened, code, reason);
       if (reason === "stall") why = "识别服务没有响应，正在重新连接…";
       else if (everOpened && !c.opened) why = now - failingSince > 30000
-        ? "连不上 Deepgram 已超过 30 秒：检查网络；也可能是余额用完（console.deepgram.com 查看）"
+        ? (rc ? "连不上知音服务器已超过 30 秒：请检查网络" : "连不上 Deepgram 已超过 30 秒：检查网络；也可能是余额用完（console.deepgram.com 查看）")
         : "网络中断，正在自动重连…";
       if (why) o.onError(why);
-      var delay = LC.retryDelay(failures, everOpened) + Math.random() * 300;
+      var delay = (rc && rc.delay ? RELAY_BACKOFF || rc.delay : LC.retryDelay(failures, everOpened)) + Math.random() * 300;
       o.onState(!everOpened && failures >= 3 ? "err" : "wait",
         (c.opened ? "连接断开" : "连接失败") + "，" + Math.max(1, Math.round(delay / 1000)) + " 秒后重试");
       retryTimer = setTimeout(connect, delay);
@@ -746,8 +1078,9 @@ if (typeof module !== "undefined") module.exports = LC;
 
   function setRunning(on) {
     ui.running = on;
-    if (on) { ui.everStarted = true; ui.stopNote = ""; }
-    ["key", "srcLang", "tgtLang", "diarize"].forEach(function (id) { $(id).disabled = on; });
+    if (on) { ui.everStarted = true; ui.stopNote = ""; ui.stopFatal = ""; }
+    ["key", "srcLang", "tgtLang", "diarize", "code"].forEach(function (id) { $(id).disabled = on; });
+    modeRadios().forEach(function (r) { r.disabled = on; });
     $("startBtn").classList.toggle("hidden", on); $("stopBtn").classList.toggle("hidden", !on);
     $("step3").classList.toggle("done", on);
   }
@@ -755,12 +1088,22 @@ if (typeof module !== "undefined") module.exports = LC;
   $("startBtn").addEventListener("click", function () {
     if (starting || dg) return;
     setErr(""); setWarn("");
-    // copied keys often carry spaces (incl. full-width / NBSP) or a "Token " prefix
-    var key = $("key").value.replace(/^\s*token\s+/i, "").replace(/[\s 　]+/g, "");
-    if (!key) { setErr("请先在第 1 步填写 Deepgram Key。"); return; }
-    if (!/^[A-Za-z0-9_.-]+$/.test(key)) { setErr("Key 格式不对（只应包含英文字母和数字），请从 Deepgram 后台重新复制。"); return; }
-    $("key").value = key;
-    store("lcl.key", key);
+    var useCode = mode === "code", key = "", code = "";
+    if (useCode) {
+      // the server is the source of truth for minutes: this browser's own usage estimate is not touched
+      code = LC.normCode($("code").value);
+      if (!$("code").value.trim()) { setErr("请先在第 1 步填写授权码（没有的话点「还没有授权码？申请」）。"); return; }
+      if (!code) { setErr("授权码格式不对：应是 16 位字母和数字（XXXX-XXXX-XXXX-XXXX），请从店主发的消息里重新复制。"); return; }
+      $("code").value = LC.fmtCode(code);
+      store("lcl.code", code);
+    } else {
+      // copied keys often carry spaces (incl. full-width / NBSP) or a "Token " prefix
+      key = $("key").value.replace(/^\s*token\s+/i, "").replace(/[\s 　]+/g, "");
+      if (!key) { setErr("请先在第 1 步填写 Deepgram Key。"); return; }
+      if (!/^[A-Za-z0-9_.-]+$/.test(key)) { setErr("Key 格式不对（只应包含英文字母和数字），请从 Deepgram 后台重新复制。"); return; }
+      $("key").value = key;
+      store("lcl.key", key);
+    }
     if (!chromium && !FAKE_AUDIO) { setErr("请用电脑版 Chrome 打开本页。"); return; }
     starting = true; $("startBtn").disabled = true;
     prepareTranslator(true); // this click also allows the language-pack download if step 2 was skipped
@@ -773,9 +1116,11 @@ if (typeof module !== "undefined") module.exports = LC;
       meter = startMeter(c.audio);
       live.startedAt = Date.now();
       setRunning(true);
+      var diarize = $("diarize").value === "1";
       dg = DGStream({
-        url: LC.listenUrl(DG_BASE, { lang: lang, diarize: $("diarize").value === "1" }),
-        key: key, track: c.audio,
+        url: useCode ? LC.relayUrl(ZY, { lang: lang, diarize: diarize }) : LC.listenUrl(DG_BASE, { lang: lang, diarize: diarize }),
+        protocols: useCode ? ["zhiyin.v1", code] : ["token", key],
+        relay: useCode, track: c.audio,
         onOpen: function (info) {
           gen = ++connGen;
           if (info.gapFrom && live.lastLoudAt > info.gapFrom) addGap(Math.max(1, Math.round((Date.now() - info.gapFrom) / 1000)));
@@ -783,10 +1128,13 @@ if (typeof module !== "undefined") module.exports = LC;
         onMessage: asm.handle, onFlush: asm.flush,
         onTick: function (sent) {
           meter.sample();
-          if (sent) { usagePending += 250; if (usagePending >= 15000) flushUsage(); } // one chunk = 250 ms of audio billed
+          if (sent && !useCode) { usagePending += 250; if (usagePending >= 15000) flushUsage(); } // one chunk = 250 ms of audio billed
         },
         lastLoudAt: function () { return live.lastLoudAt; },
         onState: setStatus, onError: setErr,
+        onQuota: useCode ? onQuota : null,
+        // used up / revoked / opened elsewhere: stop for good and say why
+        onFatal: function (msg) { stopAll(""); ui.stopFatal = msg; setErr(msg); },
       });
       c.audio.addEventListener("ended", function () { stopAll("你点了「停止共享」"); });
     }, function (e) {
@@ -801,9 +1149,10 @@ if (typeof module !== "undefined") module.exports = LC;
     flushUsage();
     setRunning(false);
     ui.stopNote = note || "";
-    setErr(""); setWarn(""); // nothing is reconnecting any more
+    setErr(""); setWarn(""); setQuotaWarn(""); // nothing is reconnecting any more
     setStatus("", "已停止");
     progress = null; render();
+    if (mode === "code") refreshMe(); // minutes left after this session
   }
   $("stopBtn").addEventListener("click", function () { stopAll(""); });
   $("retryBtn").addEventListener("click", function () { if (dg) dg.retryNow(); });
@@ -854,6 +1203,7 @@ if (typeof module !== "undefined") module.exports = LC;
   // translator ready without a click if the language pack is already installed
   prepareTranslator(false);
   window.__lcl = { lines: function () { return lines; }, progress: function () { return progress; }, ui: function () { return ui; }, capture: function () { return capture; },
+                  server: function () { return ZY; }, mode: function () { return mode; },
                   setFakeLevel: function (v) { if (fakeGain) fakeGain.gain.value = v; } }; // for tests
 })();
 </script>

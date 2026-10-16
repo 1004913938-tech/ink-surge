@@ -1,0 +1,579 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>知音字幕 · 店主后台</title>
+<style>
+  :root {
+    --bg: #f5f6f8; --card: #ffffff; --text: #1d2330; --muted: #687083; --line: #e3e6eb; --chip: #eef1f5;
+    --accent: #1f6feb; --accent-text: #ffffff; --ok: #138a43; --ok-bg: #e8f6ee;
+    --warn: #9a5b00; --warn-bg: #fff4dc; --err: #b42318; --err-bg: #fdecea; --code-bg: #f1f5ff;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0f1218; --card: #171b23; --text: #e6e9ef; --muted: #9aa3b2; --line: #2a303b; --chip: #232936;
+      --accent: #4c8dff; --accent-text: #0b1020; --ok: #45d07f; --ok-bg: #12291c;
+      --warn: #f2b65a; --warn-bg: #33270f; --err: #ff8a80; --err-bg: #3a1714; --code-bg: #1b2335;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+    font: 15px/1.55 system-ui, -apple-system, "PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC", sans-serif; }
+  [hidden] { display: none !important; }
+  header { position: sticky; top: 0; z-index: 5; display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
+    padding: 10px 16px; background: var(--card); border-bottom: 1px solid var(--line); }
+  header .brand { font-weight: 700; font-size: 16px; margin-right: auto; }
+  .wrap { max-width: 1180px; margin: 0 auto; padding: 16px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 16px; }
+  .narrow { max-width: 420px; margin: 12vh auto 0; }
+  h1 { font-size: 20px; margin: 0 0 8px; } h2 { font-size: 16px; margin: 18px 0 8px; }
+  .hint { color: var(--muted); font-size: 13px; margin: 4px 0 10px; }
+  .err { color: var(--err); font-size: 14px; min-height: 1.4em; margin: 8px 0 0; white-space: pre-wrap; }
+  button { font: inherit; border-radius: 8px; border: 1px solid var(--line); background: var(--card); color: var(--text);
+    padding: 6px 12px; cursor: pointer; white-space: nowrap; }
+  button:hover { border-color: var(--accent); }
+  button:disabled { opacity: .5; cursor: default; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-text); font-weight: 600; }
+  button.danger { color: var(--err); }
+  button.primary.danger { background: var(--err); border-color: var(--err); color: #fff; }
+  button.small { padding: 3px 8px; font-size: 13px; }
+  input, textarea, select { font: inherit; color: var(--text); background: var(--card); border: 1px solid var(--line);
+    border-radius: 8px; padding: 7px 10px; width: 100%; }
+  input:focus, textarea:focus, select:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+  input.bad, textarea.bad { border-color: var(--err); outline-color: var(--err); }
+  textarea { min-height: 110px; resize: vertical; }
+  label { display: block; font-size: 13px; color: var(--muted); margin: 10px 0 4px; }
+  .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: flex-start; }
+  .row > .grow { flex: 1 1 140px; }
+  .check { display: flex; gap: 8px; align-items: center; color: var(--text); font-size: 15px; margin: 12px 0 4px; }
+  .check input { width: auto; }
+  .banner { border-radius: 10px; padding: 10px 14px; margin-bottom: 10px; border: 1px solid transparent; }
+  .banner.err { background: var(--err-bg); color: var(--err); border-color: var(--err); min-height: 0; margin-top: 0; }
+  .banner.warn { background: var(--warn-bg); color: var(--warn); }
+  .banner a { color: inherit; font-weight: 600; }
+  .stats { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 12px; }
+  .stat { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 8px 14px; min-width: 120px; }
+  .stat b { display: block; font-size: 20px; } .stat span { color: var(--muted); font-size: 12px; }
+  nav.tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--line); margin-bottom: 12px; overflow-x: auto; }
+  nav.tabs button { border: none; border-bottom: 3px solid transparent; border-radius: 0; background: none; padding: 8px 14px; font-size: 15px; }
+  nav.tabs button.on { border-bottom-color: var(--accent); font-weight: 700; }
+  .count { display: inline-block; min-width: 20px; padding: 0 6px; border-radius: 10px; background: var(--err); color: #fff; font-size: 12px; text-align: center; }
+  .toolbar { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin-bottom: 10px; }
+  .toolbar input[type=search] { max-width: 260px; }
+  .tablewrap { overflow-x: auto; background: var(--card); border: 1px solid var(--line); border-radius: 12px; }
+  table { border-collapse: collapse; width: 100%; font-size: 14px; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; font-size: 12px; white-space: nowrap; background: var(--chip); }
+  tr:last-child td { border-bottom: none; }
+  td.nowrap { white-space: nowrap; }
+  td .sub { color: var(--muted); font-size: 12px; word-break: break-all; }
+  td.actions { white-space: nowrap; } td.actions button { margin: 0 4px 4px 0; }
+  .mono { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
+  .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; background: var(--line); margin-right: 6px; vertical-align: middle; }
+  .dot.on { background: var(--ok); box-shadow: 0 0 0 3px var(--ok-bg); }
+  .pill { display: inline-block; font-size: 12px; padding: 0 8px; border-radius: 10px; background: var(--chip); color: var(--muted); }
+  .pill.ok { background: var(--ok-bg); color: var(--ok); } .pill.bad { background: var(--err-bg); color: var(--err); }
+  .red { color: var(--err); font-weight: 600; } .muted { color: var(--muted); }
+  .empty { padding: 28px 16px; text-align: center; color: var(--muted); }
+  .note { white-space: pre-wrap; word-break: break-word; max-width: 260px; }
+  .plans .plan { display: grid; grid-template-columns: 2fr 1fr 1fr 1fr auto; gap: 8px; align-items: end; margin-bottom: 8px; }
+  @media (max-width: 640px) { .plans .plan { grid-template-columns: 1fr 1fr; } .plans .plan .pname { grid-column: 1 / -1; } }
+  .plans .plan label { margin-top: 0; }
+  .plans .plan button { height: 38px; }
+  dialog { border: 1px solid var(--line); border-radius: 14px; padding: 0; width: min(560px, calc(100vw - 32px));
+    background: var(--card); color: var(--text); max-height: calc(100vh - 48px); }
+  dialog.wide { width: min(900px, calc(100vw - 32px)); }
+  dialog::backdrop { background: rgba(10, 14, 22, .55); }
+  .dlg { padding: 18px 20px; }
+  .dlg h3 { margin: 0 0 6px; font-size: 18px; }
+  .btns { display: flex; gap: 8px; justify-content: flex-end; flex-wrap: wrap; margin-top: 16px; }
+  .facts { display: grid; grid-template-columns: auto 1fr; gap: 2px 12px; font-size: 14px; margin: 8px 0; }
+  .facts dt { color: var(--muted); } .facts dd { margin: 0; word-break: break-word; white-space: pre-wrap; }
+  .bigcode { font: 700 26px/1.3 ui-monospace, "SF Mono", Menlo, Consolas, monospace; letter-spacing: 1px; text-align: center;
+    background: var(--code-bg); border-radius: 10px; padding: 14px; margin: 10px 0; user-select: all; word-break: break-all; }
+  .msg { white-space: pre-wrap; word-break: break-word; background: var(--chip); border-radius: 10px; padding: 10px 12px; font-size: 14px; }
+  @media (max-width: 520px) { #liveTop { display: none; } header { padding: 8px 12px; } .wrap { padding: 12px 16px; } }
+  #toast { position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%); background: var(--text); color: var(--card);
+    padding: 8px 16px; border-radius: 20px; font-size: 14px; z-index: 50; max-width: calc(100vw - 32px); }
+</style>
+</head>
+<body>
+<header>
+  <div class="brand">知音字幕 · 店主后台</div>
+  <span id="liveTop" class="muted"></span>
+  <button id="refreshBtn" hidden>刷新</button>
+  <button id="logoutBtn" hidden>退出</button>
+</header>
+
+<section id="login" class="card narrow" hidden>
+  <h1>店主后台</h1>
+  <p class="hint">请输入管理密码（部署时在 GitHub Secrets 里设置的 ADMIN_PASSWORD）。密码只保存在这个浏览器标签页里，关掉标签页就需要重新输入。</p>
+  <form id="loginForm">
+    <input id="pw" type="password" autocomplete="current-password" placeholder="管理密码">
+    <div class="btns" style="margin-top:12px"><button type="submit" class="primary" style="width:100%">登录</button></div>
+  </form>
+  <p id="loginErr" class="err"></p>
+</section>
+
+<main id="app" class="wrap" hidden>
+  <div id="banners"></div>
+  <div id="stats" class="stats"></div>
+  <nav class="tabs">
+    <button data-tab="pending">待确认 <span id="pendingCount" class="count" hidden></span></button>
+    <button data-tab="users">用户</button>
+    <button data-tab="settings">设置</button>
+  </nav>
+  <section id="tab-pending"></section>
+  <section id="tab-users" hidden>
+    <div class="toolbar">
+      <button id="newUserBtn" class="primary">＋ 手动新建</button>
+      <input id="search" type="search" placeholder="搜索称呼 / 联系方式 / 码尾号">
+      <label class="check" style="margin:0"><input id="showDeleted" type="checkbox"> 显示已删除</label>
+    </div>
+    <div id="usersBox"></div>
+    <p class="hint">时间均为雅加达时间（WIB）。「本月」的美元数是按「设置」里的每分钟成本估算的 Deepgram 费用。</p>
+  </section>
+  <section id="tab-settings" hidden></section>
+</main>
+
+<dialog id="dlg"></dialog>
+<div id="toast" hidden></div>
+
+<script nonce="{{NONCE}}">
+"use strict";
+// Every string from the server (names, contacts, notes) goes into the page as text nodes only, never parsed as HTML.
+const $ = (id) => document.getElementById(id);
+const KEY = "zy_admin_pw";
+const store = {
+  get() { try { return sessionStorage.getItem(KEY) || ""; } catch { return ""; } },
+  set(v) { try { if (v) sessionStorage.setItem(KEY, v); else sessionStorage.removeItem(KEY); } catch { /* storage blocked */ } },
+};
+let pw = store.get(), ov = null, tab = "pending", timer = 0;
+
+function h(tag, props, ...kids) {
+  const el = document.createElement(tag);
+  for (const [k, v] of Object.entries(props || {})) {
+    if (v == null || v === false) continue;
+    if (k === "class") el.className = v;
+    else if (k === "text") el.textContent = v;
+    else if (k.startsWith("on")) el.addEventListener(k.slice(2), v);
+    else if (k === "value" || k === "checked" || k === "disabled" || k === "selected") el[k] = v;
+    else if (k === "dataset") Object.assign(el.dataset, v);
+    else el.setAttribute(k, v === true ? "" : String(v));
+  }
+  for (const c of kids.flat(Infinity)) if (c != null && c !== false) el.append(c instanceof Node ? c : String(c));
+  return el;
+}
+
+// ---------- formatting (all times in WIB = UTC+7) ----------
+const WIB = 7 * 3600e3;
+const fmtTime = (ms) => (ms ? new Date(ms + WIB).toISOString().slice(0, 16).replace("T", " ") : "—");
+const fmtDate = (ms) => new Date(ms + WIB).toISOString().slice(0, 10);
+const mins = (ms) => { const m = Math.floor(Math.max(0, ms) / 6000) / 10; return m.toLocaleString("zh-CN"); };   // remaining: round down
+const minsUp = (ms) => { const m = Math.ceil(Math.max(0, ms) / 6000) / 10; return m.toLocaleString("zh-CN"); }; // used: round up
+const usedOf = (u) => (u.quota_ms == null ? minsUp(u.used_ms) + " 分钟 / 不限" : minsUp(u.used_ms) + " / " + mins(u.quota_ms) + " 分钟");
+const usd = (ms) => "$" + ((ms / 60000) * ((ov && ov.settings.usd_per_min) || 0)).toFixed(2);
+const numOrNull = (v) => { const s = String(v ?? "").trim(); return s === "" ? null : Number(s); };
+const LANG = { en: "英语", id: "印尼语", zh: "中文", ja: "日语", ko: "韩语" };
+const KIND = { issue: "发码", topup: "充值", reissue: "重新发码", disable: "停用", enable: "启用", delete: "删除" };
+const END = { 1000: "正常结束", 1011: "识别服务出错", 1012: "服务器重启", 4401: "授权码停用/作废", 4402: "额度用完或到期", 4409: "在另一个页面打开了" };
+
+function toast(text) {
+  const t = $("toast"); t.textContent = text; t.hidden = false;
+  clearTimeout(toast.t); toast.t = setTimeout(() => { t.hidden = true; }, 2600);
+}
+
+// ---------- API ----------
+async function api(path, body, method) {
+  const r = await fetch("/admin/api" + path, {
+    method: method || (body !== undefined ? "POST" : "GET"), cache: "no-store",
+    headers: Object.assign({ Authorization: "Bearer " + pw }, body !== undefined ? { "Content-Type": "application/json" } : {}),
+    body: body !== undefined ? JSON.stringify(body) : undefined,
+  });
+  let j = null;
+  try { j = await r.json(); } catch { /* not JSON */ }
+  if (!r.ok) {
+    const e = new Error((j && j.message) || errText(r.status, j && j.error));
+    e.status = r.status; e.body = j || {};
+    if (r.status === 401 && path === "/overview") logout("密码不对，请重新输入。");
+    throw e;
+  }
+  return j;
+}
+function errText(status, code) {
+  if (code === "locked") return "密码错误次数太多，请 15 分钟后再试。";
+  if (status === 401) return "密码不对。";
+  if (status === 403) return "请直接在这个后台页面里操作。";
+  if (status === 409) return "这条已经处理过了，请刷新。";
+  if (status >= 500) return "服务器出错，请稍后再试。";
+  return "操作失败（" + status + "）。";
+}
+
+// ---------- login ----------
+function showLogin(msg) {
+  $("app").hidden = true; $("login").hidden = false;
+  $("refreshBtn").hidden = $("logoutBtn").hidden = true; $("liveTop").textContent = "";
+  $("loginErr").textContent = msg || ""; $("pw").focus();
+}
+function logout(msg) { pw = ""; store.set(""); clearInterval(timer); if ($("dlg").open) $("dlg").close(); showLogin(msg); }
+$("loginForm").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  pw = $("pw").value.trim();
+  if (!pw) return;
+  $("loginErr").textContent = "正在登录…";
+  try { await load(); store.set(pw); $("pw").value = ""; startApp(); }
+  catch (err) { if (err.status !== 401) $("loginErr").textContent = err.message; }
+});
+$("logoutBtn").addEventListener("click", () => logout(""));
+$("refreshBtn").addEventListener("click", () => refresh(true));
+function startApp() {
+  $("login").hidden = true; $("app").hidden = false; $("refreshBtn").hidden = $("logoutBtn").hidden = false;
+  clearInterval(timer);
+  timer = setInterval(() => { if (!document.hidden && !$("dlg").open) refresh(false); }, 20000);
+}
+async function load() { ov = await api("/overview"); render(); }
+async function refresh(manual) {
+  try { await load(); if (manual) toast("已刷新"); } catch (e) { if (e.status !== 401) toast(e.message); }
+}
+
+// ---------- rendering ----------
+for (const b of document.querySelectorAll("nav.tabs button")) b.addEventListener("click", () => { tab = b.dataset.tab; render(); });
+$("search").addEventListener("input", () => renderUsers());
+$("showDeleted").addEventListener("change", () => renderUsers());
+$("newUserBtn").addEventListener("click", () => openNewUser());
+
+function render() {
+  if (!ov) return;
+  for (const b of document.querySelectorAll("nav.tabs button")) b.classList.toggle("on", b.dataset.tab === tab);
+  for (const t of ["pending", "users", "settings"]) $("tab-" + t).hidden = t !== tab;
+  const pending = ov.registrations.filter((r) => r.status === "pending");
+  $("pendingCount").hidden = !pending.length; $("pendingCount").textContent = String(pending.length);
+  $("liveTop").replaceChildren(h("span", { class: "dot" + (ov.live_count ? " on" : "") }), "在线 " + ov.live_count + " / " + ov.max_streams);
+  renderBanners(); renderStats(); renderPending(pending); renderUsers();
+  if (tab === "settings" && !$("tab-settings").dataset.dirty) renderSettings();
+}
+
+function renderBanners() {
+  const box = $("banners"); box.replaceChildren();
+  const d = ov.dg_error;
+  if (d && (!ov.last_ok_at || d.at > ov.last_ok_at)) {
+    const text = d.status === 402 ? "Deepgram 余额不足，朋友们现在用不了。请到 Deepgram 控制台充值："
+      : d.status === 401 || d.status === 403 ? "Deepgram Key 被拒（可能被删除或权限不够）。请到 Deepgram 控制台检查 Key，然后在 GitHub Secrets 更新 DEEPGRAM_API_KEY 并重新部署："
+      : d.status === 429 ? "Deepgram 同时连接太多（429），有朋友被拒绝。如果经常出现，请在「设置」里调低同时在线上限。详情见："
+      : "连不上 Deepgram（" + (d.status || "网络") + "），可能是临时故障。如果一直出现，请查看：";
+    box.append(h("div", { class: "banner err" }, h("b", { text: "⚠ 识别服务异常　" }), text, " ",
+      h("a", { href: "https://console.deepgram.com/", target: "_blank", rel: "noopener noreferrer", text: "console.deepgram.com" }),
+      h("div", { class: "hint", style: "margin:4px 0 0;color:inherit", text: "发生于 " + fmtTime(d.at) + "（WIB）。之后只要有一次成功连接，这条提示就会消失。" })));
+  }
+  if (ov.live_count >= ov.max_streams)
+    box.append(h("div", { class: "banner warn", text: "同时在线已满（" + ov.live_count + " / " + ov.max_streams + "），新的朋友会被要求 30 秒后重试。可以在「设置」里调高上限（最多 60）。" }));
+}
+
+function renderStats() {
+  const t = ov.totals, month = t.month_min * 60000;
+  const stat = (big, small) => h("div", { class: "stat" }, h("b", { text: big }), h("span", { text: small }));
+  $("stats").replaceChildren(
+    stat(ov.live_count + " / " + ov.max_streams, "现在在线 / 上限"),
+    stat(t.today_min.toLocaleString("zh-CN") + " 分钟", "今天（WIB）"),
+    stat(t.month_min.toLocaleString("zh-CN") + " 分钟", "本月 · 约 " + usd(month) + " Deepgram 费用"),
+    stat(t.all_min.toLocaleString("zh-CN") + " 分钟", "累计"),
+    stat(String(ov.users.filter((u) => u.status === "active").length), "有效授权码"));
+}
+
+function planText(p) { return p ? p.name + (p.price ? "（" + p.price + "）" : "") : "—"; }
+
+function renderPending(pending) {
+  const box = $("tab-pending"); box.replaceChildren();
+  if (!pending.length) {
+    box.append(h("div", { class: "tablewrap" }, h("div", { class: "empty" }, "暂时没有新的申请。", h("br"),
+      "朋友在字幕页面点「还没有授权码？申请」提交后，会出现在这里。")));
+  } else {
+    box.append(h("p", { class: "hint", text: "收到朋友的付款后（付款备注里应有申请编号），点「确认收款并发码」。" }),
+      h("div", { class: "tablewrap" }, h("table", null,
+        h("thead", null, h("tr", null, ["申请编号", "时间（WIB）", "称呼", "联系方式", "套餐", "备注", ""].map((x) => h("th", { text: x })))),
+        h("tbody", null, pending.map((r) => h("tr", null,
+          h("td", { class: "mono nowrap" }, h("b", { text: r.ref })),
+          h("td", { class: "nowrap", text: fmtTime(r.created_at) }),
+          h("td", { text: r.name }), h("td", { class: "note", text: r.contact }),
+          h("td", { text: r.plan ? planText(r.plan) : r.plan_id ? "（套餐已删除）" : "—" }),
+          h("td", { class: "note", text: r.note || "" }),
+          h("td", { class: "actions" },
+            h("button", { class: "primary small", text: "确认收款并发码", onclick: () => openApprove(r) }),
+            h("button", { class: "small danger", text: "拒绝", onclick: () => confirmDo("拒绝申请 " + r.ref + "？",
+              "朋友不会收到通知；如果已经付款，请记得联系对方退款。", "拒绝", () => api("/registrations/" + r.ref + "/reject", {}), "已拒绝") }))))))));
+  }
+  const done = ov.registrations.filter((r) => r.status !== "pending");
+  if (done.length) {
+    box.append(h("details", { style: "margin-top:14px" }, h("summary", { class: "muted", text: "最近处理的申请（" + done.length + "）" }),
+      h("div", { class: "tablewrap", style: "margin-top:8px" }, h("table", null,
+        h("thead", null, h("tr", null, ["申请编号", "处理时间（WIB）", "称呼", "联系方式", "套餐", "结果"].map((x) => h("th", { text: x })))),
+        h("tbody", null, done.map((r) => h("tr", null,
+          h("td", { class: "mono", text: r.ref }), h("td", { class: "nowrap", text: fmtTime(r.decided_at) }),
+          h("td", { text: r.name || "（已删除）" }), h("td", { class: "note", text: r.contact }), h("td", { text: planText(r.plan) }),
+          h("td", null, h("span", { class: "pill " + (r.status === "approved" ? "ok" : "bad"), text: r.status === "approved" ? "已发码" : "已拒绝" })))))))));
+  }
+}
+
+function renderUsers() {
+  if (!ov) return;
+  const q = $("search").value.trim().toLowerCase(), showDel = $("showDeleted").checked;
+  const list = ov.users.filter((u) => (showDel || !u.deleted) &&
+    (!q || (u.name + " " + u.contact + " " + u.code_hint).toLowerCase().includes(q)))
+    .sort((a, b) => (b.live ? 1 : 0) - (a.live ? 1 : 0) || b.id - a.id);
+  const box = $("usersBox");
+  if (!list.length) {
+    box.replaceChildren(h("div", { class: "tablewrap" }, h("div", { class: "empty",
+      text: ov.users.length ? "没有符合条件的用户。" : "还没有用户。确认第一笔申请，或点「手动新建」发一个授权码。" })));
+    return;
+  }
+  box.replaceChildren(h("div", { class: "tablewrap" }, h("table", null,
+    h("thead", null, h("tr", null, ["", "称呼 / 联系方式", "码尾号", "已用 / 总额", "剩余", "到期（WIB）", "最近使用", "本月", "操作"].map((x) => h("th", { text: x })))),
+    h("tbody", null, list.map(userRow)))));
+}
+
+function userRow(u) {
+  const expired = u.expires_at != null && u.expires_at <= ov.now;
+  const usedUp = u.quota_ms != null && u.used_ms >= u.quota_ms;
+  const state = u.deleted ? h("span", { class: "pill", text: "已删除" }) : u.status !== "active" ? h("span", { class: "pill bad", text: "已停用" })
+    : expired ? h("span", { class: "pill bad", text: "已过期" }) : usedUp ? h("span", { class: "pill bad", text: "已用完" }) : null;
+  const left = u.status !== "active" ? h("span", { class: "muted", text: "—" }) : u.remaining_ms == null ? "不限"
+    : u.remaining_ms <= 0 ? h("span", { class: "red", text: "0" }) : u.quota_ms == null ? "不限分钟" : mins(u.remaining_ms) + " 分钟";
+  return h("tr", null,
+    h("td", { class: "nowrap", title: u.live ? "正在使用，开始于 " + fmtTime(u.live.started_at) : "" }, h("span", { class: "dot" + (u.live ? " on" : "") })),
+    h("td", null, h("div", null, h("b", { text: u.name || "（已删除）" }), " ", state), h("div", { class: "sub", text: u.contact })),
+    h("td", { class: "mono nowrap", text: "…" + u.code_hint }),
+    h("td", { class: "nowrap", text: usedOf(u) }),
+    h("td", { class: "nowrap" }, left),
+    h("td", { class: "nowrap" + (expired ? " red" : ""), text: u.expires_at == null ? "长期" : fmtDate(u.expires_at) }),
+    h("td", { class: "nowrap", text: u.live ? "正在使用" : fmtTime(u.last_used_at) }),
+    h("td", { class: "nowrap" }, minsUp(u.month_ms) + " 分钟", h("div", { class: "sub", text: "≈ " + usd(u.month_ms) })),
+    h("td", { class: "actions" }, u.deleted
+      ? h("button", { class: "small", text: "记录", onclick: () => openHistory(u) })
+      : [h("button", { class: "small primary", text: "充值", onclick: () => openTopup(u) }),
+        h("button", { class: "small", text: u.status === "active" ? "停用" : "启用", onclick: () => u.status === "active"
+          ? confirmDo("停用「" + u.name + "」的授权码？", "如果正在使用会立刻断开。以后可以再启用。", "停用", () => api("/users/" + u.id + "/status", { status: "disabled" }), "已停用")
+          : api("/users/" + u.id + "/status", { status: "active" }).then(() => { toast("已启用"); return load(); }, (e) => toast(e.message)) }),
+        h("button", { class: "small", text: "重新发码", onclick: () => confirmDo("给「" + u.name + "」重新发码？", "旧授权码会立刻作废（正在使用会被断开），剩余额度和有效期不变。新码只显示一次。",
+          "重新发码", async () => { const r = await api("/users/" + u.id + "/reissue", {}); await load(); showCode(r, "新授权码已生成"); return false; }) }),
+        h("button", { class: "small", text: "记录", onclick: () => openHistory(u) }),
+        h("button", { class: "small danger", text: "删除", onclick: () => confirmDo("删除「" + u.name + "」？",
+          "会抹掉称呼和联系方式，并停用授权码（正在使用会被断开）。使用记录保留，用于对账。不能恢复。", "删除", () => api("/users/" + u.id + "/delete", {}), "已删除") })]));
+}
+
+// ---------- dialogs ----------
+function openDialog(content, opts) {
+  const d = $("dlg");
+  d.className = (opts && opts.wide) ? "wide" : "";
+  d.replaceChildren(h("div", { class: "dlg" }, content));
+  d.onclose = null; d.oncancel = (opts && opts.oncancel) || null;
+  if (!d.open) d.showModal();
+  const first = d.querySelector("input, textarea, select"); if (first) first.focus();
+  return d;
+}
+const closeDialog = () => { const d = $("dlg"); d.oncancel = null; if (d.open) d.close(); };
+function field(labelText, input, hint) { return h("div", { class: "grow" }, h("label", { text: labelText }), input, hint ? h("div", { class: "hint", text: hint }) : null); }
+const numInput = (name, value, ph) => h("input", { name, type: "number", min: "0", step: "any", inputmode: "decimal", value: value == null ? "" : String(value), placeholder: ph || "" });
+
+function formDialog(title, intro, fields, okText, submit) {
+  const err = h("p", { class: "err" });
+  const ok = h("button", { type: "submit", class: "primary", text: okText });
+  const form = h("form", { novalidate: true }, h("h3", { text: title }), intro, fields,
+    err, h("div", { class: "btns" }, h("button", { type: "button", text: "取消", onclick: closeDialog }), ok));
+  form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    for (const el of form.querySelectorAll(".bad")) el.classList.remove("bad");
+    ok.disabled = true; err.textContent = "";
+    try { await submit(form.elements); }
+    catch (x) {
+      err.textContent = x.message;
+      const f = x.body && x.body.field && form.elements.namedItem(String(x.body.field).split(".")[0]);
+      if (f && f.classList) { f.classList.add("bad"); f.focus(); }
+    } finally { ok.disabled = false; }
+  });
+  openDialog(form);
+}
+
+function grantFields(minutes, days, note) {
+  return [h("div", { class: "row" },
+    field("分钟数", numInput("minutes", minutes, "留空 = 不限分钟")),
+    field("有效天数", numInput("days", days, "留空 = 长期有效"))),
+    h("div", { class: "hint", text: "两个都填时，先到为准。" }),
+    field("备注（只有你能看到）", h("input", { name: "note", maxlength: "200", value: note || "", placeholder: "例如：微信 ¥50" }))];
+}
+const grantBody = (f) => ({ minutes: numOrNull(f.minutes.value), days: numOrNull(f.days.value), note: f.note.value.trim() });
+
+function openApprove(r) {
+  const p = r.plan;
+  formDialog("确认收款并发码", h("dl", { class: "facts" },
+    h("dt", { text: "申请编号" }), h("dd", { class: "mono", text: r.ref }),
+    h("dt", { text: "称呼" }), h("dd", { text: r.name }),
+    h("dt", { text: "联系方式" }), h("dd", { text: r.contact }),
+    h("dt", { text: "套餐" }), h("dd", { text: planText(p) }),
+    h("dt", { text: "朋友的备注" }), h("dd", { text: r.note || "—" })),
+  grantFields(p ? p.minutes : null, p ? p.days : null, p && p.price ? p.price : ""), "发码", async (f) => {
+    const body = grantBody(f);
+    if (body.minutes == null && body.days == null && !confirm("分钟数和天数都留空 = 永久不限，确定吗？")) return;
+    const res = await api("/registrations/" + r.ref + "/approve", body);
+    await load(); showCode(res, "授权码已生成");
+  });
+}
+
+function openNewUser() {
+  const plans = (ov && ov.settings.plans) || [];
+  const pick = h("select", { name: "plan", onchange: () => {
+    const p = plans.find((x) => x.id === pick.value); if (!p) return;
+    const f = pick.form.elements; f.minutes.value = p.minutes ?? ""; f.days.value = p.days ?? ""; if (!f.note.value) f.note.value = p.price || "";
+  } }, h("option", { value: "", text: "（不用套餐，自己填）" }), plans.map((p) => h("option", { value: p.id, text: planText(p) })));
+  formDialog("手动新建授权码", h("p", { class: "hint", text: "给没有在网页上申请的朋友直接发码。" }), [
+    field("称呼", h("input", { name: "name", maxlength: "40", placeholder: "例如：小王" })),
+    field("联系方式（可不填）", h("input", { name: "contact", maxlength: "80", placeholder: "微信号 / 手机 / 邮箱" })),
+    plans.length ? field("套餐（可选，用来快速填写）", pick) : null,
+    grantFields(null, null, "")], "发码", async (f) => {
+    const body = Object.assign({ name: f.name.value.trim(), contact: f.contact.value.trim() }, grantBody(f));
+    if (body.minutes == null && body.days == null && !confirm("分钟数和天数都留空 = 永久不限，确定吗？")) return;
+    const res = await api("/users", body);
+    await load(); tab = "users"; render(); showCode(res, "授权码已生成");
+  });
+}
+
+function openTopup(u) {
+  formDialog("充值：" + u.name, h("dl", { class: "facts" },
+    h("dt", { text: "已用 / 总额" }), h("dd", { text: usedOf(u) }),
+    h("dt", { text: "到期" }), h("dd", { text: u.expires_at == null ? "长期有效" : fmtTime(u.expires_at) + "（WIB）" })), [
+    h("div", { class: "row" },
+      field("增加分钟", h("input", { name: "add_minutes", type: "number", step: "any", inputmode: "decimal", placeholder: u.quota_ms == null ? "不限分钟，无需增加" : "例如 300" })),
+      field("增加天数", numInput("add_days", null, u.expires_at == null ? "长期有效，无需增加" : "例如 30"))),
+    h("div", { class: "hint", text: "天数：已过期的码从今天起算。分钟：填负数可以扣回（用于改错）。正在使用时立刻生效，不会断开。" }),
+    field("备注（只有你能看到）", h("input", { name: "note", maxlength: "200", placeholder: "例如：微信 ¥30" }))], "充值", async (f) => {
+    await api("/users/" + u.id + "/topup", { add_minutes: numOrNull(f.add_minutes.value), add_days: numOrNull(f.add_days.value), note: f.note.value.trim() });
+    closeDialog(); toast("已充值"); await load();
+  });
+}
+
+function confirmDo(title, text, okText, action, doneText) {
+  const err = h("p", { class: "err" });
+  const ok = h("button", { class: okText === "删除" || okText === "拒绝" || okText === "停用" ? "primary danger" : "primary", text: okText, onclick: async () => {
+    ok.disabled = true;
+    try { const r = await action(); if (r !== false) { closeDialog(); if (doneText) toast(doneText); await load(); } }
+    catch (e) { err.textContent = e.message; ok.disabled = false; }
+  } });
+  openDialog([h("h3", { text: title }), h("p", { text }), err, h("div", { class: "btns" }, h("button", { text: "取消", onclick: closeDialog }), ok)]);
+}
+
+async function copyText(text) {
+  try { await navigator.clipboard.writeText(text); return true; } catch { /* fall back below */ }
+  const ta = h("textarea", { value: text, style: "position:fixed;left:-9999px;top:0" });
+  document.body.append(ta); ta.select();
+  let ok = false; try { ok = document.execCommand("copy"); } catch { ok = false; }
+  ta.remove(); return ok;
+}
+
+function showCode(res, title) {
+  let copied = false;
+  const status = h("p", { class: "hint", text: "" });
+  const copy = async (text, what) => {
+    if (await copyText(text)) { copied = true; status.textContent = "✓ 已复制" + what + "。去微信粘贴发给朋友即可。"; toast("已复制" + what); }
+    else status.textContent = "复制失败：请手动选中上面的文字复制。";
+  };
+  const done = () => { if (copied || confirm("还没有复制。关掉后就再也看不到这个授权码了（只能重新发码）。确定关闭？")) closeDialog(); };
+  openDialog([
+    h("h3", { text: title + "：" + (res.user.name || "") }),
+    h("div", { class: "banner warn", text: "授权码只显示这一次。请现在点「复制消息」，粘贴到微信发给朋友。" }),
+    h("div", { class: "bigcode", text: res.code }),
+    h("label", { text: "发给朋友的消息" }),
+    h("div", { class: "msg", text: res.message }), status,
+    h("div", { class: "btns" },
+      h("button", { text: "只复制授权码", onclick: () => copy(res.code, "授权码") }),
+      h("button", { text: "完成", onclick: done }),
+      h("button", { class: "primary", text: "复制消息", onclick: () => copy(res.message, "消息") }))],
+  { oncancel: (e) => { e.preventDefault(); done(); } });
+}
+
+async function openHistory(u) {
+  openDialog([h("h3", { text: "记录：" + (u.name || "（已删除）") }), h("p", { class: "hint", text: "加载中…" })], { wide: true });
+  let d;
+  try { d = await api("/users/" + u.id + "/sessions?limit=100"); }
+  catch (e) { openDialog([h("h3", { text: "记录" }), h("p", { class: "err", text: e.message }), h("div", { class: "btns" }, h("button", { text: "关闭", onclick: closeDialog }))]); return; }
+  const table = (heads, rows, empty) => rows.length ? h("div", { class: "tablewrap" }, h("table", null,
+    h("thead", null, h("tr", null, heads.map((x) => h("th", { text: x })))), h("tbody", null, rows))) : h("p", { class: "muted", text: empty });
+  openDialog([
+    h("h3", { text: "记录：" + (u.name || "（已删除）") }),
+    h("h2", { text: "账目" }),
+    table(["时间（WIB）", "类型", "分钟", "到期（WIB）", "备注"], d.ledger.map((l) => h("tr", null,
+      h("td", { class: "nowrap", text: fmtTime(l.at) }), h("td", { text: KIND[l.kind] || l.kind }),
+      h("td", { class: "nowrap", text: l.add_ms == null ? (l.kind === "issue" ? "不限" : "") : (l.add_ms > 0 && l.kind === "topup" ? "+" : "") + mins(l.add_ms) + (l.add_ms < 0 ? "（扣回）" : "") }),
+      h("td", { class: "nowrap", text: l.expires_at == null ? (l.kind === "issue" ? "长期" : "") : fmtDate(l.expires_at) }),
+      h("td", { class: "note", text: l.note || "" }))), "没有账目。"),
+    h("h2", { text: "使用记录（最近 100 次）" }),
+    table(["开始（WIB）", "时长", "语言", "区分说话人", "结束"], d.sessions.map((s) => h("tr", null,
+      h("td", { class: "nowrap", text: fmtTime(s.started_at) }), h("td", { class: "nowrap", text: minsUp(s.ms) + " 分钟" }),
+      h("td", { text: LANG[s.lang] || s.lang || "" }), h("td", { text: s.diarize ? "是" : "否" }),
+      h("td", { text: s.live ? "正在使用" : END[s.end_code] || (s.end_code ? "代码 " + s.end_code : "—") }))), "还没有使用记录。"),
+    h("div", { class: "btns" }, h("button", { class: "primary", text: "关闭", onclick: closeDialog }))], { wide: true });
+}
+
+// ---------- settings ----------
+function planRow(p) {
+  const row = h("div", { class: "plan", dataset: { id: (p && p.id) || "" } },
+    h("div", { class: "pname" }, h("label", { text: "套餐名称" }), h("input", { class: "p-name", maxlength: "30", value: (p && p.name) || "", placeholder: "例如：10 小时 / 3 个月" })),
+    h("div", null, h("label", { text: "分钟数" }), h("input", { class: "p-min", type: "number", min: "0", step: "any", value: p && p.minutes != null ? String(p.minutes) : "", placeholder: "不限" })),
+    h("div", null, h("label", { text: "有效天数" }), h("input", { class: "p-days", type: "number", min: "0", step: "any", value: p && p.days != null ? String(p.days) : "", placeholder: "长期" })),
+    h("div", null, h("label", { text: "价格" }), h("input", { class: "p-price", maxlength: "30", value: (p && p.price) || "", placeholder: "例如 ¥50" })),
+    h("button", { type: "button", class: "small danger", text: "删除", onclick: () => { row.remove(); markDirty(); } }));
+  return row;
+}
+function markDirty() { $("tab-settings").dataset.dirty = "1"; }
+function renderSettings() {
+  const s = ov.settings, box = $("tab-settings");
+  delete box.dataset.dirty;
+  const plansBox = h("div", { class: "plans" }, s.plans.map(planRow));
+  const err = h("p", { class: "err" });
+  const save = h("button", { type: "submit", class: "primary", text: "保存设置" });
+  const form = h("form", { class: "card", novalidate: true, oninput: markDirty },
+    h("h2", { style: "margin-top:0", text: "付款说明" }),
+    h("p", { class: "hint", text: "朋友提交申请后会看到这段文字。写清楚收款方式和金额，并提醒他们在付款备注里写申请编号。" }),
+    h("textarea", { name: "pay_text", maxlength: "2000", value: s.pay_text, placeholder: "例如：\n微信转账给 xxx（微信号 xxx）\n付款时请在备注里写申请编号 R…" }),
+    h("h2", { text: "套餐" }),
+    h("p", { class: "hint", text: "分钟数留空 = 不限分钟；天数留空 = 长期有效。两个都填时先到为准。最多 10 个。" }),
+    plansBox,
+    h("button", { type: "button", text: "＋ 添加套餐", onclick: () => {
+      if (plansBox.children.length >= 10) { toast("最多 10 个套餐"); return; }
+      plansBox.append(planRow(null)); markDirty(); plansBox.lastElementChild.querySelector("input").focus(); } }),
+    h("h2", { text: "其他" }),
+    h("label", { class: "check" }, h("input", { name: "registration_open", type: "checkbox", checked: s.registration_open }), "开放网页申请（关掉后，朋友只能找你手动发码）"),
+    h("div", { class: "row" },
+      field("同时在线上限（1–60）", h("input", { name: "max_streams", type: "number", min: "1", max: "60", step: "1", value: String(s.max_streams) }), "超过后新的连接会被要求稍后重试。"),
+      field("Deepgram 每分钟成本（美元，仅用于估算）", h("input", { name: "usd_per_min", type: "number", min: "0", step: "0.0001", value: String(s.usd_per_min) }))),
+    err, h("div", { class: "btns" }, h("button", { type: "button", text: "撤销修改", onclick: () => renderSettings() }), save));
+  form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    for (const el of form.querySelectorAll(".bad")) el.classList.remove("bad");
+    err.textContent = "";
+    const f = form.elements;
+    const body = {
+      pay_text: f.pay_text.value, registration_open: f.registration_open.checked,
+      max_streams: Number(f.max_streams.value), usd_per_min: Number(f.usd_per_min.value),
+      plans: [...plansBox.children].map((row) => ({ id: row.dataset.id || undefined, name: row.querySelector(".p-name").value.trim(),
+        minutes: numOrNull(row.querySelector(".p-min").value), days: numOrNull(row.querySelector(".p-days").value), price: row.querySelector(".p-price").value.trim() })),
+    };
+    save.disabled = true;
+    try { await api("/settings", body, "PUT"); toast("已保存"); delete $("tab-settings").dataset.dirty; await load(); renderSettings(); }
+    catch (x) {
+      err.textContent = x.message;
+      const fld = String((x.body && x.body.field) || ""), m = fld.match(/^plans\.(\d+)\.(\w+)$/);
+      const el = m ? plansBox.children[+m[1]] && plansBox.children[+m[1]].querySelector({ name: ".p-name", minutes: ".p-min", days: ".p-days", price: ".p-price" }[m[2]] || "input")
+        : f.namedItem(fld);
+      if (el && el.classList) { el.classList.add("bad"); el.focus(); }
+    } finally { save.disabled = false; }
+  });
+  box.replaceChildren(form);
+}
+
+// ---------- start ----------
+if (pw) load().then(startApp, (e) => { if (e.status !== 401) showLogin(e.message); });
+else showLogin("");
+</script>
+</body>
+</html>

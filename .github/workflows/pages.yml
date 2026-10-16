@@ -18,6 +18,24 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
+      # 知音字幕 授权码 mode: find the ZhiYin server (livecaption/server) so the page can show that mode.
+      # First step, before checkout and npm ci, so the Cloudflare token never meets third-party install scripts.
+      - name: Find the ZhiYin server (empty = 授权码 mode hidden)
+        id: zy
+        env:
+          OVERRIDE: ${{ vars.ZHIYIN_SERVER_URL }}
+          CF_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CF_ACCOUNT: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          url="$OVERRIDE"
+          if [ -z "$url" ] && [ -n "$CF_TOKEN" ] && [ -n "$CF_ACCOUNT" ]; then
+            sub=$(curl -fsS --max-time 15 -H "Authorization: Bearer $CF_TOKEN" \
+              "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT/workers/subdomain" | jq -r '.result.subdomain // empty' || true)
+            [ -n "$sub" ] && url="https://zhiyin-api.$sub.workers.dev"
+            [ -n "$url" ] && { curl -fsS --max-time 15 "$url/api/config" | jq -e '.service=="zhiyin"' >/dev/null || echo "::warning::$url not answering"; }
+          fi
+          if [ -n "$url" ] && ! printf %s "$url" | grep -Eq '^https://[A-Za-z0-9.-]+(:[0-9]+)?$'; then echo "::error::bad ZHIYIN_SERVER_URL"; exit 1; fi
+          echo "url=$url" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
@@ -27,8 +45,15 @@ jobs:
       - run: npm run build
         env:
           GITHUB_PAGES: '1'
-      # 知音字幕 (live meeting captions, one static file) at /ink-surge/zhiyin/
-      - run: mkdir -p dist/zhiyin && cp livecaption/lite/index.html dist/zhiyin/index.html
+      # 知音字幕 (live meeting captions, one static file) at /ink-surge/zhiyin/, with the server URL filled in
+      - run: |
+          mkdir -p dist/zhiyin && cp livecaption/lite/index.html dist/zhiyin/index.html
+          if [ -n "$ZY_URL" ]; then
+            sed -i "s|<meta name=\"zhiyin-server\" content=\"\" />|<meta name=\"zhiyin-server\" content=\"$ZY_URL\" />|" dist/zhiyin/index.html
+            grep -q "content=\"$ZY_URL\"" dist/zhiyin/index.html
+          fi
+        env:
+          ZY_URL: ${{ steps.zy.outputs.url }}
       - uses: actions/upload-pages-artifact@v3
         with:
           path: dist
