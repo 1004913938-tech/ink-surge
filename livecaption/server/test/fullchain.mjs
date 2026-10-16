@@ -126,12 +126,12 @@ try {
   check("owner: settings saved with the Bearer password from .dev.vars (pay text + 2 plans)", set.status === 200 && set.body.plans.length === 2, set);
   const plans = set.body.plans;
 
-  // ---------------------------------------------------------- friend: opens the page; 授权码 mode is the default
+  // ---------------------------------------------------------- friend: opens the page; 授权码 is the only mode
   const p = await device();
   const modeUi = await p.evaluate(() => ({ box: !document.getElementById("modeBox").classList.contains("hidden"),
     code: document.querySelector('input[name="mode"][value="code"]').checked, codePane: !document.getElementById("codePane").classList.contains("hidden"),
     keyPane: !document.getElementById("keyPane").classList.contains("hidden"), server: window.__lcl.server() }));
-  check("page: 授权码 mode shown and selected by default (no stored key)", modeUi.box && modeUi.code && modeUi.codePane && !modeUi.keyPane && modeUi.server === W, modeUi);
+  check("page: 授权码 is the only mode (no choice, no own-key pane)", !modeUi.box && modeUi.code && modeUi.codePane && !modeUi.keyPane && modeUi.server === W, modeUi);
 
   // ---------------------------------------------------------- friend: applies through the real /api/config + /api/register
   await p.click("#regBtn");
@@ -164,7 +164,7 @@ try {
   const msg = (ap.body?.message ?? "").split("\n");
   const code = (msg[0]?.match(/^你的知音字幕授权码：([0-9A-HJKMNP-TV-Z]{4}(?:-[0-9A-HJKMNP-TV-Z]{4}){3})$/) ?? [])[1];
   check("owner: approve -> 201 and a WeChat-ready message (code, amount, WIB expiry, page link)", ap.status === 201 && code === ap.body.code &&
-    msg[1] === `额度：0.3 分钟，有效期至 ${wibDate(ap.body.user.expires_at)}（先到为准）` && msg[2] === `用电脑版 Chrome 打开 ${PAGE_URL} → 第 1 步选「用授权码」→ 粘贴 → 开始。同一授权码同时只能在一个页面使用。`, ap.body);
+    msg[1] === `额度：0.3 分钟，有效期至 ${wibDate(ap.body.user.expires_at)}（先到为准）` && msg[2] === `用电脑版 Chrome 打开 ${PAGE_URL} → 第 1 步粘贴授权码 → 开始。同一授权码同时只能在一个页面使用。`, ap.body);
 
   // ---------------------------------------------------------- friend: pastes the code from the message; the page looks it up
   await p.fill("#code", "  " + code + " ");

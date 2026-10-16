@@ -303,7 +303,7 @@ try {
   check("approve: 90 days -> expires 23:59:59.999 WIB on the 90th day", ap.body.user.expires_at === wibEnd(ap.body.user.created_at + 90 * DAYMS),
     [ap.body.user.expires_at, wibEnd(ap.body.user.created_at + 90 * DAYMS)]);
   check("approve: WeChat-ready message", ap.body.message === `你的知音字幕授权码：${ap.body.code}\n额度：600 分钟，有效期至 ${exp90}（先到为准）\n` +
-    `用电脑版 Chrome 打开 ${PAGE_URL} → 第 1 步选「用授权码」→ 粘贴 → 开始。同一授权码同时只能在一个页面使用。`, ap.body.message);
+    `用电脑版 Chrome 打开 ${PAGE_URL} → 第 1 步粘贴授权码 → 开始。同一授权码同时只能在一个页面使用。`, ap.body.message);
   const meAp = await api("/me", { auth: ap.body.code });
   check("approved code works on /api/me", meAp.status === 200 && meAp.body.remaining_ms === 36_000_000, meAp.body);
   const ap2 = await admin(`/registrations/${r1.body.ref}/approve`, { minutes: 600, days: 90, note: "" });

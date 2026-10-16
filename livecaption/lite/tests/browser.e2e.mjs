@@ -545,14 +545,15 @@ const relayConns = (tag) => zy.conns.filter((x) => x.code === ZCANON(tag));
   await ctx.close();
 }
 
-// ---- (b) ?server=http://127.0.0.1:P -> mode choice shown, 授权码 is the default; (d) registration dialog
+// ---- (b) ?server=http://127.0.0.1:P -> 授权码 only, no mode choice; (d) registration dialog
 {
   const page = await newPage();
   const cfg0 = zy.cfg;
   await page.goto(codeUrl());
   const [mode, codePane, keyPane] = await shownIds(page, ["modeBox", "codePane", "keyPane"]);
-  const checked = await page.evaluate(() => document.querySelector('input[name="mode"]:checked')?.value);
-  check("(b) ?server=http://127.0.0.1:P -> mode choice shown, 授权码 is the default", mode && codePane && !keyPane && checked === "code", JSON.stringify([mode, codePane, keyPane, checked]));
+  const checked = await page.evaluate(() => [window.__lcl.mode(), document.querySelector('label[for="code"]').textContent]);
+  check("(b) ?server=http://127.0.0.1:P -> 授权码 only (向店主购买), no mode choice, no own-key pane",
+    !mode && codePane && !keyPane && checked[0] === "code" && checked[1] === "授权码（向店主购买）", JSON.stringify([mode, codePane, keyPane, checked]));
   check("(b) /api/config loaded over CORS", await waitFor(() => zy.cfg > cfg0, 5000));
 
   await page.click("#regBtn");
@@ -613,13 +614,22 @@ const relayConns = (tag) => zy.conns.filter((x) => x.code === ZCANON(tag));
   check("(d) 申请编号 survives a reload; a newly entered working code clears it", kept === "你的申请编号 R7K3MQ（待店主确认）" && cleared, kept);
   await page.context().close();
 }
-// the build-time meta (what pages.yml writes) turns the mode on the same way
+// the build-time meta (what pages.yml writes) turns the mode on the same way, and only that mode, even in a
+// browser that used its own key on this page before
 {
   const page = await newPage();
   await page.goto(`http://127.0.0.1:${PORT}/zhiyin.html?fakeAudio=1`);
   const html = readFileSync(INDEX, "utf8");
-  check("(b) pages.yml's sed target occurs exactly once; the filled meta turns 授权码 mode on",
-    html.split(META_EMPTY).length === 2 && (await page.isVisible("#modeBox")) && (await page.evaluate(() => window.__lcl.server())) === ZY_URL);
+  const [mode, codePane, keyPane] = await shownIds(page, ["modeBox", "codePane", "keyPane"]);
+  check("(b) pages.yml's sed target occurs exactly once; the filled meta turns 授权码 mode on, without a mode choice",
+    html.split(META_EMPTY).length === 2 && !mode && codePane && !keyPane && (await page.evaluate(() => window.__lcl.server())) === ZY_URL, JSON.stringify([mode, codePane, keyPane]));
+  await page.evaluate(() => { localStorage.setItem("lcl.key", "ownkey"); localStorage.setItem("lcl.mode", "key"); });
+  await page.reload();
+  const st = await page.evaluate(() => ({ mode: window.__lcl.mode(), box: !document.getElementById("modeBox").classList.contains("hidden"),
+    key: !document.getElementById("keyPane").classList.contains("hidden"), code: !document.getElementById("codePane").classList.contains("hidden"),
+    keptMode: localStorage.getItem("lcl.mode"), keptKey: localStorage.getItem("lcl.key") }));
+  check("(b) a stored own key / own-key choice from before does not bring the key mode back (and is left alone)",
+    st.mode === "code" && !st.box && !st.key && st.code && st.keptMode === "key" && st.keptKey === "ownkey", JSON.stringify(st));
   await page.context().close();
 }
 
@@ -681,7 +691,7 @@ const relayConns = (tag) => zy.conns.filter((x) => x.code === ZCANON(tag));
   const page = await newPage();
   await page.goto(codeUrl());
   const msg = `你的知音字幕授权码：${ZCODE("0003")}\n额度：600 分钟，有效期至 2027-01-14（先到为准）\n` +
-    "用电脑版 Chrome 打开 https://1004913938-tech.github.io/ink-surge/zhiyin/ → 第 1 步选「用授权码」→ 粘贴 → 开始。同一授权码同时只能在一个页面使用。";
+    "用电脑版 Chrome 打开 https://1004913938-tech.github.io/ink-surge/zhiyin/ → 第 1 步粘贴授权码 → 开始。同一授权码同时只能在一个页面使用。";
   const me0 = zy.me.length;
   // a paste: the <input> drops the line breaks, then the paste handler tidies the box at once (before the typing pause)
   await page.evaluate((m) => { const i = document.getElementById("code"); i.focus(); i.value = m.replace(/\n/g, ""); i.dispatchEvent(new Event("paste")); }, msg);
@@ -774,10 +784,11 @@ const relayConns = (tag) => zy.conns.filter((x) => x.code === ZCANON(tag));
   await page.context().close();
 }
 
-// ---- (k) own-key mode is unchanged on a page that also offers 授权码 mode
+// ---- (k) own-key mode is unchanged on a page that also offers 授权码 mode, for the owner at ?mykey
 {
   const page = await newPage();
-  await page.goto(codeUrl(`&dg=${encodeURIComponent(DG)}`));
+  await page.goto(codeUrl(`&dg=${encodeURIComponent(DG)}&mykey`));
+  check("(k) ?mykey -> both modes offered", await page.isVisible("#modeBox"));
   await page.check('input[name="mode"][value="key"]');
   const [codePane, keyPane] = await shownIds(page, ["codePane", "keyPane"]);
   const relay0 = zy.conns.length + zy.refused.length;
@@ -797,6 +808,19 @@ const relayConns = (tag) => zy.conns.filter((x) => x.code === ZCANON(tag));
   await page.reload();
   const byKey = await page.evaluate(() => document.querySelector('input[name="mode"]:checked')?.value);
   check("(k) chosen mode remembered; with a stored key and no choice yet the default is the key", kept === "key" && byKey === "key", `${kept} ${byKey}`);
+  // the owner's choice stays with ?mykey: the same browser without it is the friends' page, and 开始 uses the code
+  await page.goto(codeUrl(`&dg=${encodeURIComponent(DG)}`));
+  await page.evaluate(() => localStorage.setItem("lcl.mode", "key"));
+  await page.reload();
+  const plain = await page.evaluate(() => ({ mode: window.__lcl.mode(), box: !document.getElementById("modeBox").classList.contains("hidden"),
+    key: !document.getElementById("keyPane").classList.contains("hidden") }));
+  const own0 = conns.filter((x) => x.key === "ownkey").length;
+  await page.fill("#code", ZCODE("0001"));
+  await page.click("#startBtn");
+  const viaRelay = await until(page, () => window.__lcl.lines().some((l) => l.src === "Hello from the relay."), null, 8000);
+  check("(k) same browser without ?mykey: 授权码 only, and 开始 goes to the relay, never the stored own key",
+    plain.mode === "code" && !plain.box && !plain.key && viaRelay && conns.filter((x) => x.key === "ownkey").length === own0, JSON.stringify(plain));
+  await page.click("#stopBtn");
   await page.context().close();
 }
 
@@ -823,11 +847,14 @@ const relayConns = (tag) => zy.conns.filter((x) => x.code === ZCANON(tag));
   await page.click("#regBtn");
   const dlgMsg = await until(page, () => document.getElementById("regDlg").open && /连不上授权码服务/.test(document.getElementById("regMsg").textContent), null, 8000);
   await page.click("#regMsgClose");
+  check("server unreachable: 授权码 mode stays with a notice and the dialog says so (no own-key fallback for friends)",
+    note && dlgMsg && (await page.isVisible("#codePane")) && !(await page.isVisible("#modeBox")) && !(await page.isVisible("#keyPane")));
+  await page.goto(codeUrl(`&dg=${encodeURIComponent(DG)}&mykey`, deadUrl));
   await page.check('input[name="mode"][value="key"]');
   await page.fill("#key", "goodkey");
   await page.click("#startBtn");
   const own = await until(page, () => document.getElementById("status").textContent === "正在收听", null, 8000);
-  check("server unreachable: 授权码 mode stays with a notice, the dialog says so, own key still works", note && dlgMsg && (await page.isVisible("#modeBox")) && own);
+  check("server unreachable: the owner's own key (?mykey) still works", (await page.isVisible("#modeBox")) && own);
   await page.click("#stopBtn");
   await page.context().close();
 }
