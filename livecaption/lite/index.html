@@ -417,7 +417,8 @@ if (typeof module !== "undefined") module.exports = LC;
     // Deepgram numbers speakers from 0 on every connection: namespace by connection so a
     // reconnect never pins a new voice on an old label
     var spk = l.speaker === undefined || l.speaker === null ? null : gen + ":" + l.speaker;
-    var line = { id: ++lineSeq, kind: "text", speaker: spk, src: l.text, zh: "", zhState: "pending", cut: !!l.cut, t: new Date(), ver: 0 };
+    // the number is fixed when the line is made, so restarting (which restarts numbering) never relabels old lines
+    var line = { id: ++lineSeq, kind: "text", speaker: spk, spkNo: spk === null ? null : nameOf(spk), src: l.text, zh: "", zhState: "pending", cut: !!l.cut, t: new Date(), ver: 0 };
     lines.push(line);
     translateLine(line);
     render();
@@ -433,15 +434,14 @@ if (typeof module !== "undefined") module.exports = LC;
     render();
   }
 
-  function whoLabel(speaker) {
+  function whoLabel(line) {
     if ($("diarize").value !== "1") return "";
-    var n = nameOf(speaker);
-    return n ? "说话人 " + n : "";
+    return line.spkNo ? "说话人 " + line.spkNo : "";
   }
   function tail(s, n) { return s.length > n ? "…" + s.slice(s.length - n) : s; }
   function lineOpts(l) {
     if (l.kind === "gap") return { gap: true, src: l.src };
-    return { who: whoLabel(l.speaker), src: l.src + (l.cut ? " …（中断）" : ""), zh: l.zh,
+    return { who: whoLabel(l), src: l.src + (l.cut ? " …（中断）" : ""), zh: l.zh,
              zhPlaceholder: l.zhState === "pending" ? "…" : l.zhState === "error" ? "（翻译失败）" : "（翻译未就绪）" };
   }
   function interimOpts(short) {
@@ -744,6 +744,7 @@ if (typeof module !== "undefined") module.exports = LC;
       capture = c;
       var lang = $("srcLang").value;
       var gen = 0; // this session's connection number, so a stopped stream's late lines keep their own labels
+      nameOf = LC.speakerNamer(); // each start counts speakers from 1 again
       var asm = LC.createAssembler({ lang: lang, onLine: function (l) { onLine(l, gen); }, onProgress: onProgress });
       meter = startMeter(c.audio);
       live.startedAt = Date.now();
@@ -810,7 +811,7 @@ if (typeof module !== "undefined") module.exports = LC;
     var text = lines.map(function (l) {
       var ts = "[" + pad(l.t.getHours()) + ":" + pad(l.t.getMinutes()) + ":" + pad(l.t.getSeconds()) + "]";
       if (l.kind === "gap") return ts + " " + l.src + "\n";
-      var who = whoLabel(l.speaker);
+      var who = whoLabel(l);
       return ts + (who ? " " + who : "") + "\n" + l.src + (l.cut ? " …（中断）" : "") + (l.zh ? "\n" + l.zh : "") + "\n";
     }).join("\n");
     var n = new Date(), a = document.createElement("a");
