@@ -29,6 +29,8 @@
   input, select { width: 100%; background:#0b0d12; color:var(--fg); border:1px solid var(--line); border-radius:8px; padding:8px 10px; font-size:15px; }
   input:disabled, select:disabled { opacity: .6; }
   .row { display:flex; gap:10px; flex-wrap: wrap; } .row > div { flex: 1 1 160px; }
+  a.btn { display:inline-block; text-decoration:none; color:#fff; background:#222733; border-radius:8px; padding:7px 12px; font-size:14px; }
+  a.btn:hover { background:#2c3342; }
   button { background: var(--accent); color:#fff; border:0; border-radius:8px; padding:9px 14px; font-size:15px; cursor:pointer; }
   button:disabled { opacity:.45; cursor: default; } button.ghost { background:#222733; } button.danger { background: var(--bad); }
   .actions { display:flex; gap:8px; flex-wrap:wrap; margin-top: 8px; align-items: center; }
@@ -72,6 +74,11 @@
       <div class="grow">
         <div class="row">
           <div><label>Deepgram API Key（只保存在本机浏览器里）</label><input id="key" type="password" autocomplete="off" placeholder="粘贴 Deepgram Key" /></div>
+        </div>
+        <div class="actions">
+          <a class="btn" id="dgSignup" href="https://console.deepgram.com/signup" target="_blank" rel="noopener">还没有 Key？注册 Deepgram</a>
+          <a class="btn" id="dgConsole" href="https://console.deepgram.com/" target="_blank" rel="noopener">打开 Deepgram 后台（Key / 用量 / 余额）</a>
+          <span class="hint" id="usage"></span>
         </div>
         <div class="row" style="margin-top:6px">
           <div><label>对方说的语言</label>
@@ -288,6 +295,21 @@ if (typeof module !== "undefined") module.exports = LC;
   var size = store("lcl.size") || "m";
   var ui = { kind: "", status: "未开始", err: "", warn: "", since: Date.now(), running: false, everStarted: false, stopNote: "" };
   var live = { startedAt: 0, lastLoudAt: 0 };
+
+  // ---------------------------------------------------------------- local usage estimate (this browser only)
+  var USD_PER_MIN = 0.0077;   // Deepgram nova-3 streaming list price; the Deepgram console is the real bill
+  var usagePending = 0;       // ms of audio sent, not yet saved
+  function usageMs() { var v = +store("lcl.usageMs"); return isFinite(v) && v > 0 ? v : 0; }
+  function flushUsage() {
+    if (!usagePending) return;
+    store("lcl.usageMs", String(usageMs() + usagePending)); usagePending = 0; showUsage();
+  }
+  function showUsage() {
+    var ms = usageMs() + usagePending, min = ms / 60000;
+    $("usage").textContent = ms ? "这台电脑累计用了" + (min < 1 ? "不到 1 分钟" : "约 " + Math.round(min) + " 分钟") +
+      "，约 $" + (min * USD_PER_MIN).toFixed(2) + "（估算，以 Deepgram 后台为准）" : "";
+  }
+  showUsage();
 
   // ---------------------------------------------------------------- setup UI
   $("key").value = store("lcl.key") || "";
@@ -610,10 +632,11 @@ if (typeof module !== "undefined") module.exports = LC;
       // a fresh recorder per connection: each WebSocket must start with a container header
       var r = new MediaRecorder(new MediaStream([o.track]), mime ? { mimeType: mime } : undefined);
       r.ondataavailable = function (e) {
-        if (e.data && e.data.size && sock.readyState === 1) sock.send(e.data);
+        var sent = !!(e.data && e.data.size && sock.readyState === 1);
+        if (sent) sock.send(e.data);
         // media events keep firing 4x/s while Chrome is hidden (timers are throttled), so the
-        // meter and the stall check run here: loud audio going out but no reply -> reconnect
-        o.onTick();
+        // meter, the usage count and the stall check run here: loud audio going out but no reply -> reconnect
+        o.onTick(sent);
         var now = Date.now();
         if (!stopped && c.opened && now - c.lastMsgAt > STALL_MS && o.lastLoudAt() - c.lastMsgAt > STALL_MS / 3) drop(c, "stall");
       };
@@ -758,7 +781,10 @@ if (typeof module !== "undefined") module.exports = LC;
           if (info.gapFrom && live.lastLoudAt > info.gapFrom) addGap(Math.max(1, Math.round((Date.now() - info.gapFrom) / 1000)));
         },
         onMessage: asm.handle, onFlush: asm.flush,
-        onTick: function () { meter.sample(); },
+        onTick: function (sent) {
+          meter.sample();
+          if (sent) { usagePending += 250; if (usagePending >= 15000) flushUsage(); } // one chunk = 250 ms of audio billed
+        },
         lastLoudAt: function () { return live.lastLoudAt; },
         onState: setStatus, onError: setErr,
       });
@@ -772,6 +798,7 @@ if (typeof module !== "undefined") module.exports = LC;
     if (dg) { dg.stop(); dg = null; }
     if (capture) { capture.stop(); capture = null; }
     meter.stop(); meter = { sample: function () {}, stop: function () {} };
+    flushUsage();
     setRunning(false);
     ui.stopNote = note || "";
     setErr(""); setWarn(""); // nothing is reconnecting any more
@@ -781,6 +808,7 @@ if (typeof module !== "undefined") module.exports = LC;
   $("stopBtn").addEventListener("click", function () { stopAll(""); });
   $("retryBtn").addEventListener("click", function () { if (dg) dg.retryNow(); });
   window.addEventListener("beforeunload", function (e) { if (ui.running) { e.preventDefault(); e.returnValue = ""; } });
+  window.addEventListener("pagehide", flushUsage);
 
   // ---------------------------------------------------------------- floating window
   $("pipBtn").addEventListener("click", function () {

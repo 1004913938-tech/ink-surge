@@ -228,6 +228,11 @@ async function openPip(page) {
   check("status + tab title show stopped", (await page.textContent("#status")) === "已停止" && /已停止/.test(await page.title()));
   const banner = await pipText(page, "pipBanner");
   if (banner !== null) check("floating window alarms after 停止共享", /字幕已停止/.test(banner) && /停止共享/.test(banner), banner);
+  const links = await page.$$eval("#dgSignup, #dgConsole", (as) => as.map((a) => [a.href, a.target, a.rel]));
+  check("Deepgram buttons open signup and console in a new tab",
+    links.length === 2 && links[0][0] === "https://console.deepgram.com/signup" && links[1][0] === "https://console.deepgram.com/" && links.every((l) => l[1] === "_blank" && /noopener/.test(l[2])), JSON.stringify(links));
+  const usage = await page.evaluate(() => [+localStorage.getItem("lcl.usageMs"), document.getElementById("usage").textContent]);
+  check("local usage estimate counts audio sent and shows it", usage[0] >= 5000 && /累计用了(不到 1|约 \d+) 分钟，约 \$\d+\.\d\d/.test(usage[1]), JSON.stringify(usage));
   await page.context().close();
 }
 
