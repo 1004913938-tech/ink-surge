@@ -1,7 +1,11 @@
-# 面试实时字幕（轻量版）
+# 知音字幕 ZhiYin
 
-飞书 / 腾讯会议 / Zoom 面试时，对方说英文 → 你屏幕上实时出中文字幕，**只有你看得到**。
-一个网页文件（`index.html`），不用安装，不用服务器。
+飞书 / 腾讯会议 / Zoom 开会或面试时，对方说英文 → 你屏幕上实时出中文字幕，**只有你看得到**。
+不用安装，用电脑版 Chrome 打开就能用：
+
+**在线地址：https://1004913938-tech.github.io/ink-surge/zhiyin/**
+
+也可以下载 `index.html` 离线文件来用，功能一样。
 
 ```
 会议声音（Chrome 屏幕共享时带的系统声音，只在你电脑和 Deepgram 之间；已要求 Deepgram 不拿去训练模型）
@@ -9,6 +13,8 @@
    → Chrome 自带离线翻译成中文（本机运行，免费，不上传）
    → 本页 + 置顶悬浮小窗
 ```
+
+每个人用自己的 Deepgram Key，Key 只存在自己的浏览器里，不会上传到网站。分享给朋友时直接发在线地址就行。
 
 ## 面试当天怎么组合
 
@@ -55,12 +61,12 @@
 | Deepgram Key | 有余额。新账号送 $200 免费额度。查余额：登录 console.deepgram.com → 选项目 → Billing / Usage |
 | 网络 | 能连 deepgram.com。第一次「准备翻译」要从 Google 下载约 76MB 语言包，在印尼直接能连 |
 
-### 拿到文件
+### 打开页面
 
-- 在 Claude 对话里下载 `index.html`，或者
-- GitHub：仓库 `ink-surge` → 分支 `claude/conference-translation-research-buh1rm` → `livecaption/lite/index.html` → 右上角「Download raw file」。
-
-放到桌面，**右键 → 打开方式 → Google Chrome**（默认浏览器不是 Chrome 时别直接双击）。
+- **推荐**：用 Chrome 打开在线地址 https://1004913938-tech.github.io/ink-surge/zhiyin/ ，可以加入书签。网站更新后，刷新一下就是新版。
+- 离线文件：GitHub 仓库 `ink-surge` → `livecaption/lite/index.html` → 右上角「Download raw file」。
+  放到桌面，**右键 → 打开方式 → Google Chrome**（默认浏览器不是 Chrome 时别直接双击）。
+- 在线版和离线文件各自记各自的 Key，第一次换着用时要重新粘贴一次。
 
 ### 每次使用（4 步）
 
@@ -167,6 +173,8 @@ Windows 11 自带的「实时辅助字幕」能听到所有声音，但只有 Co
 - 2026-10-16 在用户的 Windows + Chrome 上实测：真实 Deepgram 识别 + Chrome 离线翻译 + 悬浮窗正常出中英字幕（YouTube 英文视频，整个屏幕 + 系统音频）。
 
 ## 开发者
+
+- 线上部署：`.github/workflows/pages.yml` 在 main 分支构建游戏后，把 `livecaption/lite/index.html` 复制到站点的 `/zhiyin/`。
 
 - 单测：`node --test livecaption/lite/tests/core.test.mjs`。覆盖纯逻辑：Deepgram 消息 → 句子、说话人分段、断线保留半句、重连间隔、错误提示。
 - 浏览器端到端：`LC_DEPS=<含 playwright 和 ws 的 node_modules 所在目录> node livecaption/lite/tests/browser.e2e.mjs`。

@@ -215,7 +215,7 @@ async function openPip(page) {
   // export
   const [dl] = await Promise.all([page.waitForEvent("download"), page.click("#exportBtn")]);
   const exported = readFileSync(await dl.path(), "utf8");
-  check("transcript download: source + translation + gap note, local-time name", /Could you introduce yourself briefly\?/.test(exported) && /【译】And your notice period\?/.test(exported) && /连接中断/.test(exported) && /^captions-\d{4}-\d\d-\d\d-\d{4}\.txt$/.test(dl.suggestedFilename()), dl.suggestedFilename());
+  check("transcript download: source + translation + gap note, local-time name", /Could you introduce yourself briefly\?/.test(exported) && /【译】And your notice period\?/.test(exported) && /连接中断/.test(exported) && /^zhiyin-\d{4}-\d\d-\d\d-\d{4}\.txt$/.test(dl.suggestedFilename()), dl.suggestedFilename());
 
   await page.screenshot({ path: `${OUT}/lite-captions.png` });
   await sleep(5600);

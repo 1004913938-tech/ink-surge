@@ -3,9 +3,10 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>LiveCaption 轻量版</title>
+<title>知音字幕 ZhiYin</title>
 <!--
-  LiveCaption Lite — one file, no server, no install.
+  知音字幕 ZhiYin (LiveCaption Lite) — one file, no server, no install.
+  Hosted: https://1004913938-tech.github.io/ink-surge/zhiyin/ (copied there by .github/workflows/pages.yml).
   Meeting audio (getDisplayMedia) -> Deepgram real-time STT (browser WebSocket, your key)
   -> Chrome built-in on-device Translator API (free) -> captions only you see (+ floating window).
   Open in desktop Chrome. Test hooks: ?dg=<ws url> overrides Deepgram, ?fakeAudio=1 uses a tone,
@@ -63,7 +64,7 @@
 </head>
 <body>
 <div class="page" id="app">
-  <h1>LiveCaption 轻量版 <small>会议声音 → 实时中文字幕 · 只有你看得到</small></h1>
+  <h1>知音字幕 <small>ZhiYin · 会议声音 → 实时字幕翻译 · 只有你看得到</small></h1>
 
   <div class="card" id="setup">
     <div class="step" id="step1">
@@ -102,7 +103,7 @@
     <div class="step" id="step3">
       <div class="num">3</div>
       <div class="grow">
-        <div>进飞书会议之前（或在入会前的预览页）点下面按钮，选择会议的声音；然后用飞书的扬声器测试确认音量条会跳</div>
+        <div>进会议之前（飞书、腾讯会议、Zoom 等，或在入会前的预览页）点下面按钮，选择会议的声音；然后用会议软件的扬声器测试确认音量条会跳</div>
         <div class="hint" id="captureHint"></div>
         <div class="actions">
           <button id="startBtn">选择会议声音并开始</button>
@@ -308,7 +309,7 @@ if (typeof module !== "undefined") module.exports = LC;
     ? "请用电脑版 Chrome 打开本页（Safari / Firefox 拿不到会议声音）。"
     : isMac
       ? "弹窗里选「整个屏幕」并打开「同时分享系统音频」（需要 macOS 14.2+），或选会议所在的浏览器标签页并打开「分享标签页中的音频」。"
-      : "弹窗里选「整个屏幕」→ 点一下屏幕缩略图 → 打开底部的「带系统音频分享」开关（有的版本叫「同时分享系统音频」，英文版 Also share system audio）→ 点「带音频分享」；之后屏幕下方的提示条点「隐藏」（不要点「停止共享」）。用飞书网页版开会时，也可以选会议所在的标签页并打开「带标签页音频分享」。";
+      : "弹窗里选「整个屏幕」→ 点一下屏幕缩略图 → 打开底部的「带系统音频分享」开关（有的版本叫「同时分享系统音频」，英文版 Also share system audio）→ 点「带音频分享」；之后屏幕下方的提示条点「隐藏」（不要点「停止共享」）。用网页版会议时，也可以选会议所在的标签页并打开「带标签页音频分享」。";
 
   function setStatus(kind, text) {
     ui.kind = kind; ui.status = text; ui.since = Date.now();
@@ -495,7 +496,7 @@ if (typeof module !== "undefined") module.exports = LC;
     if (ui.everStarted && !ui.running) { text = "字幕已停止" + (ui.stopNote ? "（" + ui.stopNote + "）" : "") + " — 回到 Chrome 点「选择会议声音并开始」"; cls = "bad"; }
     else if (ui.running && ui.err) { text = ui.err; cls = "bad"; retry = ui.kind !== "on"; }
     else if (ui.running && ui.kind !== "on" && now - ui.since >= 3000) { text = ui.status; cls = "warn"; retry = true; }
-    else if (quiet) { text = "20 秒没有会议声音（你在回答时正常）。对方说话时音量条不动 → 检查飞书扬声器 / 耳机"; cls = "warn"; stale = false; }
+    else if (quiet) { text = "20 秒没有会议声音（你在回答时正常）。对方说话时音量条不动 → 检查会议软件的扬声器 / 耳机"; cls = "warn"; stale = false; }
     d.getElementById("pipBanner").className = "banner " + cls + (text ? "" : " hidden");
     d.getElementById("pipBannerText").textContent = text;
     d.getElementById("pipRetry").classList.toggle("hidden", !retry);
@@ -526,8 +527,8 @@ if (typeof module !== "undefined") module.exports = LC;
       renderQueued = false;
       renderMain();
       try { renderPip(); } catch (e) { /* floating window closing */ }
-      document.title = ui.running ? (ui.kind !== "on" ? "⚠ 字幕重连中 · LiveCaption" : ui.warn ? "⚠ 没有会议声音 · LiveCaption" : "● 字幕中 · LiveCaption")
-        : ui.everStarted ? "⛔ 字幕已停止 · LiveCaption" : "LiveCaption 轻量版";
+      document.title = ui.running ? (ui.kind !== "on" ? "⚠ 字幕重连中 · 知音字幕" : ui.warn ? "⚠ 没有会议声音 · 知音字幕" : "● 字幕中 · 知音字幕")
+        : ui.everStarted ? "⛔ 字幕已停止 · 知音字幕" : "知音字幕 ZhiYin";
       $("elapsed").textContent = ui.running && live.startedAt ? "已收听 " + minutes() : "";
     });
   }
@@ -590,7 +591,7 @@ if (typeof module !== "undefined") module.exports = LC;
         if (level > 0.03) { silentSince = now; if (warned) { warned = false; setWarn(""); } }
         else if (now - silentSince > SILENCE_MS && !warned) {
           warned = true;
-          setWarn("20 秒没听到会议声音（还没进会、或你在回答时是正常的）。对方说话时音量条不动：检查飞书扬声器是否为系统默认设备、蓝牙耳机是否切换了设备。");
+          setWarn("20 秒没听到会议声音（还没进会、或你在回答时是正常的）。对方说话时音量条不动：检查会议软件的扬声器是否为系统默认设备、蓝牙耳机是否切换了设备。");
         }
       };
       var timer = setInterval(sample, 150);
@@ -790,7 +791,7 @@ if (typeof module !== "undefined") module.exports = LC;
       pipWin = w;
       var d = w.document;
       var st = d.createElement("style"); st.textContent = $("lc-style").textContent; d.head.appendChild(st);
-      d.title = "字幕";
+      d.title = "知音字幕";
       d.body.className = "pip";
       d.body.innerHTML = '<div id="pipBar"><span class="dot" id="pipDot"></span><span id="pipStatus"></span><span class="meter"><i id="pipMeter"></i></span></div>' +
         '<div id="pipBanner" class="banner hidden"><span id="pipBannerText"></span><button id="pipRetry" class="hidden">立即重连</button></div>' +
@@ -800,7 +801,7 @@ if (typeof module !== "undefined") module.exports = LC;
         d.getElementById("pipScroll").addEventListener(ev, function () { pipUserScrollAt = Date.now(); }, { passive: true });
       });
       applySize(size);
-      $("pipWarn").textContent = "悬浮窗可以拖动边缘放大。⚠ 面试中要「共享屏幕」时先关掉悬浮窗（或只共享飞书窗口），否则对方会看到字幕。";
+      $("pipWarn").textContent = "悬浮窗可以拖动边缘放大。⚠ 面试中要「共享屏幕」时先关掉悬浮窗（或只共享会议窗口），否则对方会看到字幕。";
       w.addEventListener("pagehide", function () { pipWin = null; $("pipWarn").textContent = ""; });
       render();
     }, function (e) { $("pipWarn").textContent = "悬浮窗打开失败：" + (e && e.message || e); });
@@ -817,7 +818,7 @@ if (typeof module !== "undefined") module.exports = LC;
     var n = new Date(), a = document.createElement("a");
     a.href = URL.createObjectURL(new Blob([text], { type: "text/plain;charset=utf-8" }));
     // ASCII name: Chromium can fall back to "download" (no .txt) for CJK file names
-    a.download = "captions-" + n.getFullYear() + "-" + pad(n.getMonth() + 1) + "-" + pad(n.getDate()) + "-" + pad(n.getHours()) + pad(n.getMinutes()) + ".txt";
+    a.download = "zhiyin-" + n.getFullYear() + "-" + pad(n.getMonth() + 1) + "-" + pad(n.getDate()) + "-" + pad(n.getHours()) + pad(n.getMinutes()) + ".txt";
     a.click(); setTimeout(function () { URL.revokeObjectURL(a.href); }, 1000);
   });
   $("clearBtn").addEventListener("click", function () { shownFrom = lines.length; progress = null; rebuildMain(); });

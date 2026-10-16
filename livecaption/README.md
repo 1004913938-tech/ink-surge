@@ -3,8 +3,9 @@
 主持人说中文，桌面和每位听众手机上实时显示 **中文原文 + 英文 + 印尼语**（听众可自选语言）。
 多人会议不乱序，翻译挂了原文照出，听众扫码免登录。架构见 [ARCHITECTURE.md](./ARCHITECTURE.md)。
 
-> **只想自己看、什么都不装**（比如飞书面试，对方说英文、你看中文）：用轻量版 [`lite/index.html`](./lite/README.md)，
-> 一个网页文件，Chrome 双击打开即可，只需要一个 Deepgram Key，翻译用 Chrome 自带的离线翻译（免费）。
+> **只想自己看、什么都不装**（比如飞书面试，对方说英文、你看中文）：用 **知音字幕 ZhiYin**（[`lite/`](./lite/README.md)），
+> 在线地址 https://1004913938-tech.github.io/ink-surge/zhiyin/ ，或者下载单个网页文件用。
+> 只需要一个 Deepgram Key，翻译用 Chrome 自带的离线翻译（免费）。
 
 ## 一键启动（需要 Docker）
 
