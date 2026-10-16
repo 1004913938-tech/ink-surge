@@ -8,7 +8,8 @@
 // Optional: CHROMIUM=<executable> (default /opt/pw-browsers/chromium if present), OUT=<dir for screenshots>,
 // LC_INDEX=<another build of the page, e.g. the one pages.yml produced>.
 // No Cloudflare or Deepgram account: fake secrets in a temporary .dev.vars-format file passed with --env-file, so a
-// developer's own livecaption/server/.dev.vars is never read or touched. The admin Bearer password is read from that file.
+// developer's own livecaption/server/.dev.vars is never read or touched. The admin Bearer password is read from that file;
+// it is partly Chinese on purpose (a browser cannot put that in a header as is: the admin page sends it percent-encoded).
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -45,7 +46,7 @@ const PORT = await freePort(), MOCK_PORT = await freePort(), INSPECT = await fre
 const W = `http://127.0.0.1:${PORT}`, MOCK = `http://127.0.0.1:${MOCK_PORT}`;
 const TMP = mkdtempSync(join(tmpdir(), "zy-fullchain-"));
 const DEV_VARS = join(TMP, ".dev.vars");
-writeFileSync(DEV_VARS, `DEEPGRAM_API_KEY=testkey\nADMIN_PASSWORD=fullchain-${randomBytes(12).toString("hex")}\n`);
+writeFileSync(DEV_VARS, `DEEPGRAM_API_KEY=testkey\nADMIN_PASSWORD=知音后台-${randomBytes(12).toString("hex")}\n`);
 const ADMIN = Object.fromEntries(readFileSync(DEV_VARS, "utf8").split("\n").filter((l) => l.includes("="))
   .map((l) => [l.slice(0, l.indexOf("=")), l.slice(l.indexOf("=") + 1)])).ADMIN_PASSWORD;
 
@@ -65,7 +66,7 @@ async function call(path, { method = "GET", body, headers = {} } = {}) {
   let j = null; try { j = JSON.parse(text); } catch { /* not JSON */ }
   return { status: r.status, body: j };
 }
-const admin = (path, body, method) => call("/admin/api" + path, { method: method ?? (body !== undefined ? "POST" : "GET"), body, headers: { Authorization: "Bearer " + ADMIN } });
+const admin = (path, body, method) => call("/admin/api" + path, { method: method ?? (body !== undefined ? "POST" : "GET"), body, headers: { Authorization: "Bearer " + encodeURIComponent(ADMIN) } });
 const me = (code) => call("/api/me", { headers: { Origin: PAGE_ORIGIN, Authorization: "Bearer " + code } });
 const seen = () => fetch(MOCK + "/seen").then((r) => r.json());
 
@@ -230,9 +231,11 @@ try {
   check("after the top-up: start again, captions flow, remaining about 5 minutes", again && leftOk, [await pageState(p), await txt(p, "codeInfo"), await txt(p, "quotaWarn")]);
 
   // ---------------------------------------------------------- the same code on a second device: newest wins (4409)
+  // this friend pastes the owner's whole WeChat message, not just the code (what 「复制消息」 / WeChat's 复制 give)
   const p2 = await device();
-  await p2.fill("#code", code);
+  await p2.fill("#code", ap.body.message);
   await p2.press("#code", "Tab");
+  check("2nd device: the whole message pasted into the code box -> only the code stays", (await p2.inputValue("#code")) === code, await p2.inputValue("#code"));
   await p2.click("#startBtn");
   const replaced = await until(p, (m) => document.getElementById("err").textContent === m && document.getElementById("status").textContent === "已停止", MSG_4409, 12_000);
   const p2on = await until(p2, (re) => document.getElementById("status").textContent === "正在收听" &&
@@ -256,6 +259,32 @@ try {
   const uEnd = ovEnd.users.find((u) => u.id === uid);
   check("owner overview: nobody live, the user is disabled, usage kept", ovEnd.live_count === 0 && uEnd.status === "disabled" && !uEnd.live &&
     uEnd.used_ms > QUOTA_MS && uEnd.month_ms >= uEnd.used_ms - 50, uEnd);
+
+  // ---------------------------------------------------------- the owner's admin page in Chromium
+  const actx = await browser.newContext({ viewport: { width: 1100, height: 900 } });
+  const adm = await actx.newPage();
+  adm.on("pageerror", (e) => pageErrors.push("admin: " + e.message));
+  await adm.goto(W + "/admin");
+  await adm.fill("#pw", ADMIN);
+  await adm.click('#loginForm button[type="submit"]');
+  const loggedIn = await until(adm, () => !document.getElementById("app").hidden && document.getElementById("stats").children.length === 5, null, 8000);
+  check("admin page: log in with a partly Chinese ADMIN_PASSWORD (it used to throw an English fetch error)", loggedIn, await adm.textContent("#loginErr"));
+  // the new code is only in the answer to the POST: a failed reload right after it must not lose it
+  await adm.route("**/admin/api/overview", (route) => route.abort());
+  await adm.click('nav.tabs button[data-tab="users"]');
+  await adm.click("#newUserBtn");
+  await adm.fill('#dlg input[name="name"]', "断网测试");
+  await adm.fill('#dlg input[name="minutes"]', "5");
+  await adm.click('#dlg button[type="submit"]');
+  const codeShown = await until(adm, () => /^[0-9A-HJKMNP-TV-Z]{4}(-[0-9A-HJKMNP-TV-Z]{4}){3}$/.test(document.querySelector("#dlg .bigcode")?.textContent || ""), null, 8000);
+  const netMsg = await until(adm, () => document.getElementById("toast").textContent === "网络连接失败，请检查网络后刷新。", null, 5000);
+  const newCode = (await adm.textContent("#dlg .bigcode").catch(() => "")) || "";
+  check("admin page: a new code stays on screen when the reload after it fails; the failure is said in Chinese",
+    codeShown && netMsg && (await me(newCode)).status === 200, [newCode, await adm.textContent("#toast")]);
+  await adm.unroute("**/admin/api/overview");
+  await shot(adm, "5-admin-code");
+  await actx.close();
+
   check("no uncaught page errors", pageErrors.length === 0, pageErrors);
 } catch (e) {
   console.error(e);

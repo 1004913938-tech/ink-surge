@@ -74,7 +74,8 @@
   .modes input { width: auto; margin: 0; accent-color: var(--accent); }
   #code { font-family: ui-monospace, Menlo, Consolas, monospace; letter-spacing: 1px; }
   #codeInfo.err { color: var(--bad); }
-  #regInfo { margin-top: 4px; }
+  .regline { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 4px; }
+  button.mini { padding: 3px 10px; font-size: 13px; }
   dialog { background: var(--card); color: var(--fg); border: 1px solid var(--line); border-radius: 12px; padding: 18px 20px; width: min(460px, calc(100vw - 32px)); }
   dialog::backdrop { background: rgba(0,0,0,.6); }
   dialog h2 { font-size: 18px; margin: 0 0 4px; }
@@ -110,7 +111,7 @@
             <button class="ghost" id="regBtn">还没有授权码？申请</button>
             <span class="hint" id="codeInfo"></span>
           </div>
-          <div class="hint" id="regInfo"></div>
+          <div class="regline"><span class="hint" id="regInfo"></span><button type="button" class="ghost mini hidden" id="regShow">查看付款方式</button></div>
         </div>
         <div id="keyPane">
           <div class="row">
@@ -194,7 +195,7 @@
       <div class="hint" id="regPlanOut"></div>
       <div class="pay" id="regPay"></div>
       <div class="note">付款时请备注申请编号；店主确认后会把授权码发给你</div>
-      <div class="actions"><button type="button" id="regClose">关闭</button></div>
+      <div class="actions"><button type="button" class="ghost" id="regAgain">重新申请</button><button type="button" id="regClose">关闭</button></div>
     </div>
   </dialog>
 
@@ -356,6 +357,17 @@ var LC = (function () {
     return /^[0-9A-HJKMNP-TV-Z]{16}$/.test(c) ? c : null;
   }
   function fmtCode(c) { return c ? c.match(/.{4}/g).join("-") : ""; }
+  // four groups of 4 letters/digits, each optionally separated by one space or dash; not inside a longer run of letters
+  var CODE_IN_TEXT = /(?:^|[^0-9A-Za-z])([0-9A-Za-z]{4}[\s\u3000\-\u2010-\u2015\u2212\uff0d]?[0-9A-Za-z]{4}[\s\u3000\-\u2010-\u2015\u2212\uff0d]?[0-9A-Za-z]{4}[\s\u3000\-\u2010-\u2015\u2212\uff0d]?[0-9A-Za-z]{4})(?![0-9A-Za-z])/g;
+  /** The code from what the friend pasted: the code alone (normCode), or the owner's whole WeChat message
+   *  ("你的知音字幕授权码：XXXX-XXXX-XXXX-XXXX / 额度… / 用电脑版 Chrome 打开 https://…") -> the first code in it. */
+  function pickCode(s) {
+    var c = normCode(s);
+    if (c) return c;
+    var m, re = new RegExp(CODE_IN_TEXT.source, "g"), str = String(s || "");
+    while ((m = re.exec(str))) { c = normCode(m[1]); if (c) return c; }
+    return null;
+  }
 
   /** The server picks every Deepgram parameter; the page may only choose the language and diarization. */
   function relayUrl(server, opt) {
@@ -438,7 +450,7 @@ var LC = (function () {
 
   return { listenUrl: listenUrl, runs: runs, speakerNamer: speakerNamer, createAssembler: createAssembler,
            retryDelay: retryDelay, closeReason: closeReason, DG_DEFAULT: DG_DEFAULT,
-           serverFrom: serverFrom, dgFrom: dgFrom, normCode: normCode, fmtCode: fmtCode, relayUrl: relayUrl,
+           serverFrom: serverFrom, dgFrom: dgFrom, normCode: normCode, pickCode: pickCode, fmtCode: fmtCode, relayUrl: relayUrl,
            relayClose: relayClose, fmtLeft: fmtLeft, meInfo: meInfo, planLabel: planLabel, regCheck: regCheck, regError: regError };
 })();
 if (typeof module !== "undefined") module.exports = LC;
@@ -520,7 +532,7 @@ if (typeof module !== "undefined") module.exports = LC;
   $("modeBox").addEventListener("change", function (e) {
     if (e.target.name !== "mode") return;
     applyMode(e.target.value); store("lcl.mode", mode); setErr("");
-    if (mode === "code" && LC.normCode($("code").value) && LC.normCode($("code").value) !== meCode) refreshMe();
+    if (mode === "code" && LC.pickCode($("code").value) && LC.pickCode($("code").value) !== meCode) refreshMe();
   });
 
   // every call to the server: JSON both ways, 10 s timeout, network failure -> status 0
@@ -532,7 +544,11 @@ if (typeof module !== "undefined") module.exports = LC;
     }).catch(function () { return { status: 0, body: {} }; }).then(function (x) { clearTimeout(t); return x; });
   }
   function codeInfo(t, bad) { $("codeInfo").textContent = t || ""; $("codeInfo").classList.toggle("err", !!bad); }
-  function showRegRef() { var r = store("lcl.regRef"); $("regInfo").textContent = r ? "你的申请编号 " + r + "（待店主确认）" : ""; }
+  function showRegRef() {
+    var r = store("lcl.regRef");
+    $("regInfo").textContent = r ? "你的申请编号 " + r + "（待店主确认）" : "";
+    $("regShow").classList.toggle("hidden", !r); // the payment details stay one click away until the code arrives
+  }
   function onQuota(q) {
     codeInfo(LC.fmtLeft(q.remaining_ms, q.expires_at, Date.now()));
     var left = q.remaining_ms;
@@ -541,7 +557,7 @@ if (typeof module !== "undefined") module.exports = LC;
 
   var meSeq = 0, meCode = "", codeTimer = null;
   function refreshMe(typed) {
-    var c = LC.normCode($("code").value);
+    var c = LC.pickCode($("code").value);
     if (!ZY || !c) return;
     meCode = c;
     var seq = ++meSeq;
@@ -549,25 +565,28 @@ if (typeof module !== "undefined") module.exports = LC;
       if (seq !== meSeq || ui.running) return; // while running, the stream's own quota notes are fresher
       if (x.status === 200) {
         var i = LC.meInfo(x.body, Date.now()); codeInfo(i.text, i.bad);
-        if (typed && store("lcl.regRef")) { store("lcl.regRef", ""); showRegRef(); } // a new code arrived: the application is done
+        if (typed && store("lcl.regRef")) { store("lcl.regRef", ""); store("lcl.regPlan", ""); showRegRef(); } // a new code arrived: the application is done
       }
       else if (x.status === 401) codeInfo("授权码无效：请检查是否抄错，或联系店主", true);
       else if (x.status === 429) codeInfo("输错次数太多，请 10 分钟后再试", true);
       else codeInfo("授权码服务暂时连不上", true);
     });
   }
-  // typing: look the code up once it is complete; leaving the field: also tidy it and point out a bad format
+  // typing: look the code up once it is complete; leaving the field: also tidy it and point out a bad format.
+  // The owner's whole WeChat message (what 「复制消息」 or WeChat's 复制 puts on the clipboard) works too: only the code stays.
   function onCodeEdit(e) {
     clearTimeout(codeTimer);
-    var raw = $("code").value, c = LC.normCode(raw), done = !!(e && e.type === "change");
+    var raw = $("code").value, c = LC.pickCode(raw), done = !!(e && e.type === "change");
     if (!raw.trim()) { store("lcl.code", ""); meCode = ""; meSeq++; codeInfo(""); return; }
     if (!c) { meCode = ""; meSeq++; codeInfo(done ? "授权码格式不对：应是 16 位字母和数字（XXXX-XXXX-XXXX-XXXX）" : "", done); return; }
     store("lcl.code", c);
-    if (done) $("code").value = LC.fmtCode(c);
+    if (done || !LC.normCode(raw)) $("code").value = LC.fmtCode(c);
     if (c !== meCode) refreshMe(true);
   }
   $("code").addEventListener("input", function () { clearTimeout(codeTimer); codeTimer = setTimeout(onCodeEdit, 400); });
   $("code").addEventListener("change", onCodeEdit);
+  // a paste is complete at once: tidy the box now instead of after the typing pause
+  $("code").addEventListener("paste", function () { setTimeout(function () { onCodeEdit({ type: "change" }); }, 0); });
 
   var cfg = null; // GET /api/config: {service, version, registration_open, pay_text, plans}
   function loadConfig() {
@@ -580,35 +599,58 @@ if (typeof module !== "undefined") module.exports = LC;
   showRegRef();
   if (ZY) loadConfig().then(function (c) {
     if (!c) codeInfo("授权码服务暂时连不上", true); // own-key mode still works
-    else if (LC.normCode($("code").value) && !meCode) refreshMe();
+    else if (LC.pickCode($("code").value) && !meCode) refreshMe();
   });
 
   // registration: name + contact + plan -> a reference (R…) the friend writes in the payment memo
   var dlg = $("regDlg");
   function regView(id) { ["regFormView", "regMsgView", "regDoneView"].forEach(function (v) { $(v).classList.toggle("hidden", v !== id); }); }
   function plansOf(c) { return c && Array.isArray(c.plans) ? c.plans : []; }
-  $("regBtn").addEventListener("click", function () {
+  function regClick() {
     var btn = $("regBtn");
     if (btn.disabled) return;
     if (cfg) { openReg(cfg); loadConfig(); return; } // open at once; fresh plans for next time
     btn.disabled = true;
     loadConfig().then(function (c) { btn.disabled = false; openReg(c); });
-  });
+  }
+  $("regBtn").addEventListener("click", regClick);
+  $("regShow").addEventListener("click", regClick);
+  function showForm(c) {
+    if (c.registration_open === false) { $("regMsg").textContent = "店主暂时没有开放在线申请，请直接联系店主。"; regView("regMsgView"); return; }
+    var sel = $("regPlan"), keep = sel.value, plans = plansOf(c);
+    sel.textContent = "";
+    plans.forEach(function (p) { var o = document.createElement("option"); o.value = p.id; o.textContent = LC.planLabel(p); sel.appendChild(o); });
+    if (keep && plans.some(function (p) { return String(p.id) === keep; })) sel.value = keep;
+    $("regPlanRow").classList.toggle("hidden", !plans.length);
+    regView("regFormView");
+    $("regName").focus();
+  }
+  // owner-typed text: textContent only (pre-wrap keeps its line breaks), never HTML
+  function showDone(ref, plan, pay) {
+    $("regRef").textContent = ref;
+    $("regPlanOut").textContent = plan ? "套餐：" + LC.planLabel(plan) : "";
+    $("regPay").textContent = String(pay || "").trim() || "店主还没有填写付款方式，请直接联系店主。";
+    $("regCopy").textContent = "复制";
+    regView("regDoneView");
+  }
   function openReg(c) {
     $("regErr").textContent = "";
+    var ref = store("lcl.regRef");
     if (!c) { $("regMsg").textContent = "连不上授权码服务，请检查网络，稍后再试。"; regView("regMsgView"); }
-    else if (c.registration_open === false) { $("regMsg").textContent = "店主暂时没有开放在线申请，请直接联系店主。"; regView("regMsgView"); }
-    else {
-      var sel = $("regPlan"), keep = sel.value, plans = plansOf(c);
-      sel.textContent = "";
-      plans.forEach(function (p) { var o = document.createElement("option"); o.value = p.id; o.textContent = LC.planLabel(p); sel.appendChild(o); });
-      if (keep && plans.some(function (p) { return String(p.id) === keep; })) sel.value = keep;
-      $("regPlanRow").classList.toggle("hidden", !plans.length);
-      regView("regFormView");
+    // already applied (and maybe not paid yet): show the reference and how to pay again, not an empty form that
+    // would make a second application
+    else if (ref) {
+      var pid = store("lcl.regPlan");
+      showDone(ref, plansOf(c).filter(function (p) { return String(p.id) === pid; })[0], c.pay_text);
     }
+    else showForm(c);
     if (!dlg.open) dlg.showModal();
-    if (c && c.registration_open !== false) $("regName").focus();
+    if (c && !ref && c.registration_open !== false) $("regName").focus();
   }
+  $("regAgain").addEventListener("click", function () {
+    $("regErr").textContent = "";
+    if (cfg) showForm(cfg); else { $("regMsg").textContent = "连不上授权码服务，请检查网络，稍后再试。"; regView("regMsgView"); }
+  });
   $("regForm").addEventListener("submit", function (e) {
     e.preventDefault();
     var plans = plansOf(cfg);
@@ -623,13 +665,8 @@ if (typeof module !== "undefined") module.exports = LC;
       var ref = String(x.body.ref), plan = x.body.plan;
       if (!plan || typeof plan !== "object") plan = plans.filter(function (p) { return String(p.id) === String(plan || f.plan_id); })[0];
       var pay = typeof x.body.pay_text === "string" ? x.body.pay_text : cfg && cfg.pay_text;
-      store("lcl.regRef", ref); showRegRef();
-      // owner-typed text: textContent only (pre-wrap keeps its line breaks), never HTML
-      $("regRef").textContent = ref;
-      $("regPlanOut").textContent = plan ? "套餐：" + LC.planLabel(plan) : "";
-      $("regPay").textContent = String(pay || "").trim() || "店主还没有填写付款方式，请直接联系店主。";
-      $("regCopy").textContent = "复制";
-      regView("regDoneView");
+      store("lcl.regRef", ref); store("lcl.regPlan", plan && plan.id != null ? String(plan.id) : ""); showRegRef();
+      showDone(ref, plan, pay);
     });
   });
   $("regCopy").addEventListener("click", function () {
@@ -949,7 +986,10 @@ if (typeof module !== "undefined") module.exports = LC;
     function stopRecorder() { var r = rec; rec = null; if (r && r.state !== "inactive") { try { r.stop(); } catch (e) {} } }
     function startRecorder(sock, c) {
       // a fresh recorder per connection: each WebSocket must start with a container header
-      var r = new MediaRecorder(new MediaStream([o.track]), mime ? { mimeType: mime } : undefined);
+      var ropts = mime ? { mimeType: mime } : {};
+      // relay mode: a fixed 64 kbit/s (plenty for speech) keeps uploads far inside the server's real-time budget
+      if (o.relay) ropts.audioBitsPerSecond = 64000;
+      var r = new MediaRecorder(new MediaStream([o.track]), ropts);
       r.ondataavailable = function (e) {
         var sent = !!(e.data && e.data.size && sock.readyState === 1);
         if (sent) sock.send(e.data);
@@ -1091,7 +1131,7 @@ if (typeof module !== "undefined") module.exports = LC;
     var useCode = mode === "code", key = "", code = "";
     if (useCode) {
       // the server is the source of truth for minutes: this browser's own usage estimate is not touched
-      code = LC.normCode($("code").value);
+      code = LC.pickCode($("code").value);
       if (!$("code").value.trim()) { setErr("请先在第 1 步填写授权码（没有的话点「还没有授权码？申请」）。"); return; }
       if (!code) { setErr("授权码格式不对：应是 16 位字母和数字（XXXX-XXXX-XXXX-XXXX），请从店主发的消息里重新复制。"); return; }
       $("code").value = LC.fmtCode(code);

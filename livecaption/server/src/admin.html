@@ -178,7 +178,8 @@ const usd = (ms) => "$" + ((ms / 60000) * ((ov && ov.settings.usd_per_min) || 0)
 const numOrNull = (v) => { const s = String(v ?? "").trim(); return s === "" ? null : Number(s); };
 const LANG = { en: "英语", id: "印尼语", zh: "中文", ja: "日语", ko: "韩语" };
 const KIND = { issue: "发码", topup: "充值", reissue: "重新发码", disable: "停用", enable: "启用", delete: "删除" };
-const END = { 1000: "正常结束", 1011: "识别服务出错", 1012: "服务器重启", 4401: "授权码停用/作废", 4402: "额度用完或到期", 4409: "在另一个页面打开了" };
+const END = { 1000: "正常结束", 1011: "识别服务出错", 1012: "服务器重启", 4401: "授权码停用/作废", 4402: "额度用完或到期", 4409: "在另一个页面打开了",
+  4413: "发送过快（不是正常网页），已断开" };
 
 function toast(text) {
   const t = $("toast"); t.textContent = text; t.hidden = false;
@@ -186,12 +187,20 @@ function toast(text) {
 }
 
 // ---------- API ----------
+// A header cannot carry non-Latin-1 characters (a Chinese password would make fetch throw), so such a password is sent
+// percent-encoded; the server accepts both forms. A plain ASCII password goes as typed.
+const authValue = (p) => "Bearer " + (/[^\x20-\x7e]/.test(p) ? encodeURIComponent(p) : p);
 async function api(path, body, method) {
-  const r = await fetch("/admin/api" + path, {
-    method: method || (body !== undefined ? "POST" : "GET"), cache: "no-store",
-    headers: Object.assign({ Authorization: "Bearer " + pw }, body !== undefined ? { "Content-Type": "application/json" } : {}),
-    body: body !== undefined ? JSON.stringify(body) : undefined,
-  });
+  let r;
+  try {
+    r = await fetch("/admin/api" + path, {
+      method: method || (body !== undefined ? "POST" : "GET"), cache: "no-store",
+      headers: Object.assign({ Authorization: authValue(pw) }, body !== undefined ? { "Content-Type": "application/json" } : {}),
+      body: body !== undefined ? JSON.stringify(body) : undefined,
+    });
+  } catch {
+    const e = new Error("网络连接失败，请检查网络后刷新。"); e.status = 0; e.body = {}; throw e;
+  }
   let j = null;
   try { j = await r.json(); } catch { /* not JSON */ }
   if (!r.ok) {
@@ -234,6 +243,8 @@ function startApp() {
   timer = setInterval(() => { if (!document.hidden && !$("dlg").open) refresh(false); }, 20000);
 }
 async function load() { ov = await api("/overview"); render(); }
+// after an action already succeeded: refresh the tables, but a failed refresh only shows a note (never hides a new code)
+function reloadQuietly() { return load().catch((e) => { if (e.status !== 401) toast(e.message); }); }
 async function refresh(manual) {
   try { await load(); if (manual) toast("已刷新"); } catch (e) { if (e.status !== 401) toast(e.message); }
 }
@@ -290,7 +301,12 @@ function renderPending(pending) {
     box.append(h("div", { class: "tablewrap" }, h("div", { class: "empty" }, "暂时没有新的申请。", h("br"),
       "朋友在字幕页面点「还没有授权码？申请」提交后，会出现在这里。")));
   } else {
-    box.append(h("p", { class: "hint", text: "收到朋友的付款后（付款备注里应有申请编号），点「确认收款并发码」。" }),
+    const before = ov.now;
+    box.append(h("div", { class: "toolbar" },
+        h("p", { class: "hint", style: "margin:0;flex:1 1 260px", text: "收到朋友的付款后（付款备注里应有申请编号），点「确认收款并发码」。" }),
+        h("button", { id: "rejectAllBtn", class: "small danger", text: "全部拒绝（" + pending.length + " 条）", onclick: () => confirmDo(
+          "拒绝全部 " + pending.length + " 条待确认的申请？", "适合清理大量垃圾申请。朋友不会收到通知；如果其中有人已经付款，请记得联系对方退款。", "拒绝",
+          () => api("/registrations/reject-pending", { before }), "已全部拒绝") })),
       h("div", { class: "tablewrap" }, h("table", null,
         h("thead", null, h("tr", null, ["申请编号", "时间（WIB）", "称呼", "联系方式", "套餐", "备注", ""].map((x) => h("th", { text: x })))),
         h("tbody", null, pending.map((r) => h("tr", null,
@@ -356,7 +372,7 @@ function userRow(u) {
           ? confirmDo("停用「" + u.name + "」的授权码？", "如果正在使用会立刻断开。以后可以再启用。", "停用", () => api("/users/" + u.id + "/status", { status: "disabled" }), "已停用")
           : api("/users/" + u.id + "/status", { status: "active" }).then(() => { toast("已启用"); return load(); }, (e) => toast(e.message)) }),
         h("button", { class: "small", text: "重新发码", onclick: () => confirmDo("给「" + u.name + "」重新发码？", "旧授权码会立刻作废（正在使用会被断开），剩余额度和有效期不变。新码只显示一次。",
-          "重新发码", async () => { const r = await api("/users/" + u.id + "/reissue", {}); await load(); showCode(r, "新授权码已生成"); return false; }) }),
+          "重新发码", async () => { const r = await api("/users/" + u.id + "/reissue", {}); showCode(r, "新授权码已生成"); reloadQuietly(); return false; }) }),
         h("button", { class: "small", text: "记录", onclick: () => openHistory(u) }),
         h("button", { class: "small danger", text: "删除", onclick: () => confirmDo("删除「" + u.name + "」？",
           "会抹掉称呼和联系方式，并停用授权码（正在使用会被断开）。使用记录保留，用于对账。不能恢复。", "删除", () => api("/users/" + u.id + "/delete", {}), "已删除") })]));
@@ -416,7 +432,7 @@ function openApprove(r) {
     const body = grantBody(f);
     if (body.minutes == null && body.days == null && !confirm("分钟数和天数都留空 = 永久不限，确定吗？")) return;
     const res = await api("/registrations/" + r.ref + "/approve", body);
-    await load(); showCode(res, "授权码已生成");
+    showCode(res, "授权码已生成"); reloadQuietly(); // the code first: it exists only in this answer
   });
 }
 
@@ -434,7 +450,7 @@ function openNewUser() {
     const body = Object.assign({ name: f.name.value.trim(), contact: f.contact.value.trim() }, grantBody(f));
     if (body.minutes == null && body.days == null && !confirm("分钟数和天数都留空 = 永久不限，确定吗？")) return;
     const res = await api("/users", body);
-    await load(); tab = "users"; render(); showCode(res, "授权码已生成");
+    tab = "users"; render(); showCode(res, "授权码已生成"); reloadQuietly();
   });
 }
 
@@ -503,7 +519,7 @@ async function openHistory(u) {
     h("h2", { text: "账目" }),
     table(["时间（WIB）", "类型", "分钟", "到期（WIB）", "备注"], d.ledger.map((l) => h("tr", null,
       h("td", { class: "nowrap", text: fmtTime(l.at) }), h("td", { text: KIND[l.kind] || l.kind }),
-      h("td", { class: "nowrap", text: l.add_ms == null ? (l.kind === "issue" ? "不限" : "") : (l.add_ms > 0 && l.kind === "topup" ? "+" : "") + mins(l.add_ms) + (l.add_ms < 0 ? "（扣回）" : "") }),
+      h("td", { class: "nowrap", text: l.add_ms == null ? (l.kind === "issue" ? "不限" : "") : l.add_ms < 0 ? "−" + mins(-l.add_ms) + "（扣回）" : (l.kind === "topup" ? "+" : "") + mins(l.add_ms) }),
       h("td", { class: "nowrap", text: l.expires_at == null ? (l.kind === "issue" ? "长期" : "") : fmtDate(l.expires_at) }),
       h("td", { class: "note", text: l.note || "" }))), "没有账目。"),
     h("h2", { text: "使用记录（最近 100 次）" }),

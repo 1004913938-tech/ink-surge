@@ -21,13 +21,15 @@ const check = (name, ok, extra = "") => { results.push(!!ok); console.log(`${ok 
 
 const TMP = mkdtempSync(join(tmpdir(), "zy-e2e-"));
 const persist = join(TMP, "state");
-const envFile = (pw) => { const f = join(TMP, `env-${pw.length}`); writeFileSync(f, `DEEPGRAM_API_KEY=testkey\nADMIN_PASSWORD=${pw}\n`); return f; };
+let envN = 0;
+const envFile = (pw) => { const f = join(TMP, `env-${++envN}`); writeFileSync(f, `DEEPGRAM_API_KEY=testkey\nADMIN_PASSWORD=${pw}\n`); return f; };
 const mock = spawn(process.execPath, [join(ROOT, "test/mock-deepgram.mjs"), String(MOCK_PORT)], { stdio: ["ignore", "ignore", "inherit"] });
 let dev;
-async function startDev(pw = ADMIN) {
+// the main run lifts the all-addresses registration limit (it registers 200+ to reach the pending cap); a later run checks it
+async function startDev(pw = ADMIN, { state = persist, vars = ["REG_PER_HOUR:100000"] } = {}) {
   dev = spawn(join(ROOT, "node_modules/.bin/wrangler"), ["dev", "--port", String(PORT), "--ip", "127.0.0.1", "--inspector-port", String(INSPECT),
-    "--persist-to", persist, "--env-file", envFile(pw), "--var", `DG_URL:${MOCK}/v1/listen`, "--var", "FLUSH_MS:500",
-    "--show-interactive-dev-session=false", "--log-level", "warn"],
+    "--persist-to", state, "--env-file", envFile(pw), "--var", `DG_URL:${MOCK}/v1/listen`, "--var", "FLUSH_MS:500",
+    ...vars.flatMap((v) => ["--var", v]), "--show-interactive-dev-session=false", "--log-level", "warn"],
   { cwd: ROOT, stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, WRANGLER_SEND_METRICS: "false", NO_PROXY: [process.env.NO_PROXY, "127.0.0.1,localhost"].filter(Boolean).join(","), no_proxy: [process.env.no_proxy, "127.0.0.1,localhost"].filter(Boolean).join(",") } });
   dev.stdout.on("data", () => {});
   dev.stderr.on("data", (d) => { if (/error/i.test(d) && !/Network connection lost|hub_error|worker_error/.test(d)) process.stderr.write(d); });
@@ -55,8 +57,9 @@ const api = (path, { origin = ORIGIN, auth, ...o } = {}) =>
   call("/api" + path, { ...o, headers: { ...(origin ? { Origin: origin } : {}), ...(auth ? { Authorization: "Bearer " + auth } : {}), ...(o.headers ?? {}) } });
 
 const sockets = [];
+// origin null = a script that sends no Origin header (allowed: the code is the real check)
 function open(code, q = "lang=en&diarize=0", origin = ORIGIN, ip = IP) {
-  const ws = new WebSocket(`${WS}/v1/listen?${q}`, code === null ? undefined : ["zhiyin.v1", code], { origin, headers: { "CF-Connecting-IP": ip } });
+  const ws = new WebSocket(`${WS}/v1/listen?${q}`, code === null ? undefined : ["zhiyin.v1", code], { ...(origin ? { origin } : {}), headers: { "CF-Connecting-IP": ip } });
   const g = { opened: false, protocol: null, msgs: [], quota: [], close: null, http: null, t0: Date.now() };
   ws.on("open", () => { g.opened = true; g.protocol = ws.protocol; });
   ws.on("message", (d) => { const m = JSON.parse(d.toString()); (m.type === "ZhiYinQuota" ? g.quota : g.msgs).push(m); });
@@ -72,6 +75,10 @@ const seenCount = async () => (await fetch(MOCK + "/seen").then((r) => r.json())
 const overview = async () => (await admin("/overview")).body;
 const history = async (id) => (await admin(`/users/${id}/sessions?limit=100`)).body;
 const mk = async (name, minutes, days, extra = {}) => (await admin("/users", { name, contact: "", minutes, days, note: "", ...extra })).body;
+const ctl = (q) => fetch(MOCK + "/ctl?" + q);
+const usedOf = async (id) => (await overview()).users.find((u) => u.id === id).used_ms;
+const WIB = 7 * 3600e3, DAYMS = 86400e3;
+const wibEnd = (t) => Math.floor((t + WIB) / DAYMS) * DAYMS - WIB + DAYMS - 1; // 23:59:59.999 WIB of that day
 
 try {
   await startDev();
@@ -126,6 +133,17 @@ try {
   c = open(B.code, undefined, "https://evil.example"); await sleep(800); check("ws: foreign Origin -> HTTP 403", c.g.http === 403, c.g.http);
   c = open("ZZZZ-ZZZZ-ZZZZ-ZZZZ", undefined, ORIGIN, "10.0.9.3"); await sleep(1000); check("ws: unknown code -> 4401", c.g.close?.code === 4401, c.g.close);
   c = open(B.code, "lang=fr&diarize=0"); await sleep(1000); check("ws: bad lang -> 4400", c.g.close?.code === 4400, c.g.close);
+  const seenProto = await seenCount();
+  const protoLangs = ["constructor", "__proto__", "toString"].map((l) => open(B.code, `lang=${l}&diarize=0`));
+  await sleep(1200);
+  check("ws: lang=constructor / __proto__ / toString -> 4400, Deepgram never contacted (regression: prototype keys passed the whitelist)",
+    protoLangs.every((x) => x.g.close?.code === 4400) && (await seenCount()) === seenProto, protoLangs.map((x) => x.g.close));
+  c = open("not-a-code"); await sleep(800);
+  check("ws: malformed code -> refused by the Worker (HTTP 401)", c.g.http === 401, c.g.http);
+  const junkMe = [];
+  for (let i = 0; i < 25; i++) junkMe.push((await api("/me", { auth: "junk-" + i, ip: "10.0.9.9" })).status);
+  const afterJunk = await api("/me", { auth: B.code, ip: "10.0.9.9" });
+  check("/api/me: malformed codes -> 401 from the Worker, not counted against the address", junkMe.every((s) => s === 401) && afterJunk.status === 200, [junkMe[0], afterJunk.status]);
 
   const b1 = open(B.code, "lang=en&diarize=1&mip_opt_out=false&model=whisper&callback=https://evil.example"), c1 = open(C.code);
   await sleep(700); await Promise.all([pump(b1.ws, 1500), pump(c1.ws, 1500)]);
@@ -155,6 +173,10 @@ try {
   const before = await seenCount();
   const t1 = open(T1.code), t2 = open(T2.code); await sleep(1000);
   check("< 10 s left at connect -> 4402, Deepgram never contacted", t1.g.close?.code === 4402 && t2.g.close?.code === 4402 && (await seenCount()) === before, [t1.g.close, t2.g.close]);
+  // a Deepgram handshake that hangs is given up after 8 s (1011, the page reconnects), before the page's own 10 s timeout
+  const SL = await mk("slow-dg", 10);
+  await ctl("delayOnce=9500");
+  const sl = open(SL.code); await sleep(400);
   const a1 = open(A.code), e1 = open(E.code), d1 = open(D.code); await sleep(300);
   setTimeout(() => admin(`/users/${D.user.id}/topup`, { add_minutes: 1, note: "mid-stream" }), 9000);
   await Promise.all([pump(a1.ws, 13500), pump(e1.ws, 14000), pump(d1.ws, 14500)]);
@@ -164,6 +186,8 @@ try {
   c = open(A.code); await sleep(800); check("used-up code reconnect -> 4402", c.g.close?.code === 4402, c.g.close);
   check("expiry date reached mid-stream -> 4402", e1.g.close?.code === 4402 && e1.g.close.afterMs < 14000, e1.g.close);
   check("admin top-up mid-stream extends the live stream", d1.ws.readyState === 1 && d1.g.quota.some((q) => q.remaining_ms > 30000), d1.g.close); d1.ws.close();
+  check("Deepgram handshake hanging > 8 s -> 1011 at ~8 s (and the 8 s limit never cuts an open stream)", sl.g.close?.code === 1011 &&
+    sl.g.close.afterMs > 7500 && sl.g.close.afterMs < 9500 && (await history(SL.user.id)).sessions.length === 0, sl.g.close);
 
   b2.ws.send(JSON.stringify({ type: "CloseStream" })); await sleep(800);
   check("CloseStream -> Metadata relayed, close 1000", b2.g.msgs.at(-1)?.type === "Metadata" && b2.g.close?.code === 1000, b2.g.close);
@@ -177,10 +201,56 @@ try {
   const ov2 = await overview();
   check("admin overview shows last Deepgram error (newer than last good session)", ov2.dg_error?.status === 429 && ov2.dg_error.err === "mock 429" && ov2.dg_error.at > ov2.last_ok_at, ov2.dg_error);
   const hB = await history(B.user.id);
-  const sB = hB.sessions.find((s) => s.dg_duration_s);
+  const sB = hB.sessions.find((s) => s.dg_duration_s && s.end_code === 1000);
   check("session row: ms, bytes_up, Metadata duration", sB && sB.ms > 0 && sB.bytes_up > 0 && sB.end_code === 1000 && sB.dg_request_id === "mock-req", sB);
   check("sessions endpoint: rows newest first + ledger issue row", hB.sessions.length >= 3 && hB.sessions[0].started_at >= hB.sessions.at(-1).started_at &&
     hB.ledger.some((l) => l.kind === "issue" && l.add_ms === 600000), hB.ledger);
+  await closeAll();
+
+  // ------------------------------------------------------------ audio faster than real time (a script with a valid code)
+  // regression: metering was wall-clock only and uploads were unlimited, so 10 minutes of audio pushed in 0.7 s cost 0.6 s
+  const FL = await mk("flood", 1);
+  const fl = open(FL.code, undefined, null); await sleep(700);
+  const flSeen = (await fetch(MOCK + "/seen").then((r) => r.json())).length;
+  for (let i = 0; i < 400; i++) fl.ws.send(Buffer.alloc(4096, 3)); // 400 x 4 KB (100 s of "audio") as fast as the socket takes it
+  await sleep(1500);
+  const hFL = (await history(FL.user.id)).sessions[0], upFL = (await fetch(MOCK + "/seen").then((r) => r.json()))[flSeen - 1];
+  check("burst upload -> stream ends with 4413 at once; the over-budget frames never reach Deepgram",
+    fl.g.close?.code === 4413 && hFL.end_code === 4413 && hFL.bytes_up <= 32_000 + 2 * 32_000 && upFL.frames < 30, [fl.g.close, hFL, upFL.frames]);
+  check("burst upload: charged at least the audio Deepgram received (Metadata after CloseStream)",
+    hFL.dg_duration_s > 0 && hFL.ms >= hFL.dg_duration_s * 1000 && (await usedOf(FL.user.id)) === hFL.ms, hFL);
+
+  await ctl("frameSec=3"); // a client that packs 3 s of audio into each small message (low bitrate): bytes stay in budget
+  const LD = await mk("lead", 5);
+  const ld = open(LD.code, undefined, null); await sleep(700);
+  for (let i = 0; i < 8 && ld.ws.readyState === 1; i++) { ld.ws.send(Buffer.alloc(200, 1)); await sleep(40); }
+  await sleep(1200);
+  await ctl("frameSec=0.25");
+  const hLD = (await history(LD.user.id)).sessions[0], usedLD = await usedOf(LD.user.id);
+  check("audio cursor > clock + 10 s -> 4413; charged max(clock, audio) = the audio, not the ~1 s of connection",
+    ld.g.close?.code === 4413 && hLD.dg_duration_s >= 12 && usedLD >= 12_000 && usedLD >= hLD.dg_duration_s * 1000 && hLD.ms === usedLD, [ld.g.close, hLD, usedLD]);
+
+  // ------------------------------------------------------------ newest wins by arrival, not by when Deepgram answers
+  // regression: the page abandons a slow handshake (立即重连 / 10 s timeout) and reconnects; the abandoned attempt's late
+  // Deepgram answer used to end the NEW stream with 4409, which stops the page for good
+  const RC = await mk("race", 10);
+  await ctl("delayOnce=2500");
+  const ra = open(RC.code); await sleep(500);
+  ra.ws.terminate(); // given up while still connecting
+  const rb = open(RC.code); await sleep(700);
+  await pump(rb.ws, 3500); // the abandoned handshake completes in the meantime (at ~2.5 s)
+  const hRC = await history(RC.user.id);
+  check("abandoned slow handshake + reconnect: the new stream keeps running (no 4409), the stale attempt makes no session",
+    rb.ws.readyState === 1 && rb.g.close === null && rb.g.msgs.length > 4 && hRC.sessions.length === 1 && hRC.sessions[0].live === true, [rb.g.close, hRC.sessions]);
+  rb.ws.close();
+
+  // per-user connection attempts: 20 a minute, then 4429 (the page waits 30 s); stale attempts get 4409, one stream stays
+  const HL = await mk("handshakes", 10);
+  const hl = Array.from({ length: 22 }, () => open(HL.code));
+  await sleep(2500);
+  const hlCodes = hl.map((x) => x.g.close?.code ?? (x.ws.readyState === 1 ? "open" : "?"));
+  check("handshake limit: 22 rapid attempts -> 20 allowed (19 x 4409, 1 open), 2 x 4429",
+    hlCodes.filter((x) => x === 4429).length === 2 && hlCodes.filter((x) => x === 4409).length === 19 && hlCodes.filter((x) => x === "open").length === 1, hlCodes);
   await closeAll();
 
   // ------------------------------------------------------------ settings
@@ -228,7 +298,10 @@ try {
   const ap = await admin(`/registrations/${r1.body.ref}/approve`, { minutes: 600, days: 90, note: "微信 ¥50" });
   const exp90 = new Date(ap.body?.user?.expires_at + 7 * 3600e3).toISOString().slice(0, 10);
   check("approve -> 201 {user, code, message}", ap.status === 201 && /^[0-9A-Z]{4}(-[0-9A-Z]{4}){3}$/.test(ap.body.code) && ap.body.user.name === "小王" &&
-    ap.body.user.quota_ms === 36_000_000 && Math.abs(ap.body.user.expires_at - Date.now() - 90 * 86400e3) < 60_000, ap.body);
+    ap.body.user.quota_ms === 36_000_000, ap.body);
+  // the message says 有效期至 <date>: whole days now run to the END of that WIB day (it used to be the time of day issued)
+  check("approve: 90 days -> expires 23:59:59.999 WIB on the 90th day", ap.body.user.expires_at === wibEnd(ap.body.user.created_at + 90 * DAYMS),
+    [ap.body.user.expires_at, wibEnd(ap.body.user.created_at + 90 * DAYMS)]);
   check("approve: WeChat-ready message", ap.body.message === `你的知音字幕授权码：${ap.body.code}\n额度：600 分钟，有效期至 ${exp90}（先到为准）\n` +
     `用电脑版 Chrome 打开 ${PAGE_URL} → 第 1 步选「用授权码」→ 粘贴 → 开始。同一授权码同时只能在一个页面使用。`, ap.body.message);
   const meAp = await api("/me", { auth: ap.body.code });
@@ -310,21 +383,47 @@ try {
   check("max_streams reached -> 4429 for a new user", live1 === 1 && y1.g.close?.code === 4429, [live1, y1.g.close]);
   check("max_streams: same code may still replace its own stream (4409)", x1.g.close?.code === 4409 && x2.ws.readyState === 1 && x2.g.msgs.length > 0, x1.g.close);
   await admin("/settings", { ...goodSettings, plans }, { method: "PUT" }); x2.ws.close();
+  // regression: max_streams was checked before the await on Deepgram, so connections arriving together all got in
+  await closeAll();
+  const P1 = await mk("race-p", 30), P2 = await mk("race-q", 30);
+  await admin("/settings", { ...goodSettings, plans, max_streams: 1 }, { method: "PUT" });
+  await ctl("delay=1500");
+  const pa = open(P1.code), pb = open(P2.code);
+  await sleep(2600);
+  const liveRace = (await overview()).live_count, raceCodes = [pa.g.close?.code ?? null, pb.g.close?.code ?? null];
+  await ctl("delay=0");
+  check("max_streams=1, two codes connecting at the same time (slow Deepgram) -> one 4429, one live",
+    raceCodes.filter((x) => x === 4429).length === 1 && raceCodes.includes(null) && liveRace === 1, [raceCodes, liveRace]);
+  await admin("/settings", { ...goodSettings, plans }, { method: "PUT" });
+  await closeAll();
 
   const U1 = await mk("topup-1", 10, 1), U2 = await mk("topup-2", null, null);
   const t1r = await admin(`/users/${U1.user.id}/topup`, { add_minutes: 5, add_days: 2, note: "微信 ¥20" });
   const t2r = await admin(`/users/${U2.user.id}/topup`, { add_minutes: 5, add_days: 2, note: "" });
+  const t3before = Date.now();
   const t3r = await admin(`/users/${E.user.id}/topup`, { add_days: 1, note: "" });
+  const t3after = Date.now();
   const t0r = await admin(`/users/${U1.user.id}/topup`, { add_minutes: 0, add_days: 0 });
   const t404 = await admin(`/users/999999/topup`, { add_minutes: 5 });
   check("top-up: quota += minutes; expiry = max(expiry, now) + days", t1r.status === 200 && t1r.body.user.quota_ms === 15 * 60000 &&
     t1r.body.user.expires_at === U1.user.expires_at + 2 * 86400e3, t1r.body);
   check("top-up: unlimited stays unlimited (NULL stays NULL)", t2r.body.user.quota_ms === null && t2r.body.user.expires_at === null, t2r.body);
-  check("top-up: expired code restarts from now", Math.abs(t3r.body.user.expires_at - (Date.now() + 86400e3)) < 10_000 && t3r.body.user.remaining_ms > 0, t3r.body);
+  check("top-up: expired code restarts from now (+1 day, to the end of that WIB day)", [wibEnd(t3before + DAYMS), wibEnd(t3after + DAYMS)].includes(t3r.body.user.expires_at) &&
+    t3r.body.user.remaining_ms > 0, t3r.body);
   check("top-up: nothing to add -> 400; unknown user -> 404", t0r.status === 400 && t404.status === 404, [t0r.status, t404.status]);
   const hU1 = await history(U1.user.id);
   check("ledger: top-up row with note", hU1.ledger[0].kind === "topup" && hU1.ledger[0].add_ms === 5 * 60000 && hU1.ledger[0].note === "微信 ¥20" &&
     hU1.ledger[0].expires_at === t1r.body.user.expires_at, hU1.ledger);
+  // regression: a negative correction larger than the total was clamped at 0 while the ledger kept the typed amount
+  const tOver = await admin(`/users/${U1.user.id}/topup`, { add_minutes: -6000, note: "typo" });
+  const tFix = await admin(`/users/${U1.user.id}/topup`, { add_minutes: -5, note: "改错" });
+  const hU1b = await history(U1.user.id), hU2 = await history(U2.user.id);
+  check("top-up: taking back more than the total -> 400 {field:add_minutes} naming the total; nothing changed",
+    tOver.status === 400 && tOver.body.field === "add_minutes" && /15 分钟/.test(tOver.body.message) && hU1b.ledger.length === 3, [tOver.status, tOver.body]);
+  check("top-up: a correction is recorded as the change actually made", tFix.status === 200 && tFix.body.user.quota_ms === 10 * 60000 &&
+    hU1b.ledger[0].add_ms === -5 * 60000 && hU1b.ledger[0].note === "改错", [tFix.body, hU1b.ledger[0]]);
+  check("top-up on an unlimited, never-expiring code: ledger records no change (not +5 min / +2 days)",
+    hU2.ledger[0].kind === "topup" && hU2.ledger[0].add_ms === null && hU2.ledger[0].expires_at === null, hU2.ledger[0]);
 
   const ovT = await overview(), tt = ovT.totals, uB = ovT.users.find((u) => u.id === B.user.id);
   check("overview: WIB totals today <= month <= all, > 0; per-user month_ms", tt.today_min > 0 && tt.today_min <= tt.month_min && tt.month_min <= tt.all_min &&
@@ -340,6 +439,12 @@ try {
   const other = await api("/me", { auth: B.code, ip: "10.66.0.2" });
   check("bad-code lockout: 20 wrong codes -> /api/me 429 too_many_attempts", lk.every((s) => s === 401) && lk21.status === 429 && lk21.body.error === "too_many_attempts", [lk, lk21.status]);
   check("bad-code lockout: WebSocket from that IP -> 4429; other IPs fine", c.g.close?.code === 4429 && other.status === 200, [c.g.close, other.status]);
+  // regression: limits were keyed on the full IPv6 address, so one host could rotate through its /64 forever
+  const V6 = "2001:db8:66:1", lk6 = [];
+  for (let i = 0; i < 20; i++) lk6.push((await api("/me", { auth: `ZZZZ-ZZZZ-ZZZZ-${String(1000 + i).replace(/[01]/g, "Z")}`, ip: `${V6}::${(i + 1).toString(16)}` })).status);
+  const lk6same = await api("/me", { auth: B.code, ip: `${V6}:ffff::1` }), lk6other = await api("/me", { auth: B.code, ip: "2001:db8:66:2::1" });
+  check("IPv6: 20 wrong codes from 20 addresses of one /64 -> the whole /64 is locked (429); the next /64 is fine",
+    lk6.every((s) => s === 401) && lk6same.status === 429 && lk6other.status === 200, [lk6, lk6same.status, lk6other.status]);
   const AL = "10.77.0.1", al = [];
   for (let i = 0; i < 10; i++) al.push((await admin("/overview", undefined, { pw: "wrong-" + i, ip: AL })).status);
   const al11 = await admin("/overview", undefined, { ip: AL }), alOther = await admin("/overview");
@@ -358,12 +463,53 @@ try {
   const cfgR = await api("/config");
   check("after restart: settings persisted", cfgR.body.plans.length === 2 && cfgR.body.pay_text === goodSettings.pay_text, cfgR.body);
 
+  // ------------------------------------------------------------ global admin lock (wrong passwords from many addresses)
+  const gl = [];
+  for (let i = 0; i < 30; i++) gl.push((await admin("/overview", undefined, { pw: "wrong-global-" + i, ip: `10.88.${i}.1` })).status);
+  const glRight = await admin("/overview", undefined, { ip: "10.88.200.1" });
+  check("admin: 30 wrong passwords from 30 addresses -> whole admin locked (429), even the right password from a new address",
+    gl.every((s) => s === 401) && glRight.status === 429 && glRight.body.error === "locked" && /锁定 15 分钟/.test(glRight.body.message), [gl, glRight.status]);
+  await stopDev();
+  await startDev();
+  const glAfter = await admin("/overview", undefined, { ip: "10.88.201.1" }), glPublic = await api("/config");
+  check("admin lock survives a restart (kept in SQLite); the public API is unaffected", glAfter.status === 429 && glAfter.body.error === "locked" && glPublic.status === 200,
+    [glAfter.status, glAfter.body]);
+
   // ------------------------------------------------------------ short ADMIN_PASSWORD
   await stopDev();
   await startDev("short-pw-15char");
   const sp = await admin("/overview", undefined, { pw: "short-pw-15char" }), spCfg = await api("/config");
   check("ADMIN_PASSWORD shorter than 16 -> admin 503 admin_password_too_short (public API still up)", sp.status === 503 && sp.body.error === "admin_password_too_short" &&
     spCfg.status === 200, [sp.status, sp.body]);
+
+  // ------------------------------------------------------------ a Chinese ADMIN_PASSWORD (fresh state, default limits)
+  // regression: a browser cannot send non-Latin-1 text in a header, so such a password made the admin page unusable.
+  // The page now sends it percent-encoded and the server accepts that form too.
+  await stopDev();
+  const CN = "知音字幕后台密码请勿告诉别人谢谢"; // 16 characters, as README step 5 allows
+  // the secret is stored with a trailing space (as a careless paste would): the server trims it
+  await startDev(`"${CN} "`, { state: join(TMP, "state-cn"), vars: [] });
+  const cnOk = await admin("/overview", undefined, { pw: encodeURIComponent(CN), ip: "10.90.0.1" });
+  const cnBad = await admin("/overview", undefined, { pw: encodeURIComponent("知音字幕后台密码请勿告诉别人谢了"), ip: "10.90.0.2" });
+  check("Chinese ADMIN_PASSWORD (stored with a trailing space): percent-encoded bearer -> 200; a wrong one -> 401", cnOk.status === 200 && cnBad.status === 401,
+    [cnOk.status, cnBad.status]);
+  const pwCN = encodeURIComponent(CN);
+  // registrations from everywhere together: 30 an hour (one host with many addresses cannot fill the 200-slot queue)
+  const gr = [];
+  let cutoff = 0;
+  for (let i = 0; i < 30; i++) {
+    if (i === 29) { await sleep(20); cutoff = Date.now(); await sleep(20); }
+    gr.push((await api("/register", { method: "POST", body: { name: "批" + i, contact: "wx" + i, website: "" }, ip: `10.91.${i}.1` })).status);
+  }
+  const gr31 = await api("/register", { method: "POST", body: { name: "第31个", contact: "wx31", website: "" }, ip: "10.91.99.1" });
+  check("registration: 30 an hour from all addresses together, then 429 rate_limited", gr.every((s) => s === 201) && gr31.status === 429 &&
+    gr31.body.error === "rate_limited", [gr, gr31.status]);
+  // 全部拒绝: every pending registration the owner could see (created up to the overview's time), not newer ones
+  const rjAll = await admin("/registrations/reject-pending", { before: cutoff }, { pw: pwCN });
+  const ovCN = await admin("/overview", undefined, { pw: pwCN });
+  const pendCN = ovCN.body.registrations.filter((r) => r.status === "pending");
+  check("全部拒绝: rejects the 29 seen, keeps the one that arrived later", rjAll.status === 200 && rjAll.body.rejected === 29 &&
+    pendCN.length === 1 && pendCN[0].name === "批29", [rjAll.body, pendCN.map((r) => r.name)]);
 } catch (e) { console.error(e); results.push(false); }
 finally {
   for (const s of sockets) { try { s.terminate(); } catch { /* gone */ } }

@@ -222,6 +222,39 @@ test("normCode: identical to the server's implementation on random input", { ski
   for (let i = 0; i < 200; i++) { const c = S.newCode(); assert.equal(LC.normCode(c.toLowerCase()), c.replace(/-/g, "")); assert.equal(LC.fmtCode(LC.normCode(c)), c); }
 });
 
+// regression: the admin page's main button copies the whole WeChat message, and WeChat's 复制 on the bubble does too;
+// pasting that used to give 「授权码格式不对」
+const PAGE = "https://1004913938-tech.github.io/ink-surge/zhiyin/";
+test("pickCode: the code alone, or the first code in the owner's whole message", () => {
+  const msg = "你的知音字幕授权码：7K3M-9QX2-HJ4T-WZ8P\n额度：600 分钟，有效期至 2027-01-14（先到为准）\n" +
+    `用电脑版 Chrome 打开 ${PAGE} → 第 1 步选「用授权码」→ 粘贴 → 开始。同一授权码同时只能在一个页面使用。`;
+  assert.equal(LC.pickCode(msg), "7K3M9QX2HJ4TWZ8P");
+  assert.equal(LC.pickCode(msg.replace(/\n/g, "")), "7K3M9QX2HJ4TWZ8P", "an <input> drops the line breaks of a paste");
+  assert.equal(LC.pickCode(msg.split("\n")[0]), "7K3M9QX2HJ4TWZ8P", "first line only");
+  assert.equal(LC.pickCode("授权码 7k3m 9qx2 hj4t wz8p 谢谢"), "7K3M9QX2HJ4TWZ8P");
+  assert.equal(LC.pickCode("code:7K3M9QX2HJ4TWZ8P."), "7K3M9QX2HJ4TWZ8P");
+  // the code alone keeps working exactly as normCode (same vectors)
+  for (const s of ["7K3M-9QX2-HJ4T-WZ8P", " 7k3m 9qx2 hj4t wz8p ", "OIL0-0000-0000-0000"]) assert.equal(LC.pickCode(s), LC.normCode(s));
+  // no code in it: nothing picked (the page link and dates are not codes)
+  assert.equal(LC.pickCode(`用电脑版 Chrome 打开 ${PAGE} → 开始`), null);
+  assert.equal(LC.pickCode("额度：600 分钟，有效期至 2027-01-14"), null);
+  assert.equal(LC.pickCode("7K3M-9QX2-HJ4T"), null, "incomplete");
+  assert.equal(LC.pickCode("ABCDEFGHJKMNPQRSTV"), null, "a longer run of letters is not cut into a code");
+  assert.equal(LC.pickCode("UUUU-UUUU-UUUU-UUUU 7K3M-9QX2-HJ4T-WZ8P"), "7K3M9QX2HJ4TWZ8P", "skips a code-shaped group that is not a code");
+  assert.equal(LC.pickCode(""), null);
+  assert.equal(LC.pickCode(undefined), null);
+});
+
+test("pickCode: finds the code in every message the server writes", { skip: !existsSync(serverLib) && "livecaption/server/src/lib.ts not present" }, async () => {
+  const S = await import(serverLib.href);
+  for (let i = 0; i < 300; i++) {
+    const code = S.newCode(), canon = code.replace(/-/g, "");
+    const m = S.codeMessage({ code, left_ms: i % 3 ? i * 60_000 : null, expires_at: i % 2 ? Date.UTC(2027, 0, 14) : null, pageUrl: PAGE, reissue: i % 5 === 0 });
+    assert.equal(LC.pickCode(m), canon, m);
+    assert.equal(LC.pickCode(m.replace(/\n/g, "")), canon);
+  }
+});
+
 test("serverFrom / dgFrom: build-time meta, overrides honoured for localhost only", () => {
   assert.equal(LC.serverFrom("", null), "");
   assert.equal(LC.serverFrom("https://zhiyin-api.abc.workers.dev", null), "https://zhiyin-api.abc.workers.dev");
@@ -258,7 +291,8 @@ test("relayClose: stop vs wait vs reconnect per server close code", () => {
   const busy = LC.relayClose(true, 4429), paused = LC.relayClose(true, 4503);
   assert.equal(busy.stop, false); assert.equal(busy.delay, 30000); assert.match(busy.msg, /繁忙/);
   assert.equal(paused.stop, false); assert.equal(paused.delay, 60000); assert.match(paused.msg, /识别服务暂停，请联系店主/);
-  for (const code of [1000, 1006, 1011, 1012, 0]) assert.deepEqual({ ...LC.relayClose(true, code) }, { stop: false, msg: "", delay: 0 }, String(code));
+  // 4413 (server: audio sent faster than real time, only a script does that): a normal reconnect, never a permanent stop
+  for (const code of [1000, 1006, 1011, 1012, 4413, 0]) assert.deepEqual({ ...LC.relayClose(true, code) }, { stop: false, msg: "", delay: 0 }, String(code));
   const data = LC.relayClose(true, 1008);
   assert.equal(data.stop, false); assert.match(data.msg, /音频/);
 });

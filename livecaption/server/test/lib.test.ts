@@ -4,6 +4,7 @@ import {
   newCode, newRef, normCode, fmtCode, remaining, dgUrl, sendable, dgRefusal, originOk, Limiter, codeHash,
   validRegistration, validGrant, validNewUser, validTopup, validSettings, loadSettings, DEFAULT_SETTINGS,
   wibDayStart, wibMonthStart, wibDate, fmtMinutes, codeMessage, type Plan,
+  ipKey, upBudgetOk, grantExpiry, msSince, UP_BYTES_PER_S, UP_SLACK_BYTES, UP_MSGS_PER_S, UP_SLACK_MSGS,
 } from "../src/lib.ts";
 
 // Shared with the page (livecaption/lite lc-core normCode): same inputs must give the same canonical code.
@@ -59,6 +60,74 @@ test("dgUrl: whitelist only, forced privacy", () => {
   assert.equal(dgUrl("https://x/v1/listen", new URLSearchParams("lang=en&diarize=1"), 1)!.searchParams.get("diarize"), "true");
   assert.equal(dgUrl("https://x/v1/listen", new URLSearchParams("lang=fr"), 1), null);
   assert.equal(dgUrl("https://x/v1/listen", new URLSearchParams("diarize=yes"), 1), null);
+  // regression: names inherited from Object.prototype are not languages (they used to pass the whitelist)
+  for (const l of ["constructor", "__proto__", "toString", "hasOwnProperty", "valueOf", "isPrototypeOf"])
+    assert.equal(dgUrl("https://x/v1/listen", new URLSearchParams("lang=" + l), 1), null, l);
+});
+
+test("ipKey: IPv4 as is, IPv6 by /64", () => {
+  assert.equal(ipKey("203.0.113.9"), "203.0.113.9");
+  assert.equal(ipKey("local"), "local");
+  assert.equal(ipKey("2001:db8:1:2::1"), "2001:db8:1:2::/64");
+  assert.equal(ipKey("2001:0db8:0001:0002:aaaa:bbbb:cccc:dddd"), "2001:db8:1:2::/64");
+  assert.equal(ipKey("2001:DB8:1:2:FFFF::9"), "2001:db8:1:2::/64");          // case and the host part do not matter
+  assert.notEqual(ipKey("2001:db8:1:3::1"), ipKey("2001:db8:1:2::1"));        // another /64 is another key
+  assert.equal(ipKey("2001:db8::1"), "2001:db8:0:0::/64");                    // "::" inside the prefix
+  assert.equal(ipKey("::1"), "0:0:0:0::/64");
+  assert.equal(ipKey("::ffff:198.51.100.7"), "198.51.100.7");                // IPv4-mapped
+  // a host rotating through its /64 (the reviewer's attack): one key, so the per-address limits hold
+  const keys = new Set(Array.from({ length: 50 }, (_, i) => ipKey(`2001:db8:aa:bb:${i.toString(16)}::${(i * 7).toString(16)}`)));
+  assert.equal(keys.size, 1);
+});
+
+test("Limiter: bounded size, cheap sweep, same answers", () => {
+  const l = new Limiter(3, 1000, 100);
+  for (let i = 0; i < 1000; i++) l.hit("k" + i, 0);
+  assert.ok(l.m.size <= 100, "never more than cap entries");
+  assert.ok(l.hit("k999", 1) && l.hit("k999", 2) && !l.hit("k999", 3)); // the newest keys are the ones kept
+  assert.ok(l.blocked("k999", 4));
+  assert.ok(!l.blocked("k999", 1001) && l.hit("k999", 1001));         // window over: allowed again
+  l.hit("x", 5000);
+  assert.equal(l.m.size, 1, "expired entries are dropped from the front");
+  // many distinct keys inside one window: each hit stays O(1) (it used to walk the whole Map once it held 5000)
+  const big = new Limiter(20, 3_600_000);
+  const t0 = performance.now();
+  for (let i = 0; i < 200_000; i++) big.hit("2001:db8:" + i.toString(16) + "::/64", 1_000_000 + i);
+  const ms = performance.now() - t0;
+  assert.ok(big.m.size <= 20_000, String(big.m.size));
+  assert.ok(ms < 2000, `200k hits took ${ms.toFixed(0)} ms`);
+});
+
+test("upload budget: real time passes, bursts do not", () => {
+  // the page: one ~250 ms chunk (at most ~4 KB at 128 kbit/s) 4x a second + a KeepAlive every 5 s, for an hour
+  for (let t = 250; t <= 3_600_000; t += 250) assert.ok(upBudgetOk((t / 250) * 4000, (t / 250) * 1.05, t), String(t));
+  assert.ok(upBudgetOk(UP_SLACK_BYTES, UP_SLACK_MSGS, 0));
+  assert.ok(!upBudgetOk(UP_SLACK_BYTES + 1, 1, 0));
+  assert.ok(!upBudgetOk(1, UP_SLACK_MSGS + 1, 0));
+  assert.ok(upBudgetOk(UP_SLACK_BYTES + 10 * UP_BYTES_PER_S, UP_SLACK_MSGS + 10 * UP_MSGS_PER_S, 10_000));
+  assert.ok(!upBudgetOk(2_400 * 4096, 2_400, 700)); // the reviewer's burst: 10 minutes of 4 KB frames in 0.7 s
+});
+
+test("grantExpiry: whole days run to the end of the WIB day; less than a day stays exact", () => {
+  const now = Date.UTC(2026, 9, 16, 8, 0); // 2026-10-16 15:00 WIB
+  const e30 = grantExpiry(now, 30);
+  assert.equal(wibDate(e30), "2026-11-15");
+  assert.equal(e30, Date.UTC(2026, 10, 15, 16, 59, 59, 999));        // 2026-11-15 23:59:59.999 WIB
+  assert.equal(wibDate(e30 + 1), "2026-11-16");
+  assert.equal(grantExpiry(e30, 2), e30 + 2 * 86_400_000);             // topping up an end-of-day expiry keeps it end-of-day
+  assert.equal(grantExpiry(now, 13 / 86400), now + 13_000);             // seconds (tests) stay exact
+  assert.equal(grantExpiry(now, 0.5), now + 43_200_000);
+  assert.equal(wibDate(grantExpiry(Date.UTC(2026, 9, 16, 16, 59), 1)), "2026-10-17"); // 23:59 WIB + 1 day = end of the 17th
+});
+
+test("msSince: a session across a boundary is split in proportion", () => {
+  const b = 1_000_000;
+  assert.equal(msSince({ started_at: b, ended_at: b + 500, ms: 500 }, b), 500);             // started at the boundary
+  assert.equal(msSince({ started_at: b - 1000, ended_at: b - 10, ms: 990 }, b), 0);          // ended before it
+  assert.equal(msSince({ started_at: b - 3000, ended_at: b + 1000, ms: 4000 }, b), 1000);    // 3/4 before, 1/4 after
+  assert.equal(msSince({ started_at: b - 3000, ended_at: b + 1000, ms: 8000 }, b), 2000);    // charged > wall (audio): same share
+  assert.equal(msSince({ started_at: b - 3000, ended_at: null, ms: 4000 }, b), 1000);        // live: up to its last flush
+  assert.equal(msSince({ started_at: b - 3000, ended_at: null, ms: 2000 }, b), 0);
 });
 
 test("close codes", () => {

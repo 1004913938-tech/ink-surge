@@ -5,6 +5,15 @@ export const PROTO = "zhiyin.v1";
 export const MAX_TIMER = 2_147_483_647;
 export const MIN_START_MS = 10_000; // refuse a new stream when less than this is left (4402)
 export const MIN = 60_000, DAY = 86_400_000, WIB = 7 * 3_600_000;
+// Upload budget for one stream. The page sends one MediaRecorder chunk (250 ms of WebM/Opus, about 3-16 KB/s in total)
+// four times a second plus a KeepAlive every 5 s, never faster than real time. A client far above this is a script
+// pushing a recording faster than real time (Deepgram bills the audio, not the connection time): the stream ends (4413).
+export const UP_BYTES_PER_S = 32_000, UP_SLACK_BYTES = 32_000; // 256 kbit/s, far above Opus in WebM
+export const UP_MSGS_PER_S = 12, UP_SLACK_MSGS = 40;
+export const AUDIO_LEAD_MS = 10_000; // Deepgram's audio cursor may not run more than this ahead of the wall clock
+export const GRACE_MS = 3_000;       // after the client leaves: wait this long for Deepgram's Metadata (the audio it bills)
+export const DG_HANDSHAKE_MS = 8_000; // give up on a Deepgram handshake the page (10 s timeout) is about to abandon
+export const CLOSE_TOO_FAST = 4413;
 
 export type UserRow = { id: number; quota_ms: number | null; used_ms: number; expires_at: number | null; status: string };
 export type Plan = { id: string; name: string; minutes: number | null; days: number | null; price: string };
@@ -44,7 +53,8 @@ export function remaining(u: UserRow | null | undefined, now = Date.now()): numb
 }
 /** The server, not the browser, decides every Deepgram parameter (ToS: no generic pass-through). */
 export function dgUrl(base: string, q: URLSearchParams, userId: number): URL | null {
-  const lang = LANGS[q.get("lang") || "en"];
+  const l = q.get("lang") || "en";
+  const lang = Object.hasOwn(LANGS, l) ? LANGS[l] : undefined; // own keys only: "constructor", "__proto__" are not languages
   const diarize = q.get("diarize") || "0";
   if (!lang || (diarize !== "0" && diarize !== "1")) return null;
   const u = new URL(base);
@@ -67,18 +77,58 @@ export function originOk(origin: string | null, allowed: string): boolean {
   if (origin === null) return true;
   return allowed.split(",").map((s) => s.trim()).filter(Boolean).includes(origin);
 }
-/** Fixed-window counter kept in memory (no storage writes, so abuse cannot burn the SQLite write quota). */
+/** Upload budget check for one stream (see UP_BYTES_PER_S): true while bytes and messages stay near real time. */
+export function upBudgetOk(bytes: number, msgs: number, elapsedMs: number): boolean {
+  const s = Math.max(0, elapsedMs) / 1000;
+  return bytes <= UP_SLACK_BYTES + s * UP_BYTES_PER_S && msgs <= UP_SLACK_MSGS + s * UP_MSGS_PER_S;
+}
+/** Rate-limit key for a client address: IPv4 as is, IPv6 by its /64 (one customer usually holds a whole /64,
+ *  so keying on the full address would let a single host rotate past every per-IP limit). */
+export function ipKey(ip: string): string {
+  const s = String(ip || "").trim().toLowerCase();
+  if (!s.includes(":")) return s;
+  const mapped = s.match(/^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/);
+  if (mapped) return mapped[1];
+  const halves = s.split("::");
+  if (halves.length > 2) return s;
+  const head = halves[0] ? halves[0].split(":") : [], tail = halves.length === 2 && halves[1] ? halves[1].split(":") : [];
+  const groups = halves.length === 2 ? [...head, ...Array<string>(Math.max(0, 8 - head.length - tail.length)).fill("0"), ...tail] : head;
+  return groups.slice(0, 4).map((g) => (parseInt(g, 16) || 0).toString(16)).join(":") + "::/64";
+}
+type Window = { n: number; reset: number };
+/** Fixed-window counter kept in memory (no storage writes, so abuse cannot burn the SQLite write quota).
+ *  Every window has the same length, so the queue of windows in the order they opened is also the order they expire:
+ *  expired ones are dropped from its head (amortised O(1) per hit, however many keys there are), and when `cap` keys
+ *  are held the oldest makes room, so memory stays bounded under a flood of fresh addresses. */
 export class Limiter {
-  m = new Map<string, { n: number; reset: number }>();
-  max: number; windowMs: number;
-  constructor(max: number, windowMs: number) { this.max = max; this.windowMs = windowMs; }
+  m = new Map<string, Window>();
+  q: { k: string; w: Window }[] = []; qh = 0; // windows in opening order; q[qh] is the oldest still queued
+  max: number; windowMs: number; cap: number;
+  constructor(max: number, windowMs: number, cap = 20_000) { this.max = max; this.windowMs = windowMs; this.cap = cap; }
   hit(key: string, now = Date.now()): boolean { // true = allowed
-    if (this.m.size > 5000) for (const [k, v] of this.m) if (v.reset < now) this.m.delete(k);
+    this.sweep(now);
     const e = this.m.get(key);
-    if (!e || e.reset < now) { this.m.set(key, { n: 1, reset: now + this.windowMs }); return true; }
-    return ++e.n <= this.max;
+    if (e && e.reset >= now) return ++e.n <= this.max;
+    if (!e && this.m.size >= this.cap) this.dropOldest();
+    const w = { n: 1, reset: now + this.windowMs };
+    this.m.set(key, w); this.q.push({ k: key, w });
+    return true;
   }
   blocked(key: string, now = Date.now()): boolean { const e = this.m.get(key); return !!e && e.reset >= now && e.n >= this.max; }
+  sweep(now: number) {
+    while (this.qh < this.q.length) {
+      const { k, w } = this.q[this.qh];
+      if (this.m.get(k) === w) { if (w.reset >= now) break; this.m.delete(k); } // else: superseded by a newer window
+      this.qh++;
+    }
+    if (this.qh > 1024 && this.qh * 2 > this.q.length) { this.q = this.q.slice(this.qh); this.qh = 0; }
+  }
+  dropOldest() {
+    while (this.qh < this.q.length) {
+      const { k, w } = this.q[this.qh++];
+      if (this.m.get(k) === w) { this.m.delete(k); return; }
+    }
+  }
 }
 
 // ---------- validators: each returns {ok:true, value} or {ok:false, field, message} ----------
@@ -178,6 +228,21 @@ export function loadSettings(raw: string | null | undefined): Settings {
 export const wibDayStart = (now: number) => Math.floor((now + WIB) / DAY) * DAY - WIB;
 export function wibMonthStart(now: number): number { const d = new Date(now + WIB); return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), 1) - WIB; }
 export const wibDate = (ms: number) => new Date(ms + WIB).toISOString().slice(0, 10);
+/** Expiry for a grant of `days` counted from `base`. Whole days run to the end of that WIB calendar day, because the
+ *  friend's message and the admin table show only the date ("有效期至 2026-11-15" = all of Nov 15). Under a day
+ *  (tests, or a few hours on purpose) stays exact. */
+export function grantExpiry(base: number, days: number): number {
+  const t = base + Math.round(days * DAY);
+  return days >= 1 ? wibDayStart(t) + DAY - 1 : t;
+}
+/** The part of a session's charged ms that falls at or after `from` (start of today / this month, WIB). A session that
+ *  crossed the boundary is split in proportion to its time on each side; a live one counts up to its last flush. */
+export function msSince(s: { started_at: number; ended_at: number | null; ms: number }, from: number): number {
+  if (s.started_at >= from) return s.ms;
+  const end = s.ended_at ?? s.started_at + s.ms;
+  if (end <= from) return 0;
+  return Math.round((s.ms * (end - from)) / Math.max(1, end - s.started_at));
+}
 
 /** 600 -> "600", 12.345 -> "12.3", 0.05 -> "0" (rounded down: never promise more than there is). */
 export function fmtMinutes(ms: number): string { const m = Math.floor(Math.max(0, ms) / 6000) / 10; return String(m); }

@@ -1,7 +1,7 @@
 // ZhiYin server, Worker entry (stateless): routing, CORS, Origin / same-origin checks, the admin page with a CSP nonce,
 // and a 30 s isolate cache for /api/config. Everything stateful lives in the Hub Durable Object (hub.ts).
-import { Hub, json, type Env } from "./hub";
-import { PROTO, originOk } from "./lib";
+import { Hub, json, type Env } from "./hub.ts";
+import { PROTO, originOk, ipKey, normCode } from "./lib.ts";
 import ADMIN_HTML from "./admin.html";
 
 export { Hub };
@@ -13,10 +13,11 @@ const text = (body: string, status: number) =>
   new Response(body, { status, headers: { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" } });
 
 /** Forward to the single Hub. The DO's 101 (with its un-accepted client socket) is returned untouched, so the runtime pumps
- *  frames natively with no Worker CPU per frame. x-zy-ip is always overwritten, so a client cannot choose it. */
+ *  frames natively with no Worker CPU per frame. x-zy-ip is always overwritten, so a client cannot choose it; it is the
+ *  rate-limit key (IPv6 by /64, see ipKey). */
 function toHub(req: Request, env: Env, init?: RequestInit): Promise<Response> {
   const fwd = new Request(req, init);
-  fwd.headers.set("x-zy-ip", req.headers.get("CF-Connecting-IP") ?? "local");
+  fwd.headers.set("x-zy-ip", ipKey(req.headers.get("CF-Connecting-IP") ?? "local"));
   return env.HUB.getByName("main", { locationHint: "apac" }).fetch(fwd);
 }
 
@@ -74,7 +75,9 @@ async function publicApi(req: Request, env: Env, url: URL): Promise<Response> {
         ? json({ error: "invalid_input", field: "body", message: "内容太长" }, 400)
         : await toHub(req, env, { method: "POST", headers: { "content-type": "application/json" }, body });
     } else if (route === "GET /api/me") {
-      res = await toHub(req, env);
+      // something that is not even shaped like a code never reaches the Hub (it cannot be guessed into a real one anyway)
+      const code = (req.headers.get("Authorization") ?? "").replace(/^Bearer\s+/i, "");
+      res = normCode(code) ? await toHub(req, env) : json({ error: "unknown_code", message: "授权码无效" }, 401);
     } else if (["/api/config", "/api/register", "/api/me"].includes(url.pathname)) {
       res = json({ error: "method_not_allowed" }, 405);
     } else {
@@ -122,7 +125,8 @@ export default {
       if (req.headers.get("Upgrade")?.toLowerCase() !== "websocket") return text("expected websocket", 426);
       if (!originOk(req.headers.get("Origin"), env.ALLOWED_ORIGINS)) return text("origin not allowed", 403);
       const protos = (req.headers.get("Sec-WebSocket-Protocol") ?? "").split(",").map((s) => s.trim());
-      if (protos[0] !== PROTO || !protos[1]) return text("missing access code", 401);
+      // the page checks the format before connecting, so a malformed code here is a script: refused without the Hub
+      if (protos[0] !== PROTO || !normCode(protos[1] ?? "")) return text("missing access code", 401);
       return toHub(req, env);
     }
     if (p.startsWith("/api/")) return publicApi(req, env, url);

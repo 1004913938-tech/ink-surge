@@ -583,8 +583,16 @@ const relayConns = (tag) => zy.conns.filter((x) => x.code === ZCANON(tag));
   await page.click("#regClose");
   const ref = await page.evaluate(() => [document.getElementById("regInfo").textContent, localStorage.getItem("lcl.regRef"), document.getElementById("regDlg").open]);
   check("(d) after closing: 「你的申请编号 R…（待店主确认）」 is kept on the page", ref[0] === "你的申请编号 R7K3MQ（待店主确认）" && ref[1] === "R7K3MQ" && !ref[2], JSON.stringify(ref));
-  zy.regStatus = 429;
+  // regression: reopening used to show an empty form, so the payment details were gone and a second application followed
+  const regs1 = zy.regs.length;
   await page.click("#regBtn");
+  const reopened = await until(page, () => document.getElementById("regDlg").open && !document.getElementById("regDoneView").classList.contains("hidden"), null, 5000);
+  const again = await page.evaluate(() => ({ ref: document.getElementById("regRef").textContent, pay: document.getElementById("regPay").textContent,
+    plan: document.getElementById("regPlanOut").textContent, form: !document.getElementById("regFormView").classList.contains("hidden") }));
+  check("(d) reopening 申请 shows the same 申请编号, plan and payment details again, without a new application",
+    reopened && again.ref === "R7K3MQ" && again.pay === PAY && /包月.*¥50/.test(again.plan) && !again.form && zy.regs.length === regs1, JSON.stringify(again));
+  zy.regStatus = 429;
+  await page.click("#regAgain"); // 「重新申请」: the form is still there when really wanted
   await until(page, () => document.getElementById("regDlg").open && !document.getElementById("regFormView").classList.contains("hidden"), null, 5000);
   await page.click("#regSubmit");
   const tooMany = await until(page, () => /太频繁/.test(document.getElementById("regErr").textContent), null, 5000);
@@ -593,8 +601,15 @@ const relayConns = (tag) => zy.conns.filter((x) => x.code === ZCANON(tag));
   await page.keyboard.press("Escape");
   await page.reload();
   const kept = await page.textContent("#regInfo");
+  const regs2 = zy.regs.length;
+  await page.click("#regShow"); // 「查看付款方式」 next to the reference
+  const payAgain = await until(page, (p) => document.getElementById("regDlg").open && !document.getElementById("regDoneView").classList.contains("hidden") &&
+    document.getElementById("regRef").textContent === "R7K3MQ" && document.getElementById("regPay").textContent === p, PAY, 5000);
+  check("(d) after a reload: 「查看付款方式」 shows the reference and payment details again (nothing sent)", payAgain && zy.regs.length === regs2);
+  await page.click("#regClose");
   await page.fill("#code", ZCODE("0001")); // the owner sent the code
-  const cleared = await until(page, () => document.getElementById("regInfo").textContent === "" && !localStorage.getItem("lcl.regRef") && /^剩余/.test(document.getElementById("codeInfo").textContent), null, 5000);
+  const cleared = await until(page, () => document.getElementById("regInfo").textContent === "" && !localStorage.getItem("lcl.regRef") && /^剩余/.test(document.getElementById("codeInfo").textContent) &&
+    document.getElementById("regShow").classList.contains("hidden"), null, 5000);
   check("(d) 申请编号 survives a reload; a newly entered working code clears it", kept === "你的申请编号 R7K3MQ（待店主确认）" && cleared, kept);
   await page.context().close();
 }
@@ -657,6 +672,31 @@ const relayConns = (tag) => zy.conns.filter((x) => x.code === ZCANON(tag));
   await page.reload();
   check("(e) a stored code is looked up on load", (await page.inputValue("#code")) === "ZYZY-TEST-0000-0001" &&
     await until(page, () => /^剩余 9 小时 12 分/.test(document.getElementById("codeInfo").textContent), null, 5000));
+  await page.context().close();
+}
+
+// ---- the owner's whole WeChat message pasted into the code box (what 「复制消息」 and WeChat's 复制 give)
+// regression: it used to say 「授权码格式不对」 and point back to the same message
+{
+  const page = await newPage();
+  await page.goto(codeUrl());
+  const msg = `你的知音字幕授权码：${ZCODE("0003")}\n额度：600 分钟，有效期至 2027-01-14（先到为准）\n` +
+    "用电脑版 Chrome 打开 https://1004913938-tech.github.io/ink-surge/zhiyin/ → 第 1 步选「用授权码」→ 粘贴 → 开始。同一授权码同时只能在一个页面使用。";
+  const me0 = zy.me.length;
+  // a paste: the <input> drops the line breaks, then the paste handler tidies the box at once (before the typing pause)
+  await page.evaluate((m) => { const i = document.getElementById("code"); i.focus(); i.value = m.replace(/\n/g, ""); i.dispatchEvent(new Event("paste")); }, msg);
+  const tidy = await until(page, (c) => document.getElementById("code").value === c, ZCODE("0003"), 350);
+  const looked = await until(page, () => /^剩余 9 小时 12 分/.test(document.getElementById("codeInfo").textContent), null, 5000);
+  check("paste the owner's whole message: only the code stays in the box, at once, and it is looked up",
+    tidy && looked && zy.me.slice(me0).includes(ZCANON("0003")) && (await page.textContent("#err")) === "", `${await page.inputValue("#code")} | ${await page.textContent("#codeInfo")}`);
+  await page.fill("#code", "");
+  await page.fill("#code", msg); // inserted without a paste event: tidied after the typing pause
+  const tidy2 = await until(page, (c) => document.getElementById("code").value === c, ZCODE("0003"), 2000);
+  await page.click("#startBtn");
+  const ok = await until(page, () => window.__lcl.lines().some((l) => l.src === "Again 0003."), null, 8000);
+  const c = relayConns("0003")[0];
+  check("…and 开始 connects with the code from the message", tidy2 && ok && c?.offered.join(",") === "zhiyin.v1," + ZCANON("0003"), c && c.offered.join(","));
+  await page.click("#stopBtn");
   await page.context().close();
 }
 

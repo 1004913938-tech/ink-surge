@@ -10,7 +10,7 @@
     "skipLibCheck": true,
     "erasableSyntaxOnly": true,
     "noUnusedLocals": true,
-    "allowImportingTsExtensions": false
+    "allowImportingTsExtensions": true
   },
   "include": ["src"]
 }
