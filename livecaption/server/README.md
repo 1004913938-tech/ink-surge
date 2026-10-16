@@ -84,7 +84,8 @@
 | --- | --- |
 | 绿色 ✓，但 Summary 写「知音服务器未部署：缺少 secrets: …」 | 按提示补上缺的那个 secret（名字要一模一样），再 Run workflow |
 | 红色 ✗，红在 **Check repository secrets** | `ADMIN_PASSWORD` 不到 16 位，改长一点再 Run workflow |
-| 红色 ✗，红在 **Ensure workers.dev subdomain** 或 **Deploy Worker** | Cloudflare 的 Token 或 Account ID 填错了，重新复制再填；或者再点一次 **Re-run jobs**（第一次部署偶尔要跑两次） |
+| 红色 ✗，红在 **Check repository secrets** 或 **Ensure workers.dev subdomain** | 点进这次运行，**Summary** 和红色错误里会用中文写明是哪个 secret 不对（`CLOUDFLARE_API_TOKEN` 无效或权限不够 / `CLOUDFLARE_ACCOUNT_ID` 不对 / 两者不属于同一个账户）。按提示重新复制、更新那个 secret，再 Run workflow。复制时多带的空格、换行，或者把整个网址当成 Account ID 粘进去，都会自动纠正，不用担心 |
+| 红色 ✗，红在 **Deploy Worker** | 再点一次 **Re-run jobs**（第一次部署偶尔要跑两次）；还是红就把这一步的错误截图发给懂技术的朋友 |
 | Summary 有地址，但打开后台显示打不开 | 新地址第一次要几分钟才生效，过 5–10 分钟再试 |
 | 字幕页面没有「用授权码」选项 | Actions → **Deploy GitHub Pages** → **Run workflow**，等它变绿后刷新字幕页面 |
 

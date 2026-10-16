@@ -31,6 +31,10 @@ jobs:
           LIVE_PAGE: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/zhiyin/
         run: |
           url="$OVERRIDE"
+          # same clean-up as the deploy job: pasted secrets may carry whitespace, "Bearer ", or the whole dashboard URL
+          CF_TOKEN=$(printf %s "$CF_TOKEN" | tr -d '[:space:]'); CF_TOKEN=${CF_TOKEN#Bearer}; CF_TOKEN=${CF_TOKEN#bearer}
+          CF_ACCOUNT=$(printf %s "$CF_ACCOUNT" | grep -oiE '[0-9a-f]{32}' | head -n1 | tr 'A-F' 'a-f' || true)
+          [ -n "$CF_TOKEN" ] && echo "::add-mask::$CF_TOKEN"
           if [ -z "$url" ] && [ -n "$CF_TOKEN" ] && [ -n "$CF_ACCOUNT" ]; then
             body=$(mktemp)
             status=$(curl -sS --retry 3 --retry-connrefused --retry-delay 5 --max-time 15 -o "$body" -w '%{http_code}' \
