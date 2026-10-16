@@ -18,6 +18,46 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
+      # 知音字幕 授权码 mode: find the ZhiYin server (livecaption/server) so the page can show that mode.
+      # First step, before checkout and npm ci, so the Cloudflare token never meets third-party install scripts.
+      # A failed lookup (Cloudflare API down, token expired or deleted) never silently removes 授权码 mode: the URL the
+      # live page already has is kept, with a warning; if even that cannot be read, the build fails and the live site stays.
+      - name: Find the ZhiYin server (empty = 授权码 mode hidden)
+        id: zy
+        env:
+          OVERRIDE: ${{ vars.ZHIYIN_SERVER_URL }}
+          CF_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CF_ACCOUNT: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          LIVE_PAGE: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/zhiyin/
+        run: |
+          url="$OVERRIDE"
+          if [ -z "$url" ] && [ -n "$CF_TOKEN" ] && [ -n "$CF_ACCOUNT" ]; then
+            body=$(mktemp)
+            status=$(curl -sS --retry 3 --retry-connrefused --retry-delay 5 --max-time 15 -o "$body" -w '%{http_code}' \
+              -H "Authorization: Bearer $CF_TOKEN" "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT/workers/subdomain" || true)
+            sub=$(jq -r '.result.subdomain // empty' "$body" 2>/dev/null || true)
+            if [ "$status" = 200 ] && [ -n "$sub" ]; then
+              url="https://zhiyin-api.$sub.workers.dev"
+              curl -fsS --max-time 15 "$url/api/config" | jq -e '.service=="zhiyin"' >/dev/null || echo "::warning::$url not answering"
+            elif jq -e '[.errors[]?.code] | index(10007)' "$body" >/dev/null 2>&1; then
+              echo "::notice::No workers.dev subdomain yet: 授权码 mode stays hidden until the ZhiYin server is deployed"
+            else
+              # the lookup itself failed: keep the server the live page already uses
+              page=$(mktemp)
+              pstatus=$(curl -sSL --retry 3 --retry-connrefused --retry-delay 5 --max-time 15 -o "$page" -w '%{http_code}' "$LIVE_PAGE" || true)
+              if [ "$pstatus" = 200 ]; then
+                url=$(grep -o '<meta name="zhiyin-server" content="[^"]*"' "$page" | head -n 1 | sed 's/.*content="//; s/"$//' || true)
+              elif [ "$pstatus" != 404 ]; then
+                echo "::error::Cloudflare API lookup failed (HTTP ${status:-none}) and the live page could not be read (HTTP ${pstatus:-none}); not publishing, so the live page keeps its server. Re-run later."
+                echo "### ⚠ 网页没有更新：查不到知音服务器地址（Cloudflare 连不上或令牌失效），线上页面保持不变。请稍后点 Re-run jobs；一直这样就检查 CLOUDFLARE_API_TOKEN。" >> "$GITHUB_STEP_SUMMARY"
+                exit 1
+              fi
+              echo "::warning::Cloudflare API lookup failed (HTTP ${status:-none}); kept the live page's server: ${url:-none}. Check CLOUDFLARE_API_TOKEN if this repeats."
+              echo "### ⚠ 查不到知音服务器地址（Cloudflare 连不上或令牌失效），这次沿用了线上页面的地址：${url:-无}。一直这样请检查 CLOUDFLARE_API_TOKEN。" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          fi
+          if [ -n "$url" ] && ! printf %s "$url" | grep -Eq '^https://[A-Za-z0-9.-]+(:[0-9]+)?$'; then echo "::error::bad ZHIYIN_SERVER_URL"; exit 1; fi
+          echo "url=$url" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
@@ -27,8 +67,15 @@ jobs:
       - run: npm run build
         env:
           GITHUB_PAGES: '1'
-      # 知音字幕 (live meeting captions, one static file) at /ink-surge/zhiyin/
-      - run: mkdir -p dist/zhiyin && cp livecaption/lite/index.html dist/zhiyin/index.html
+      # 知音字幕 (live meeting captions, one static file) at /ink-surge/zhiyin/, with the server URL filled in
+      - run: |
+          mkdir -p dist/zhiyin && cp livecaption/lite/index.html dist/zhiyin/index.html
+          if [ -n "$ZY_URL" ]; then
+            sed -i "s|<meta name=\"zhiyin-server\" content=\"\" />|<meta name=\"zhiyin-server\" content=\"$ZY_URL\" />|" dist/zhiyin/index.html
+            grep -q "content=\"$ZY_URL\"" dist/zhiyin/index.html
+          fi
+        env:
+          ZY_URL: ${{ steps.zy.outputs.url }}
       - uses: actions/upload-pages-artifact@v3
         with:
           path: dist

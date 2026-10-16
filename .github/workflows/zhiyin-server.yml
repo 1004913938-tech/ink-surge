@@ -1,0 +1,132 @@
+# 知音字幕 ZhiYin server (livecaption/server): test on every change, deploy to Cloudflare Workers from main.
+# The owner sets 4 repository secrets once (see livecaption/server/README.md) and clicks "Run workflow".
+# Without the secrets the deploy job finishes green with a notice and deploys nothing.
+# Secrets are mapped into STEP-level env only (never job-level), so npm install scripts never see them.
+name: Deploy ZhiYin server (Cloudflare Worker)
+
+on:
+  push:
+    branches: [main]
+    paths: ["livecaption/server/**", ".github/workflows/zhiyin-server.yml"]
+  pull_request:
+    paths: ["livecaption/server/**", ".github/workflows/zhiyin-server.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: "zhiyin-worker-${{ github.ref }}"
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: livecaption/server
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: livecaption/server/package-lock.json
+      - run: npm ci
+      - run: npm run typecheck
+      # unit tests + local end-to-end (wrangler dev + mock Deepgram; no Cloudflare or Deepgram account needed)
+      - run: npm test
+        env:
+          WRANGLER_SEND_METRICS: "false"
+      - run: npx wrangler deploy --dry-run --outdir "$RUNNER_TEMP/zy-dry"
+        env:
+          WRANGLER_SEND_METRICS: "false"
+
+  deploy:
+    needs: test
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: write # to start pages.yml at the end, so the page shows 授权码 mode
+    steps:
+      - name: Check repository secrets
+        id: check
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          DEEPGRAM_API_KEY: ${{ secrets.DEEPGRAM_API_KEY }}
+          ADMIN_PASSWORD: ${{ secrets.ADMIN_PASSWORD }}
+        run: |
+          missing=""
+          for n in CLOUDFLARE_API_TOKEN CLOUDFLARE_ACCOUNT_ID DEEPGRAM_API_KEY ADMIN_PASSWORD; do
+            [ -z "${!n}" ] && missing="$missing $n"
+          done
+          if [ -n "$missing" ]; then
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=ZhiYin server not deployed::Missing repository secrets:$missing"
+            echo "### 知音服务器未部署：缺少 secrets:$missing" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          if [ "${#ADMIN_PASSWORD}" -lt 16 ]; then echo "::error::ADMIN_PASSWORD needs at least 16 characters"; exit 1; fi
+          echo "ready=true" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v6
+        if: steps.check.outputs.ready == 'true'
+      - uses: actions/setup-node@v4
+        if: steps.check.outputs.ready == 'true'
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: livecaption/server/package-lock.json
+      # Install the pinned wrangler here, in a step WITHOUT secrets. wrangler-action then finds 4.143.0 and skips its
+      # own `npm i wrangler@…`, which would otherwise run every install script inside the step that holds the secrets.
+      - name: Install dependencies (no secrets in this step)
+        if: steps.check.outputs.ready == 'true'
+        working-directory: livecaption/server
+        run: npm ci
+      - name: Ensure workers.dev subdomain
+        id: sub
+        if: steps.check.outputs.ready == 'true'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          api="https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/subdomain"
+          sub=$(curl -fsS -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" "$api" | jq -r '.result.subdomain // empty' || true)
+          if [ -z "$sub" ]; then
+            sub="zhiyin-$(printf %s "$CLOUDFLARE_ACCOUNT_ID" | sha256sum | cut -c1-10)"
+            curl -fsS -X PUT -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" -H "Content-Type: application/json" \
+              --data "{\"subdomain\":\"$sub\"}" "$api" > /dev/null
+            echo "::notice::Registered $sub.workers.dev (DNS may take a few minutes)"
+          fi
+          echo "url=https://zhiyin-api.$sub.workers.dev" >> "$GITHUB_OUTPUT"
+      - name: Deploy Worker
+        if: steps.check.outputs.ready == 'true'
+        uses: cloudflare/wrangler-action@953926a2e2182532811c01a25e53647d93bf07c0 # v4.1.3
+        env:
+          DEEPGRAM_API_KEY: ${{ secrets.DEEPGRAM_API_KEY }}
+          ADMIN_PASSWORD: ${{ secrets.ADMIN_PASSWORD }}
+          WRANGLER_SEND_METRICS: "false"
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          workingDirectory: livecaption/server
+          wranglerVersion: "4.143.0"
+          secrets: |
+            DEEPGRAM_API_KEY
+            ADMIN_PASSWORD
+      - name: Smoke test and summary
+        if: steps.check.outputs.ready == 'true'
+        env:
+          URL: ${{ steps.sub.outputs.url }}
+        run: |
+          ok=no; for _ in $(seq 1 12); do curl -fsS "$URL/api/config" | jq -e '.service=="zhiyin"' >/dev/null && { ok=yes; break; }; sleep 15; done
+          [ "$ok" = yes ] || echo "::warning::$URL not answering yet (new workers.dev DNS can take minutes)"
+          { echo "### 知音服务器已部署"; echo "- 服务器: $URL"; echo "- 店主后台: $URL/admin"; } >> "$GITHUB_STEP_SUMMARY"
+      - name: Rebuild the page so it shows 授权码 mode
+        if: steps.check.outputs.ready == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run pages.yml --ref main --repo "$GITHUB_REPOSITORY"

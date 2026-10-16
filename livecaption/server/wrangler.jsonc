@@ -1,0 +1,17 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "zhiyin-api",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-01",
+  "workers_dev": true,
+  "observability": { "enabled": true },
+  "vars": {
+    // "null" lets the downloaded offline copy of the page (file://) use 授权码 mode; remove it if that is not wanted
+    "ALLOWED_ORIGINS": "https://1004913938-tech.github.io,null",
+    "PUBLIC_PAGE_URL": "https://1004913938-tech.github.io/ink-surge/zhiyin/"
+  },
+  // secrets (never in this file): DEEPGRAM_API_KEY, ADMIN_PASSWORD (at least 16 characters)
+  "durable_objects": { "bindings": [{ "name": "HUB", "class_name": "Hub" }] },
+  // new_sqlite_classes (never new_classes: the Free plan only offers SQLite-backed Durable Objects)
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Hub"] }]
+}
